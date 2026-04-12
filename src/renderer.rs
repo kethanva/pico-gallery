@@ -136,7 +136,22 @@ impl Renderer {
     // ── Image decode & scale ─────────────────────────────────────────────────
 
     pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<RgbaImage> {
+        // Reject suspiciously large blobs before handing to the decoder.
+        const MAX_DECODE_BYTES: usize = 50 * 1024 * 1024;
+        if bytes.len() > MAX_DECODE_BYTES {
+            return Err(anyhow::anyhow!(
+                "image blob too large ({} MB) — refusing to decode",
+                bytes.len() / 1_048_576
+            ));
+        }
         let img = image::load_from_memory(bytes).context("decoding image")?;
+        // Reject extreme dimensions that could cause OOM during RGBA conversion.
+        if img.width() > 16_000 || img.height() > 16_000 {
+            return Err(anyhow::anyhow!(
+                "image dimensions {}×{} exceed safety limit",
+                img.width(), img.height()
+            ));
+        }
         Ok(self.scale_image(img).into_rgba8())
     }
 

@@ -192,7 +192,8 @@ impl Slideshow {
             }
 
             // ── Prefetch the next photo in background ─────────────────────
-            if cursor < queue.len() {
+            // Only fetch if the buffer isn't already full (strict size enforcement).
+            if cursor < queue.len() && prefetched.len() < prefetch_n {
                 let (pidx, meta) = &queue[cursor];
                 if let Some(bytes) = self.fetch_photo(pidx, meta, renderer).await {
                     prefetched.push_back((*pidx, meta.clone(), bytes));
@@ -221,14 +222,19 @@ impl Slideshow {
             return Some(bytes);
         }
 
-        // Fetch from remote.
-        match plugin.get_photo_bytes(meta, renderer.width(), renderer.height()).await {
-            Ok(bytes) => {
+        // Fetch from remote — 30 s timeout prevents a hung plugin from stalling the slideshow.
+        let fetch = plugin.get_photo_bytes(meta, renderer.width(), renderer.height());
+        match tokio::time::timeout(Duration::from_secs(30), fetch).await {
+            Ok(Ok(bytes)) => {
                 let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
                 Some(bytes)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("fetch_photo {} error: {}", meta.filename, e);
+                None
+            }
+            Err(_) => {
+                warn!("fetch_photo {} timed out after 30 s", meta.filename);
                 None
             }
         }

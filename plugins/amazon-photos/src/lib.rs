@@ -108,8 +108,15 @@ impl AmazonPhotosPlugin {
     fn token_path(&self) -> PathBuf { self.token_dir.join(TOKEN_FILE) }
 
     async fn save_token(&self, t: &StoredToken) {
-        let _ = fs::create_dir_all(self.token_path().parent().unwrap()).await;
-        let _ = fs::write(self.token_path(), serde_json::to_vec(t).unwrap_or_default()).await;
+        let path = self.token_path();
+        let _ = fs::create_dir_all(path.parent().unwrap()).await;
+        let _ = fs::write(&path, serde_json::to_vec(t).unwrap_or_default()).await;
+        // Restrict token file to owner-only — contains refresh token.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 
     async fn load_token(&mut self) {
