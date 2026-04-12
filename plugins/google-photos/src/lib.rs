@@ -132,26 +132,34 @@ impl GooglePhotosPlugin {
             return Ok(());
         }
 
-        // Try by-year from current year going back up to 5 years.
+        // Try by-year from current year going back up to 30 years.
+        // Cap each year at 50 MB so we get photos quickly even for busy years.
+        // rclone exits non-zero when max-transfer is hit — that's fine; we check
+        // whether files actually landed rather than trusting the exit code.
         let current_year = current_year();
-        for year in (current_year - 5..=current_year).rev() {
+        for year in (current_year.saturating_sub(30)..=current_year).rev() {
             let src = format!("{}:media/by-year/{}", REMOTE, year);
-            info!("Google Photos: initial sync from {} (fast year-based)…", src);
+            info!("Google Photos: initial sync from {} (up to 50 MB)…", src);
 
             let out = Command::new("rclone")
                 .args([
-                    "--config", conf, "copy", &src, dst_str,
-                    "--transfers", "4",
-                    "--include", "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
+                    "--config",       conf,
+                    "copy",           &src,
+                    dst_str,
+                    "--max-transfer", "50M",   // ~5-15 photos; stops download quickly
+                    "--transfers",    "4",
+                    "--include",      "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
                 ])
                 .output().await.context("rclone initial sync (by-year)")?;
 
-            if !out.status.success() {
-                warn!("rclone year {} sync: {}", year, String::from_utf8_lossy(&out.stderr).trim());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() && !stderr.contains("Max transfer") {
+                // Real error (not just hitting the transfer cap) — try next year.
+                warn!("rclone year {}: {}", year, stderr.trim());
                 continue;
             }
 
-            // Check if we actually got some photos.
+            // Check if we actually got some photos (exit code is unreliable with cap).
             let found = Self::list_local_images(&dst).await;
             if !found.is_empty() {
                 info!("Google Photos: initial sync done — {} photos from {}.", found.len(), year);
@@ -160,7 +168,7 @@ impl GooglePhotosPlugin {
             info!("Google Photos: no photos in {} — trying earlier year.", year);
         }
 
-        warn!("Google Photos: no photos found in recent years. Background sync will continue.");
+        warn!("Google Photos: no photos found in any year. Background sync will continue.");
         Ok(())
     }
 

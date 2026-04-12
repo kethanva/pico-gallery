@@ -173,37 +173,37 @@ sync_dir      = "/tmp/picogallery-gphotos"   # local cache directory
 
 ---
 
-## How Google Photos auth works
+## Google Photos — API status (March 2025)
 
-No Google Cloud project, no API key, no app verification process.
+> **Google removed `photoslibrary.readonly` on March 31, 2025.**
+> All read access to existing photo libraries via API is now blocked.
+> This affects the Photos Library API, rclone, and all third-party tools.
 
-```
-picogallery starts
-       │
-       ▼
-token saved?  ──yes──▶  sync photos in background  ──▶  slideshow runs
-       │
-      no
-       │
-       ▼
-rclone authorize "google photos"
-  (uses rclone's own verified OAuth app)
-       │
-       ├── macOS: browser opens automatically
-       └── Pi:    URL printed → open on phone/laptop
-       │
-       ▼
-user approves in browser
-       │
-       ▼
-token saved to ~/.config/picogallery/rclone-gphotos.conf
-       │
-       ▼
-rclone syncs photos to sync_dir  ──▶  slideshow starts
+### Recommended: Google Takeout + local plugin
+
+1. Go to **[takeout.google.com](https://takeout.google.com)**
+2. Deselect all → select only **Google Photos** → Next step → Create export
+3. Download and extract the zip — you get a folder of JPEGs organised by date
+4. Copy to your Pi (USB drive, NAS, or `scp`) and configure:
+
+```toml
+[[plugins]]
+name    = "local"
+enabled = true
+paths   = ["/mnt/photos/Google Photos"]   # path to your Takeout extract
 ```
 
-The token is refreshed automatically by rclone on every sync.
-Re-authentication is never required unless you revoke access.
+5. Re-export every few months to pick up new photos
+
+### API status table
+
+| Approach | Status (2026) |
+|---|---|
+| Google Photos Library API | Blocked for existing libraries since March 2025 |
+| rclone Google Photos | Blocked (uses same underlying API) |
+| Google Picker API | Manual per-session selection — not suitable for slideshows |
+| **Google Takeout + local plugin** | **Works — recommended** |
+| Self-hosted Immich / Nextcloud | Works — full open API control |
 
 ---
 
