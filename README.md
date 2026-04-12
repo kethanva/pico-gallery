@@ -1,4 +1,4 @@
-# 🖼 PicoGallery
+# PicoGallery
 
 > Lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
 
@@ -13,28 +13,22 @@
 ```
 picogallery/
 ├── Cargo.toml                    # workspace root + main crate (lib + bin)
-├── Cargo.lock                    # locked dependency versions (reproducible builds)
+├── Cargo.lock
 ├── install.sh                    # one-shot Pi installer
-├── core/                         # picogallery-core: shared plugin trait (no cycle)
+├── core/                         # picogallery-core: shared plugin trait
 │   ├── Cargo.toml
 │   └── src/lib.rs                # PhotoPlugin trait, PhotoMeta, PluginConfig
 ├── src/
 │   ├── lib.rs                    # re-exports core + all modules
 │   ├── main.rs                   # binary entry point + plugin registry
-│   ├── config.rs                 # TOML config structs (DisplayConfig, Transition, …)
+│   ├── config.rs                 # TOML config structs
 │   ├── cache.rs                  # LRU disk image cache
-│   ├── renderer.rs               # SDL2 / KMS-DRM renderer (Linux) or native (macOS)
-│   └── slideshow.rs              # async slideshow engine + background prefetch
+│   ├── renderer.rs               # SDL2 / KMS-DRM renderer
+│   └── slideshow.rs              # async slideshow engine
 └── plugins/
-    ├── google-photos/            # Google Photos via OAuth2 device flow
-    │   ├── Cargo.toml
-    │   └── src/lib.rs
-    ├── amazon-photos/            # Amazon Photos via LWA device flow
-    │   ├── Cargo.toml
-    │   └── src/lib.rs
+    ├── google-photos/            # Google Photos via rclone (no API key needed)
+    ├── amazon-photos/            # Amazon Photos via LWA
     └── local/                    # Local filesystem scanner
-        ├── Cargo.toml
-        └── src/lib.rs
 ```
 
 ---
@@ -45,24 +39,23 @@ picogallery/
 |---|---|---|
 | RSS on Pi Zero | ~8 MB | ~60–120 MB |
 | Binary size | ~4 MB stripped | N/A (interpreter) |
-| CPU during decode | ~40 % one core | ~90 % one core |
+| CPU during decode | ~40% one core | ~90% one core |
 | Startup time | < 0.5 s | 2–5 s |
-| Packages installed | `libsdl2-2.0-0` only | python3, pip, 15+ wheels |
-| GC pauses during fade | None | Yes (Python GC) |
-
-On a Pi Zero with 512 MB RAM, every megabyte matters. Rust wins clearly.
+| Packages installed | `libsdl2` + `rclone` | python3, pip, 15+ wheels |
+| GC pauses during fade | None | Yes |
 
 ---
 
 ## Features
 
-- **No X11, no desktop environment** — renders directly to the KMS/DRM framebuffer via SDL2.
-- **Plugin architecture** — Google Photos, Amazon Photos, and local filesystem today; add your own by implementing a single Rust trait.
-- **OAuth2 device flow** — headless-friendly authentication: a URL and code are shown on screen; the user approves on any browser.
-- **Disk cache with LRU eviction** — photos are cached to SD card so they survive reboots and brief WiFi outages.
-- **Background prefetch** — next N photos are fetched while the current one displays, so transitions are instant.
-- **Cross-fade / slide / cut transitions** — configurable per config.toml. `cut` is fastest on Pi Zero.
-- **Keyboard control** — `→` / `Space` next, `←` prev, `P` pause, `Q` / `Esc` quit.
+- **No X11 / no desktop** — renders directly to the KMS/DRM framebuffer via SDL2.
+- **Plugin architecture** — Google Photos, Amazon Photos, local filesystem; add your own with one Rust trait.
+- **Google Photos via rclone** — no Google Cloud project or API key needed; rclone's own verified OAuth app handles auth.
+- **One-time sign-in** — browser opens automatically on first run; token is saved and reused forever.
+- **Disk cache with LRU eviction** — photos survive reboots and WiFi outages.
+- **Background prefetch** — next N photos are fetched while the current one displays.
+- **Cross-fade / slide / cut transitions** — configurable in `config.toml`.
+- **Keyboard control** — `→`/`Space` next, `←` prev, `P` pause, `Q`/`Esc` quit.
 
 ---
 
@@ -70,101 +63,76 @@ On a Pi Zero with 512 MB RAM, every megabyte matters. Rust wins clearly.
 
 | Device | Notes |
 |---|---|
-| Raspberry Pi Zero W / 2W | Tested; use `--jobs 1` when building |
-| Raspberry Pi 1 Model B+ | Should work; same ARM11 core as Zero |
+| Raspberry Pi Zero W / 2W | Tested; use `--jobs 1` when cross-compiling |
 | Raspberry Pi 2 / 3 / 4 | Full speed |
 
-**Required**: a display connected before boot (HDMI or official DSI touchscreen).
-
-**Not required**: keyboard, mouse, X server, desktop environment, display manager.
+**Required**: display connected before boot (HDMI or DSI).
+**Not required**: keyboard, mouse, X server, desktop environment.
 
 ---
 
 ## System dependencies
 
-Runtime packages (the only ones installed permanently):
-
 ```
-libsdl2-2.0-0     ~1.5 MB   SDL2 with KMS/DRM backend
-libdrm2           ~200 KB   DRM display probing (finds correct /dev/dri/cardN)
-ca-certificates   ~200 KB   HTTPS root certificates (already present on Pi OS)
-```
-
-Build-time only (safe to `apt purge` after compiling):
-```
-libsdl2-dev  libdrm-dev  clang  pkg-config  build-essential
+libsdl2-2.0-0     SDL2 with KMS/DRM backend
+libdrm2           DRM display probing (finds correct /dev/dri/cardN on Pi 4/5)
+rclone            Google Photos sync (no API key — uses rclone's verified OAuth)
+ca-certificates   HTTPS root certs
 ```
 
 ---
 
 ## Quick start
 
-### 1. Install
+### 1. Install rclone
 
 ```bash
-# On your Pi (SSH in or directly):
-curl -sSL https://raw.githubusercontent.com/yourusername/picogallery/main/install.sh | bash
+# macOS
+brew install rclone
+
+# Raspberry Pi / Debian
+sudo apt install rclone
 ```
 
-The installer will:
-- Install `libsdl2-dev`, `clang`, `pkg-config`
-- Install Rust via rustup (if not present)
-- Compile picogallery with release optimisations
-- Install to `/usr/local/bin/picogallery`
-- Add your user to the `video` and `render` groups
-- Write a systemd service
+### 2. Configure
 
-### 2. Configure Google Photos credentials
-
-You need a **TV and Limited Input Devices** OAuth 2.0 client. This type
-supports the device flow, which is headless-compatible.
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project (or use an existing one)
-3. Enable **Photos Library API**
-4. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-5. Choose **TV and Limited Input Devices**
-6. Copy the `client_id` and `client_secret`
-
-Edit your config:
-
-```bash
-nano ~/.config/picogallery/config.toml
-```
+Create `~/.config/picogallery/config.toml`:
 
 ```toml
+[display]
+slide_duration_secs = 10
+transition          = "fade"    # "cut" | "fade" | "slide_left" | "slide_right"
+transition_ms       = 800
+fill_screen         = false
+fps                 = 15
+
+[cache]
+max_mb         = 256
+prefetch_count = 3
+
+# Google Photos — no API key or Cloud project needed
 [[plugins]]
-name          = "google-photos"
-enabled       = true
-client_id     = "1234567890-abc.apps.googleusercontent.com"
-client_secret = "GOCSPX-yourSecret"
+name     = "google-photos"
+enabled  = true
+sync_dir = "/tmp/picogallery-gphotos"   # local photo cache
+# album  = "Holiday 2024"               # optional: one album only
 ```
 
-### 3. First run (auth)
+### 3. Run
 
 ```bash
-# From a terminal (SSH works fine):
-SDL_VIDEODRIVER=kmsdrm picogallery
+picogallery --config ~/.config/picogallery/config.toml
 ```
 
-You will see something like:
+**First run only:** a browser window opens for a one-time Google sign-in
+(rclone's own verified OAuth — nothing to set up in Google Cloud).
+Approve access, and the app stores the token at
+`~/.config/picogallery/rclone-gphotos.conf`.
 
-```
-=== Google Photos ===
-Open this URL on any device:
+Every subsequent run starts immediately with no sign-in prompt.
+rclone syncs new photos in the background while the slideshow runs.
 
-  https://www.google.com/device
-
-Enter code: ABCD-EFGH
-
-(expires in 1800 seconds)
-```
-
-Open the URL on your phone or computer, enter the code, and approve.
-The Pi will detect the approval and start the slideshow automatically.
-The token is saved to `~/.config/picogallery/` so you only do this once.
-
-### 4. Enable on boot
+### 4. Enable on boot (Pi)
 
 ```bash
 sudo systemctl enable --now picogallery
@@ -178,146 +146,97 @@ sudo systemctl enable --now picogallery
 [display]
 slide_duration_secs = 10      # seconds per photo
 transition          = "fade"  # "cut" | "fade" | "slide_left" | "slide_right"
-transition_ms       = 800     # transition length in milliseconds
+transition_ms       = 800     # transition duration in ms
 fill_screen         = false   # true=crop-to-fill, false=letterbox
-fps                 = 15      # max FPS (lower = less CPU; 15 is good for Pi Zero)
+fps                 = 15      # max FPS (lower = less CPU on Pi Zero)
+# width  = 1920               # force resolution (0 = auto-detect)
+# height = 1080
 
 [cache]
 max_mb         = 256   # disk cache ceiling
 prefetch_count = 3     # photos to prefetch ahead
 
-# Google Photos
+# ── Google Photos (rclone backend) ────────────────────────────────────────────
 [[plugins]]
 name          = "google-photos"
 enabled       = true
-client_id     = "..."
-client_secret = "..."
-# album_id = "ABcd123..."  # restrict to one album
+sync_dir      = "/tmp/picogallery-gphotos"   # local cache directory
+# album       = "Favourites"                 # sync one album only
+# max_transfer = "500"                       # MB cap per sync run
 
-# Local files
-[[plugins]]
-name    = "local"
-enabled = false
-paths   = ["/mnt/nas/photos", "/home/pi/Pictures"]
+# ── Local filesystem ──────────────────────────────────────────────────────────
+# [[plugins]]
+# name    = "local"
+# enabled = true
+# paths   = ["/mnt/nas/photos", "/home/pi/Pictures"]
 ```
 
 ---
 
-## Writing a new plugin
+## How Google Photos auth works
 
-1. Create a new crate under `plugins/`:
+No Google Cloud project, no API key, no app verification process.
 
 ```
-plugins/my-source/
-├── Cargo.toml
-└── src/lib.rs
+picogallery starts
+       │
+       ▼
+token saved?  ──yes──▶  sync photos in background  ──▶  slideshow runs
+       │
+      no
+       │
+       ▼
+rclone authorize "google photos"
+  (uses rclone's own verified OAuth app)
+       │
+       ├── macOS: browser opens automatically
+       └── Pi:    URL printed → open on phone/laptop
+       │
+       ▼
+user approves in browser
+       │
+       ▼
+token saved to ~/.config/picogallery/rclone-gphotos.conf
+       │
+       ▼
+rclone syncs photos to sync_dir  ──▶  slideshow starts
 ```
 
-`plugins/my-source/Cargo.toml`:
-```toml
-[package]
-name    = "picogallery-my-source"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-picogallery = { path = "../.." }
-anyhow      = { workspace = true }
-async-trait = { workspace = true }
-log         = { workspace = true }
-tokio       = { workspace = true }
-# add reqwest, serde, etc. as needed
-```
-
-2. Implement the `PhotoPlugin` trait in `plugins/my-source/src/lib.rs`:
-
-```rust
-use picogallery::plugin::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
-use async_trait::async_trait;
-
-pub struct MyPlugin { /* fields */ }
-
-#[async_trait]
-impl PhotoPlugin for MyPlugin {
-    fn name(&self) -> &str { "my-source" }
-
-    async fn init(&mut self, config: &PluginConfig) -> anyhow::Result<()> { Ok(()) }
-    async fn auth_status(&self) -> AuthStatus { AuthStatus::Authenticated }
-    async fn authenticate(&mut self) -> anyhow::Result<AuthStatus> { Ok(AuthStatus::Authenticated) }
-
-    async fn list_photos(&self, limit: usize, offset: usize) -> anyhow::Result<Vec<PhotoMeta>> {
-        // Return metadata — no pixel data here.
-        Ok(vec![])
-    }
-
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> anyhow::Result<Vec<u8>> {
-        // Return raw JPEG/PNG bytes.
-        Ok(vec![])
-    }
-}
-```
-
-3. Register the crate in the root `Cargo.toml` (three places):
-
-```toml
-# Under [workspace] members:
-members = [".", "plugins/my-source", ...]
-
-# Under [dependencies]:
-picogallery-my-source = { path = "plugins/my-source", optional = true }
-
-# Under [features]:
-plugin-my-source = ["dep:picogallery-my-source"]
-```
-
-4. Add to `build_plugins()` in `src/main.rs`:
-
-```rust
-#[cfg(feature = "plugin-my-source")]
-{
-    if let Some(pcfg) = cfg.plugin_config("my-source") {
-        plugins.push(Box::new(picogallery_my_source::MyPlugin::new(pcfg.clone())));
-    }
-}
-```
-
-5. Add a `[[plugins]]` entry to `~/.config/picogallery/config.toml` and build with `--features plugin-my-source`.
+The token is refreshed automatically by rclone on every sync.
+Re-authentication is never required unless you revoke access.
 
 ---
 
-## Running locally for development and testing
+## Running locally for development
 
-The app runs on **macOS and Linux** without a Pi. SDL2 uses its native backend
-(Cocoa/Metal on macOS, X11/KMS on Linux). The KMS/DRM probe and `kmsdrm` video
-driver are automatically disabled on non-Linux platforms.
+The app runs on macOS and Linux without a Pi. SDL2 uses its native backend
+(Cocoa/Metal on macOS). KMS/DRM is compiled out on non-Linux platforms.
 
 ### Prerequisites
 
 **macOS**
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-source "$HOME/.cargo/env"
-
-# cmake is required to compile the bundled SDL2
-# Download cmake universal binary from https://cmake.org/download/
-# and add to PATH, or install via a package manager
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+brew install rclone cmake
 ```
 
-**Linux (Ubuntu/Debian)**
+**Linux**
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-source "$HOME/.cargo/env"
-sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential rclone
 ```
 
-### Build for local testing (local plugin only — no credentials needed)
+### Build
 
 ```bash
+# Full build (Google Photos + local)
+cargo build
+
+# Local-only build (no rclone needed)
 cargo build --no-default-features --features plugin-local
 ```
 
-### Create test photos
+### Test with local photos
 
 ```bash
 mkdir -p /tmp/picogallery-test-photos
@@ -341,20 +260,17 @@ for filename, colour, label in photos:
 EOF
 ```
 
-### Write a test config
+Write a local-only config:
 
 ```bash
-mkdir -p ~/.config/picogallery
 cat > ~/.config/picogallery/config.toml << 'EOF'
 [display]
 slide_duration_secs = 4
-transition          = "fade"
-transition_ms       = 600
-fill_screen         = false
-fps                 = 30
+transition = "fade"
+fps = 30
 
 [cache]
-max_mb         = 64
+max_mb = 64
 prefetch_count = 2
 
 [[plugins]]
@@ -364,39 +280,92 @@ paths   = ["/tmp/picogallery-test-photos"]
 EOF
 ```
 
-### Run
+### Run (macOS)
 
 ```bash
-# macOS — SDL2 compiled from source (bundled), find its dylib first:
 SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs dirname)
-DYLD_LIBRARY_PATH="$SDL_LIB" RUST_LOG=info ./target/debug/picogallery
-
-# Linux
-RUST_LOG=info ./target/debug/picogallery
-
-# Or with explicit config path:
-RUST_LOG=info ./target/debug/picogallery --config ~/.config/picogallery/config.toml
+DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery --config ~/.config/picogallery/config.toml
 ```
 
-Keys while running: `→` / `Space` next · `←` prev · `P` pause · `Q` / `Esc` quit
+### Run with Google Photos (macOS)
 
-### Measured resource usage (macOS Apple Silicon, release build)
-
-| Metric | Debug build | Release build |
-|---|---|---|
-| Binary size | 18 MB | **1.5 MB** |
-| RSS at idle (photo on screen) | ~135 MB | **~1.6 MB** |
-| RSS during transition | ~140 MB | **~2–3 MB** |
-| CPU at idle | ~0.1% | **~0%** |
-| CPU during fade transition | 54–101% (unoptimised) | ~10–15% (estimate) |
-
-Build release for accurate numbers:
 ```bash
-cargo build --release --no-default-features --features plugin-local
+SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs dirname)
+DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery --config ~/.config/picogallery/config.toml
 ```
 
-> **Note:** the debug build is large because it includes debug symbols, bounds checks,
-> and unoptimised allocations. Always use `--release` for Pi deployment and benchmarking.
+First run opens a browser. After approving, the slideshow starts automatically.
+
+---
+
+## Writing a new plugin
+
+1. Create `plugins/my-source/Cargo.toml`:
+
+```toml
+[package]
+name    = "picogallery-my-source"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+log              = { workspace = true }
+tokio            = { workspace = true }
+```
+
+2. Implement `PhotoPlugin` in `plugins/my-source/src/lib.rs`:
+
+```rust
+use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use async_trait::async_trait;
+
+pub struct MyPlugin;
+
+#[async_trait]
+impl PhotoPlugin for MyPlugin {
+    fn name(&self) -> &str { "my-source" }
+
+    async fn init(&mut self, _cfg: &PluginConfig) -> anyhow::Result<()> { Ok(()) }
+    async fn auth_status(&self) -> AuthStatus { AuthStatus::Authenticated }
+    async fn authenticate(&mut self) -> anyhow::Result<AuthStatus> {
+        Ok(AuthStatus::Authenticated)
+    }
+    async fn refresh_auth(&mut self) -> anyhow::Result<()> { Ok(()) }
+
+    async fn list_photos(&self, limit: usize, offset: usize) -> anyhow::Result<Vec<PhotoMeta>> {
+        Ok(vec![])
+    }
+
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> anyhow::Result<Vec<u8>> {
+        Ok(vec![])
+    }
+}
+```
+
+3. Add to root `Cargo.toml`:
+
+```toml
+# [workspace] members:
+"plugins/my-source"
+
+# [dependencies]:
+picogallery-my-source = { path = "plugins/my-source", optional = true }
+
+# [features]:
+plugin-my-source = ["dep:picogallery-my-source"]
+```
+
+4. Register in `src/main.rs` `build_plugins()`:
+
+```rust
+#[cfg(feature = "plugin-my-source")]
+if let Some(pcfg) = cfg.plugin_config("my-source") {
+    plugins.push(Box::new(picogallery_my_source::MyPlugin::new(pcfg.clone())));
+}
+```
 
 ---
 
@@ -404,43 +373,17 @@ cargo build --release --no-default-features --features plugin-local
 
 ```toml
 [display]
-transition  = "cut"   # no fade — saves CPU
-fps         = 10      # reduce frame rate
-fill_screen = false   # letterbox is cheaper than crop+scale
+transition    = "cut"   # no animation — saves CPU
 transition_ms = 0
+fps           = 10
+fill_screen   = false   # letterbox cheaper than crop+scale
 
 [cache]
-prefetch_count = 2    # fewer concurrent fetches
-max_mb         = 128  # smaller if SD card is tight
+prefetch_count = 2
+max_mb         = 128
 ```
 
-Set `gpu_mem=64` in `/boot/config.txt` (the installer does this automatically).
-
----
-
-## Display without keyboard
-
-A GPIO button can send keyboard events to picogallery via `triggerhappy`.
-`triggerhappy` reads `/dev/input/event*` directly — no X server needed.
-
-Install:
-```bash
-sudo apt-get install -y --no-install-recommends triggerhappy
-```
-
-Wire a button to a GPIO pin and map it in `/etc/triggerhappy/triggers.d/picogallery.conf`:
-```
-# KEY_NEXT / KEY_PREVIOUS are sent by a GPIO button driver (e.g. gpio-keys overlay)
-KEY_NEXT     1    picogallery-ctl next
-KEY_PREVIOUS 1    picogallery-ctl prev
-```
-
-Alternatively, send `SIGUSR1`/`SIGUSR2` directly to advance slides:
-```bash
-kill -USR1 $(pidof picogallery)   # next photo
-```
-
-> **Do not use `xdotool`** — it requires an X server which this project intentionally avoids.
+Set `gpu_mem=64` in `/boot/config.txt` (the installer does this).
 
 ---
 
@@ -450,50 +393,56 @@ kill -USR1 $(pidof picogallery)   # next photo
 config.toml
     │
     ▼
-Plugin registry ──┬── GooglePhotosPlugin (OAuth2 device flow → Photos API)
-                  ├── AmazonPhotosPlugin (LWA device flow → Drive API)
+Plugin registry ──┬── GooglePhotosPlugin (rclone sync → local disk)
+                  ├── AmazonPhotosPlugin (LWA OAuth → Amazon API)
                   └── LocalPlugin (filesystem scan)
-                        │  dyn PhotoPlugin trait
+                        │  dyn PhotoPlugin
                         ▼
                   Slideshow engine
-                  ├─ build_queue(): page through plugins, shuffle
-                  ├─ prefetch loop: async fetch → disk cache → decode
+                  ├─ build_queue(): list photos from plugins, shuffle
+                  ├─ prefetch loop: fetch → disk cache → decode
                   └─ display loop: transition → show → event poll
                         │
                         ▼
-                  Renderer (SDL2, SDL_VIDEODRIVER=kmsdrm)
+                  Renderer (SDL2, SDL_VIDEODRIVER=kmsdrm on Linux)
                   │
-                  ├─ DRM probe (startup, once)
+                  ├─ DRM probe (Linux only, startup once)
                   │   └─ scans /dev/dri/card0..3 via drm crate
-                  │   └─ finds connected HDMI/DSI connector
-                  │   └─ reads native resolution from preferred mode
-                  │   └─ sets SDL_VIDEO_KMSDRM_DEVICE → correct cardN
+                  │   └─ finds connected display, native resolution
+                  │   └─ sets SDL_VIDEO_KMSDRM_DEVICE=correct cardN
                   │
-                  └─ SDL2 KMS/DRM renderer
-                        │
-                        ▼
-                  /dev/dri/cardN  (VC4 KMS/DRM — no X11)
-                        │
-                        ▼
-                  HDMI / DSI display
+                  └─ SDL2 canvas → present → /dev/dri/cardN → HDMI
 ```
 
-### Why SDL2 + DRM probe rather than raw DRM?
+### SDL2 + DRM probe vs raw DRM
 
-The Raspberry Pi's VC4/V3D GPU driver does **not** support DRM dumb buffers
-(`DRM_CAP_DUMB_BUFFER = 0` on vc4).  Going fully raw would require GBM buffer
-management + EGL — adding `libgbm` and `libEGL` as runtime dependencies and
-significant complexity for no user-visible benefit.
+The Pi's VC4 GPU does not support DRM dumb buffers (`DRM_CAP_DUMB_BUFFER=0`).
+Raw DRM would require GBM+EGL. SDL2's KMS backend already uses GBM+EGL internally
+and is well-tested on Pi. The `drm` crate is used only to probe which card is active.
 
-SDL2's KMS/DRM backend already uses GBM+EGL internally and is well-tested on Pi.
-The `drm` crate is used only for the lightweight startup probe — no buffers are
-allocated, no DRM master is claimed.
-
-| Approach | Runtime libs | Works on VC4 | Complexity |
+| Approach | Runtime deps | Works on VC4 | Complexity |
 |---|---|---|---|
-| Raw DRM dumb buffers | libdrm2 | ✗ (no dumb buffer cap) | High |
-| Raw DRM + GBM + EGL | libdrm2 libgbm libEGL | ✓ | Very high |
-| **SDL2 + DRM probe (chosen)** | **libsdl2 libdrm2** | **✓** | **Low** |
+| Raw DRM dumb buffers | libdrm2 | No | High |
+| Raw DRM + GBM + EGL | libdrm2 libgbm libEGL | Yes | Very high |
+| **SDL2 + DRM probe (chosen)** | **libsdl2 libdrm2** | **Yes** | **Low** |
+
+---
+
+## Display without keyboard (GPIO button)
+
+Use `triggerhappy` — reads `/dev/input/event*` directly, no X server needed.
+
+```bash
+sudo apt-get install -y triggerhappy
+```
+
+`/etc/triggerhappy/triggers.d/picogallery.conf`:
+```
+KEY_NEXT     1    kill -USR1 $(pidof picogallery)
+KEY_PREVIOUS 1    kill -USR2 $(pidof picogallery)
+```
+
+> Do not use `xdotool` — it requires X11.
 
 ---
 

@@ -135,18 +135,24 @@ max_mb        = 256   # disk cache ceiling in megabytes
 prefetch_count = 3    # photos to pre-fetch ahead (keep low on Pi Zero)
 
 # ─────────────────────────────────────────────────────────────
-# Google Photos Plugin
+# Google Photos Plugin  (uses rclone — no API key needed)
 # ─────────────────────────────────────────────────────────────
-# 1. Go to https://console.cloud.google.com/
-# 2. Create a project, enable "Photos Library API"
-# 3. Create an OAuth 2.0 Client ID → TV and Limited Input Devices
-# 4. Copy the client_id and client_secret below
+# One-time setup (run once in a terminal, then never again):
+#   rclone config
+#   → n  (new remote)
+#   → name: gphotos
+#   → type: google photos
+#   → leave client_id / client_secret blank  (use rclone's built-in)
+#   → read_only: true
+#   → browser opens → sign in to Google → approve
+#   → q  (quit)
 [[plugins]]
-name          = "google-photos"
-enabled       = true
-client_id     = "YOUR_CLIENT_ID.apps.googleusercontent.com"
-client_secret = "YOUR_CLIENT_SECRET"
-# album_id    = ""   # Leave blank to show all photos, or paste an album ID
+name           = "google-photos"
+enabled        = true
+rclone_remote  = "gphotos"                    # must match the name you gave in rclone config
+sync_dir       = "/tmp/picogallery-gphotos"   # local cache of synced photos
+# album        = "Favourites"                 # optional: sync one album only
+# max_transfer = "500"                        # MB cap per sync run
 
 # ─────────────────────────────────────────────────────────────
 # Amazon Photos Plugin (optional)

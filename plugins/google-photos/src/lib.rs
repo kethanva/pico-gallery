@@ -1,252 +1,228 @@
-/// Google Photos plugin for PicoGallery.
+/// Google Photos plugin for PicoGallery — rclone backend.
 ///
-/// Authentication uses the OAuth 2.0 Device Authorization Grant
-/// (RFC 8628).  This is the right flow for a headless Pi: the user
-/// is shown a short URL and code, visits it on their phone or PC,
-/// approves, and the Pi polls until the token arrives.
+/// On first run, spawns `rclone authorize "google photos"` which opens a browser
+/// for a one-time Google sign-in (uses rclone's own verified OAuth app — no
+/// Google Cloud project or API key required).  The resulting token is stored in
+/// `<config_dir>/picogallery/rclone-gphotos.conf`.  Every subsequent run reuses
+/// that token; rclone refreshes it automatically.
 ///
-/// Required config keys:
-///   client_id     — OAuth2 client ID (TV/Limited-Input type)
-///   client_secret — OAuth2 client secret
-///   album_id      — (optional) restrict to a single album
+/// After auth, photos are synced from Google Photos to `sync_dir` via
+/// `rclone copy` and served from disk.
+///
+/// Config keys (in config.toml):
+///   sync_dir      — local cache directory  (default: /tmp/picogallery-gphotos)
+///   album         — sync one album only    (default: all photos)
+///   max_transfer  — MB cap per sync run    (default: "500")
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::process::Command;
 
-// Re-export the plugin trait from the main crate.
 use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
-// ── Token storage ─────────────────────────────────────────────────────────────
-
-const TOKEN_FILE: &str = "google-photos-token.json";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredToken {
-    access_token:  String,
-    refresh_token: Option<String>,
-    expires_at:    DateTime<Utc>,
-}
-
-impl StoredToken {
-    fn is_expired(&self) -> bool {
-        Utc::now() >= self.expires_at - chrono::Duration::minutes(5)
-    }
-}
-
-// ── Google API types ──────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct DeviceCodeResponse {
-    device_code:      String,
-    user_code:        String,
-    verification_url: String,
-    interval:         u64,
-    expires_in:       u64,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token:  String,
-    token_type:    String,
-    expires_in:    Option<u64>,
-    refresh_token: Option<String>,
-    #[serde(default)]
-    error:         Option<String>,
-}
-
-#[derive(Deserialize)]
-struct MediaItemsResponse {
-    #[serde(rename = "mediaItems", default)]
-    media_items:    Vec<GMediaItem>,
-    #[serde(rename = "nextPageToken")]
-    next_page_token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GMediaItem {
-    id:       String,
-    filename: String,
-    #[serde(rename = "mediaMetadata")]
-    metadata: GMediaMetadata,
-    #[serde(rename = "baseUrl")]
-    base_url: String,
-}
-
-#[derive(Deserialize)]
-struct GMediaMetadata {
-    width:            Option<String>,
-    height:           Option<String>,
-    #[serde(rename = "creationTime")]
-    creation_time:    Option<String>,
-}
-
-// ── Plugin struct ─────────────────────────────────────────────────────────────
+/// Name of the rclone remote written into our private config file.
+const REMOTE: &str = "picogallery-gphotos";
 
 pub struct GooglePhotosPlugin {
-    cfg:           PluginConfig,
-    client:        reqwest::Client,
-    token:         Option<StoredToken>,
-    token_dir:     PathBuf,
-    device_code:   Option<String>,
-    poll_interval: u64,
+    cfg:       PluginConfig,
+    conf_path: PathBuf,  // our generated rclone.conf (isolated from user's rclone)
 }
 
 impl GooglePhotosPlugin {
     pub fn new(cfg: PluginConfig) -> Self {
-        Self {
-            cfg,
-            client:        reqwest::Client::new(),
-            token:         None,
-            token_dir:     dirs::config_dir()
-                               .unwrap_or_default()
-                               .join("picogallery"),
-            device_code:   None,
-            poll_interval: 5,
+        let conf_path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("picogallery")
+            .join("rclone-gphotos.conf");
+        Self { cfg, conf_path }
+    }
+
+    // ── Config helpers ────────────────────────────────────────────────────────
+
+    fn sync_dir(&self) -> PathBuf {
+        PathBuf::from(self.cfg.get_str("sync_dir").unwrap_or("/tmp/picogallery-gphotos"))
+    }
+
+    fn rclone_src(&self) -> String {
+        match self.cfg.get_str("album") {
+            Some(album) => format!("{}:album/{}", REMOTE, album),
+            None        => format!("{}:media/all", REMOTE),
         }
     }
 
-    // ── Config helpers ────────────────────────────────────────────────────
-
-    fn client_id(&self)     -> Result<&str> { self.cfg.require_str("client_id") }
-    fn client_secret(&self) -> Result<&str> { self.cfg.require_str("client_secret") }
-    fn album_id(&self)      -> Option<&str> { self.cfg.get_str("album_id") }
-
-    // ── Token persistence ─────────────────────────────────────────────────
-
-    fn token_path(&self) -> PathBuf { self.token_dir.join(TOKEN_FILE) }
-
-    async fn save_token(&self, t: &StoredToken) {
-        let p = self.token_path();
-        let _ = fs::create_dir_all(p.parent().unwrap()).await;
-        let _ = fs::write(&p, serde_json::to_vec(t).unwrap_or_default()).await;
+    fn max_transfer_mb(&self) -> String {
+        format!("{}M", self.cfg.get_str("max_transfer").unwrap_or("500"))
     }
 
-    async fn load_token(&mut self) {
-        let p = self.token_path();
-        if let Ok(data) = fs::read(&p).await {
-            if let Ok(t) = serde_json::from_slice::<StoredToken>(&data) {
-                self.token = Some(t);
-            }
-        }
-    }
+    // ── Auth ──────────────────────────────────────────────────────────────────
 
-    // ── OAuth2 device flow ────────────────────────────────────────────────
+    fn token_saved(&self) -> bool { self.conf_path.exists() }
 
-    async fn request_device_code(&mut self) -> Result<DeviceCodeResponse> {
-        let res = self.client
-            .post("https://oauth2.googleapis.com/device/code")
-            .form(&[
-                ("client_id", self.client_id()?),
-                ("scope",     "https://www.googleapis.com/auth/photoslibrary.readonly"),
-            ])
-            .send().await?
-            .error_for_status()?
-            .json::<DeviceCodeResponse>().await?;
-        Ok(res)
-    }
+    /// Run `rclone authorize "google photos"`, parse the printed token, and
+    /// write a minimal rclone config that subsequent `rclone copy` calls use.
+    async fn run_rclone_authorize(&self) -> Result<()> {
+        info!("Google Photos: starting rclone authorize — browser will open…");
+        println!("\n=== Google Photos — one-time sign-in ===");
+        println!("A browser window is opening. Sign in to Google and approve access.");
+        println!("(On a headless Pi, visit the printed URL from another device.)\n");
 
-    async fn poll_token(&self, device_code: &str) -> Result<Option<StoredToken>> {
-        let res = self.client
-            .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("client_id",     self.client_id()?),
-                ("client_secret", self.client_secret()?),
-                ("device_code",   device_code),
-                ("grant_type",    "urn:ietf:params:oauth:grant-type:device_code"),
-            ])
-            .send().await?
-            .json::<TokenResponse>().await?;
+        let output = Command::new("rclone")
+            .args(["authorize", "google photos"])
+            .output()
+            .await
+            .context("running 'rclone authorize google photos' — is rclone installed?")?;
 
-        if let Some(err) = &res.error {
-            if err == "authorization_pending" || err == "slow_down" {
-                return Ok(None); // not yet — keep polling
-            }
-            anyhow::bail!("Token error: {}", err);
-        }
+        // rclone prints the token to stdout between markers; some versions use stderr.
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        debug!("rclone authorize output:\n{}", combined);
 
-        let expires_in = res.expires_in.unwrap_or(3600);
-        let token = StoredToken {
-            access_token:  res.access_token,
-            refresh_token: res.refresh_token,
-            expires_at:    Utc::now() + chrono::Duration::seconds(expires_in as i64),
-        };
-        Ok(Some(token))
-    }
+        let token_json = extract_token_json(&combined).with_context(|| {
+            format!(
+                "Could not find token in rclone authorize output.\n\
+                 Full output:\n{}",
+                combined
+            )
+        })?;
 
-    async fn refresh_token_now(&mut self) -> Result<()> {
-        let refresh_token = match &self.token {
-            Some(t) => t.refresh_token.clone().context("no refresh token")?,
-            None    => anyhow::bail!("not authenticated"),
-        };
+        // Write a self-contained rclone config with the token embedded.
+        // Using --config <this_file> keeps us isolated from any existing rclone setup.
+        let conf = format!(
+            "[{}]\ntype = google photos\nread_only = true\ntoken = {}\n",
+            REMOTE, token_json
+        );
+        fs::create_dir_all(self.conf_path.parent().unwrap()).await?;
+        fs::write(&self.conf_path, conf).await
+            .with_context(|| format!("writing {}", self.conf_path.display()))?;
 
-        let res = self.client
-            .post("https://oauth2.googleapis.com/token")
-            .form(&[
-                ("client_id",     self.client_id()?),
-                ("client_secret", self.client_secret()?),
-                ("refresh_token", &refresh_token as &str),
-                ("grant_type",    "refresh_token"),
-            ])
-            .send().await?
-            .json::<TokenResponse>().await?;
-
-        let expires_in = res.expires_in.unwrap_or(3600);
-        let token = StoredToken {
-            access_token:  res.access_token,
-            refresh_token: Some(refresh_token),
-            expires_at:    Utc::now() + chrono::Duration::seconds(expires_in as i64),
-        };
-        self.save_token(&token).await;
-        self.token = Some(token);
+        info!("Google Photos: token saved → {}", self.conf_path.display());
         Ok(())
     }
 
-    fn access_token(&self) -> Result<&str> {
-        self.token.as_ref()
-            .map(|t| t.access_token.as_str())
-            .ok_or_else(|| anyhow::anyhow!("not authenticated"))
+    // ── Sync ──────────────────────────────────────────────────────────────────
+
+    /// Foreground sync: download recent photos quickly so the slideshow can start.
+    ///
+    /// Strategy: sync by-year (fast — only one year's photos) starting from the
+    /// current year, falling back to previous years until photos are found.
+    /// Full library sync happens in background via spawn_sync().
+    async fn sync_initial(&self) -> Result<()> {
+        let conf = self.conf_path.to_str().unwrap_or("");
+        let dst  = self.sync_dir();
+        let dst_str = dst.to_str().unwrap_or("");
+
+        // If the user pinned a specific album, sync that directly.
+        if self.cfg.get_str("album").is_some() {
+            info!("Google Photos: initial sync from album…");
+            let out = Command::new("rclone")
+                .args([
+                    "--config", conf, "copy", &self.rclone_src(), dst_str,
+                    "--transfers", "4",
+                    "--include", "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
+                ])
+                .output().await.context("rclone initial sync (album)")?;
+            if !out.status.success() {
+                warn!("rclone album sync: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            return Ok(());
+        }
+
+        // Try by-year from current year going back up to 5 years.
+        let current_year = current_year();
+        for year in (current_year - 5..=current_year).rev() {
+            let src = format!("{}:media/by-year/{}", REMOTE, year);
+            info!("Google Photos: initial sync from {} (fast year-based)…", src);
+
+            let out = Command::new("rclone")
+                .args([
+                    "--config", conf, "copy", &src, dst_str,
+                    "--transfers", "4",
+                    "--include", "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
+                ])
+                .output().await.context("rclone initial sync (by-year)")?;
+
+            if !out.status.success() {
+                warn!("rclone year {} sync: {}", year, String::from_utf8_lossy(&out.stderr).trim());
+                continue;
+            }
+
+            // Check if we actually got some photos.
+            let found = Self::list_local_images(&dst).await;
+            if !found.is_empty() {
+                info!("Google Photos: initial sync done — {} photos from {}.", found.len(), year);
+                return Ok(());
+            }
+            info!("Google Photos: no photos in {} — trying earlier year.", year);
+        }
+
+        warn!("Google Photos: no photos found in recent years. Background sync will continue.");
+        Ok(())
     }
 
-    // ── Photos API ────────────────────────────────────────────────────────
+    /// Background sync: keep pulling the full library without blocking.
+    async fn spawn_sync(&self) {
+        let conf   = self.conf_path.clone();
+        let src    = self.rclone_src();
+        let dst    = self.sync_dir();
+        let max_mb = self.max_transfer_mb();
 
-    async fn list_page(&self, page_token: Option<&str>, page_size: usize) -> Result<MediaItemsResponse> {
-        let token = self.access_token()?;
+        tokio::spawn(async move {
+            info!("rclone background sync: {} → {}", src, dst.display());
+            let result = Command::new("rclone")
+                .args([
+                    "--config",      conf.to_str().unwrap_or(""),
+                    "copy",          &src,
+                    dst.to_str().unwrap_or(""),
+                    "--max-transfer", &max_mb,
+                    "--transfers",   "2",
+                    "--checkers",    "4",
+                    "--no-traverse",
+                    "--include",     "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
+                ])
+                .output().await;
 
-        let url = match self.album_id() {
-            Some(album) => {
-                // Album-scoped search.
-                let body = serde_json::json!({
-                    "albumId":   album,
-                    "pageSize":  page_size,
-                    "pageToken": page_token.unwrap_or(""),
-                });
-                let res = self.client
-                    .post("https://photoslibrary.googleapis.com/v1/mediaItems:search")
-                    .bearer_auth(token)
-                    .json(&body)
-                    .send().await?
-                    .error_for_status()?
-                    .json::<MediaItemsResponse>().await?;
-                return Ok(res);
+            match result {
+                Ok(o) if o.status.success() => info!("rclone background sync complete."),
+                Ok(o) => warn!(
+                    "rclone sync exited {}: {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => warn!("rclone spawn error: {}", e),
             }
-            None => format!(
-                "https://photoslibrary.googleapis.com/v1/mediaItems?pageSize={}&pageToken={}",
-                page_size, page_token.unwrap_or("")
-            ),
-        };
+        });
+    }
 
-        let res = self.client
-            .get(&url)
-            .bearer_auth(token)
-            .send().await?
-            .error_for_status()?
-            .json::<MediaItemsResponse>().await?;
-        Ok(res)
+    // ── Local file listing ────────────────────────────────────────────────────
+
+    async fn list_local_images(dir: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let Ok(mut entries) = fs::read_dir(dir).await else { return paths };
+        let mut stack = vec![entries];
+
+        while let Some(rd) = stack.last_mut() {
+            match rd.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    match entry.file_type().await {
+                        Ok(ft) if ft.is_dir() => {
+                            if let Ok(sub) = fs::read_dir(&path).await {
+                                stack.push(sub);
+                            }
+                        }
+                        Ok(_) if is_image(&path) => paths.push(path),
+                        _ => {}
+                    }
+                }
+                Ok(None) | Err(_) => { stack.pop(); }
+            }
+        }
+        paths
     }
 }
 
@@ -254,114 +230,162 @@ impl GooglePhotosPlugin {
 
 #[async_trait]
 impl PhotoPlugin for GooglePhotosPlugin {
-    fn name(&self)         -> &str { "google-photos"  }
+    fn name(&self)         -> &str { "google-photos" }
     fn display_name(&self) -> &str { "Google Photos"  }
-    fn version(&self)      -> &str { "0.1.0"          }
+    fn version(&self)      -> &str { "0.3.0"          }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
-        self.load_token().await;
+    async fn init(&mut self, _cfg: &PluginConfig) -> Result<()> {
+        fs::create_dir_all(self.sync_dir()).await
+            .with_context(|| format!("creating sync_dir {}", self.sync_dir().display()))?;
         Ok(())
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        match &self.token {
-            None    => AuthStatus::NotAuthenticated,
-            Some(t) if t.is_expired() && t.refresh_token.is_none() => AuthStatus::NotAuthenticated,
-            Some(_) => AuthStatus::Authenticated,
-        }
+        if self.token_saved() { AuthStatus::Authenticated } else { AuthStatus::NotAuthenticated }
     }
 
     async fn authenticate(&mut self) -> Result<AuthStatus> {
-        // Already authenticated?
-        if let Some(t) = &self.token {
-            if !t.is_expired() { return Ok(AuthStatus::Authenticated); }
-            if t.refresh_token.is_some() {
-                self.refresh_token_now().await?;
-                return Ok(AuthStatus::Authenticated);
-            }
+        // Check rclone is present.
+        let rclone_ok = Command::new("rclone").arg("version").output().await
+            .map(|o| o.status.success()).unwrap_or(false);
+
+        if !rclone_ok {
+            return Ok(AuthStatus::PendingUserAction {
+                message: "rclone is not installed.\n\
+                          macOS: brew install rclone\n\
+                          Pi:    sudo apt install rclone\n\
+                          Then restart picogallery — it will sign in automatically.".to_string(),
+                poll_interval_secs: 10,
+            });
         }
 
-        // Start the device flow.
-        let dc = self.request_device_code().await?;
-        self.device_code   = Some(dc.device_code.clone());
-        self.poll_interval = dc.interval;
+        // Already have a saved token — nothing to do.
+        if self.token_saved() {
+            info!("Google Photos: using saved rclone token.");
+            return Ok(AuthStatus::Authenticated);
+        }
 
-        let message = format!(
-            "Open this URL on any device:\n\n  {}\n\nEnter code: {}\n\n(expires in {} seconds)",
-            dc.verification_url, dc.user_code, dc.expires_in
-        );
-
-        Ok(AuthStatus::PendingUserAction {
-            message,
-            poll_interval_secs: dc.interval,
-        })
+        // First run: do the one-time browser sign-in.
+        // rclone authorize blocks until the user approves (or times out).
+        self.run_rclone_authorize().await?;
+        Ok(AuthStatus::Authenticated)
     }
 
-    async fn refresh_auth(&mut self) -> Result<()> {
-        // Called from main loop: check token expiry and try to refresh.
-        if let Some(t) = &self.token {
-            if t.is_expired() { self.refresh_token_now().await?; }
+    async fn refresh_auth(&mut self) -> Result<()> { Ok(()) } // rclone handles token refresh
+
+    async fn list_photos(&self, limit: usize, _offset: usize) -> Result<Vec<PhotoMeta>> {
+        let local = Self::list_local_images(&self.sync_dir()).await;
+
+        if local.is_empty() {
+            // First run: foreground sync of the most recent year so the
+            // slideshow has something to show immediately.
+            self.sync_initial().await?;
         }
 
-        // Also poll device code if we're in the middle of auth.
-        if let Some(code) = self.device_code.clone() {
-            if let Ok(Some(token)) = self.poll_token(&code).await {
-                info!("Google Photos: device authorized!");
-                self.save_token(&token).await;
-                self.token       = Some(token);
-                self.device_code = None;
-            }
+        // Full library sync runs in background (idempotent — skips existing files).
+        self.spawn_sync().await;
+
+        let paths = Self::list_local_images(&self.sync_dir()).await;
+
+        if paths.is_empty() {
+            warn!("Google Photos: still no photos after initial sync. Check rclone config.");
+            return Ok(vec![]);
         }
-        Ok(())
-    }
 
-    async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
-        // Google Photos API doesn't support arbitrary offsets; we page through
-        // sequentially and track the page token internally.
-        // For simplicity, we fetch one full page of `limit` items.
-        // A production implementation would cache page tokens.
-        let response = self.list_page(None, limit).await?;
+        let photos: Vec<PhotoMeta> = paths.into_iter()
+            .take(limit)
+            .enumerate()
+            .map(|(i, path)| {
+                let filename = path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                PhotoMeta {
+                    id:           i.to_string(),
+                    filename:     filename,
+                    width:        0,
+                    height:       0,
+                    taken_at:     None,
+                    download_url: Some(path.to_string_lossy().to_string()),
+                    extra:        Default::default(),
+                }
+            })
+            .collect();
 
-        let photos: Vec<PhotoMeta> = response.media_items.into_iter().map(|item| {
-            let w = item.metadata.width.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let h = item.metadata.height.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let taken_at = item.metadata.creation_time.as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc));
-            PhotoMeta {
-                id:           item.id,
-                filename:     item.filename,
-                width:        w,
-                height:       h,
-                taken_at,
-                download_url: Some(item.base_url),
-                extra:        Default::default(),
-            }
-        }).collect();
-
+        info!("Google Photos: {} photos available locally.", photos.len());
         Ok(photos)
     }
 
     async fn get_photo_bytes(
         &self,
         meta: &PhotoMeta,
-        display_width: u32,
-        display_height: u32,
+        _dw: u32,
+        _dh: u32,
     ) -> Result<Vec<u8>> {
-        // Google Photos base URL + `=w{W}-h{H}` suffix requests closest CDN size.
-        let base = meta.download_url.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("no download URL for {}", meta.id))?;
-        let url = format!("{}=w{}-h{}", base, display_width * 2, display_height * 2);
-
-        let bytes = self.client
-            .get(&url)
-            .bearer_auth(self.access_token()?)
-            .send().await?
-            .error_for_status()?
-            .bytes().await?
-            .to_vec();
-
-        debug!("Fetched {} bytes for {}", bytes.len(), meta.filename);
-        Ok(bytes)
+        let path = meta.download_url.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no local path for {}", meta.filename))?;
+        fs::read(path).await
+            .with_context(|| format!("reading local photo {}", path))
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Extract the token JSON that rclone prints between its paste markers.
+/// Handles both stdout and stderr across rclone versions.
+fn extract_token_json(output: &str) -> Option<String> {
+    // Primary: look for content between "--->" and "<---End paste"
+    if let Some(arrow) = output.find("--->") {
+        let after = &output[arrow + 4..];
+        let end   = after.find("<---").unwrap_or(after.len());
+        let candidate = after[..end].trim();
+        if candidate.starts_with('{') && candidate.ends_with('}') {
+            return Some(candidate.to_string());
+        }
+    }
+
+    // Fallback: find any JSON object containing both access_token and refresh_token.
+    // Walk the string looking for '{' ... '}' pairs at the top level.
+    let bytes = output.as_bytes();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0 { start = Some(i); }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        let candidate = &output[s..=i];
+                        if candidate.contains("access_token") && candidate.contains("refresh_token") {
+                            return Some(candidate.to_string());
+                        }
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns the current calendar year (UTC, approximate — 365.25 days/year).
+fn current_year() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    1970 + (secs / 31_557_600) as u32
+}
+
+fn is_image(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+    )
 }
