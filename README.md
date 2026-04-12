@@ -13,14 +13,17 @@
 ```
 picogallery/
 ├── Cargo.toml                    # workspace root + main crate (lib + bin)
+├── Cargo.lock                    # locked dependency versions (reproducible builds)
 ├── install.sh                    # one-shot Pi installer
+├── core/                         # picogallery-core: shared plugin trait (no cycle)
+│   ├── Cargo.toml
+│   └── src/lib.rs                # PhotoPlugin trait, PhotoMeta, PluginConfig
 ├── src/
-│   ├── lib.rs                    # re-exports all modules (plugins import from here)
+│   ├── lib.rs                    # re-exports core + all modules
 │   ├── main.rs                   # binary entry point + plugin registry
-│   ├── plugin.rs                 # PhotoPlugin trait, PhotoMeta, PluginConfig
 │   ├── config.rs                 # TOML config structs (DisplayConfig, Transition, …)
 │   ├── cache.rs                  # LRU disk image cache
-│   ├── renderer.rs               # SDL2 / KMS-DRM renderer (no X server)
+│   ├── renderer.rs               # SDL2 / KMS-DRM renderer (Linux) or native (macOS)
 │   └── slideshow.rs              # async slideshow engine + background prefetch
 └── plugins/
     ├── google-photos/            # Google Photos via OAuth2 device flow
@@ -279,6 +282,121 @@ plugin-my-source = ["dep:picogallery-my-source"]
 ```
 
 5. Add a `[[plugins]]` entry to `~/.config/picogallery/config.toml` and build with `--features plugin-my-source`.
+
+---
+
+## Running locally for development and testing
+
+The app runs on **macOS and Linux** without a Pi. SDL2 uses its native backend
+(Cocoa/Metal on macOS, X11/KMS on Linux). The KMS/DRM probe and `kmsdrm` video
+driver are automatically disabled on non-Linux platforms.
+
+### Prerequisites
+
+**macOS**
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+
+# cmake is required to compile the bundled SDL2
+# Download cmake universal binary from https://cmake.org/download/
+# and add to PATH, or install via a package manager
+```
+
+**Linux (Ubuntu/Debian)**
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential
+```
+
+### Build for local testing (local plugin only — no credentials needed)
+
+```bash
+cargo build --no-default-features --features plugin-local
+```
+
+### Create test photos
+
+```bash
+mkdir -p /tmp/picogallery-test-photos
+
+python3 - << 'EOF'
+from PIL import Image, ImageDraw
+photos = [
+    ("photo1.jpg", (220, 60,  60),  "Photo 1 — Red"),
+    ("photo2.jpg", (60,  140, 220), "Photo 2 — Blue"),
+    ("photo3.jpg", (60,  180, 80),  "Photo 3 — Green"),
+    ("photo4.jpg", (200, 160, 40),  "Photo 4 — Yellow"),
+    ("photo5.jpg", (140, 60,  200), "Photo 5 — Purple"),
+]
+for filename, colour, label in photos:
+    img = Image.new("RGB", (1280, 720), colour)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([340, 260, 940, 460], fill=(255, 255, 255))
+    draw.text((640, 360), label, fill=(30, 30, 30), anchor="mm")
+    img.save(f"/tmp/picogallery-test-photos/{filename}", "JPEG", quality=90)
+    print(f"Created {filename}")
+EOF
+```
+
+### Write a test config
+
+```bash
+mkdir -p ~/.config/picogallery
+cat > ~/.config/picogallery/config.toml << 'EOF'
+[display]
+slide_duration_secs = 4
+transition          = "fade"
+transition_ms       = 600
+fill_screen         = false
+fps                 = 30
+
+[cache]
+max_mb         = 64
+prefetch_count = 2
+
+[[plugins]]
+name    = "local"
+enabled = true
+paths   = ["/tmp/picogallery-test-photos"]
+EOF
+```
+
+### Run
+
+```bash
+# macOS — SDL2 compiled from source (bundled), find its dylib first:
+SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs dirname)
+DYLD_LIBRARY_PATH="$SDL_LIB" RUST_LOG=info ./target/debug/picogallery
+
+# Linux
+RUST_LOG=info ./target/debug/picogallery
+
+# Or with explicit config path:
+RUST_LOG=info ./target/debug/picogallery --config ~/.config/picogallery/config.toml
+```
+
+Keys while running: `→` / `Space` next · `←` prev · `P` pause · `Q` / `Esc` quit
+
+### Measured resource usage (macOS Apple Silicon, release build)
+
+| Metric | Debug build | Release build |
+|---|---|---|
+| Binary size | 18 MB | **1.5 MB** |
+| RSS at idle (photo on screen) | ~135 MB | **~1.6 MB** |
+| RSS during transition | ~140 MB | **~2–3 MB** |
+| CPU at idle | ~0.1% | **~0%** |
+| CPU during fade transition | 54–101% (unoptimised) | ~10–15% (estimate) |
+
+Build release for accurate numbers:
+```bash
+cargo build --release --no-default-features --features plugin-local
+```
+
+> **Note:** the debug build is large because it includes debug symbols, bounds checks,
+> and unoptimised allocations. Always use `--release` for Pi deployment and benchmarking.
 
 ---
 
