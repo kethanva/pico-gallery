@@ -1,0 +1,6 @@
+target/
+.DS_Store
+*.pdf
+BACKUPS/
+mnt/
+.claude/
