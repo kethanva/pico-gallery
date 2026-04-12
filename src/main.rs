@@ -135,24 +135,22 @@ max_mb        = 256   # disk cache ceiling in megabytes
 prefetch_count = 3    # photos to pre-fetch ahead (keep low on Pi Zero)
 
 # ─────────────────────────────────────────────────────────────
-# Google Photos Plugin  (uses rclone — no API key needed)
+# Google Photos
 # ─────────────────────────────────────────────────────────────
-# One-time setup (run once in a terminal, then never again):
-#   rclone config
-#   → n  (new remote)
-#   → name: gphotos
-#   → type: google photos
-#   → leave client_id / client_secret blank  (use rclone's built-in)
-#   → read_only: true
-#   → browser opens → sign in to Google → approve
-#   → q  (quit)
-[[plugins]]
-name           = "google-photos"
-enabled        = true
-rclone_remote  = "gphotos"                    # must match the name you gave in rclone config
-sync_dir       = "/tmp/picogallery-gphotos"   # local cache of synced photos
-# album        = "Favourites"                 # optional: sync one album only
-# max_transfer = "500"                        # MB cap per sync run
+# NOTE (March 2025): Google removed the photoslibrary.readonly API scope.
+# All third-party read access to existing libraries is now blocked.
+# rclone, direct OAuth, and all other API approaches are affected.
+#
+# Recommended approach — Google Takeout + local plugin:
+#   1. Go to takeout.google.com → select Google Photos → export
+#   2. Download and extract the zip to a local folder
+#   3. Enable the local plugin below pointing at that folder
+#   4. Refresh periodically by repeating the Takeout export
+# ─────────────────────────────────────────────────────────────
+# [[plugins]]
+# name     = "google-photos"
+# enabled  = false
+# sync_dir = "/tmp/picogallery-gphotos"
 
 # ─────────────────────────────────────────────────────────────
 # Amazon Photos Plugin (optional)
@@ -164,7 +162,7 @@ sync_dir       = "/tmp/picogallery-gphotos"   # local cache of synced photos
 # client_secret = "YOUR_LWA_CLIENT_SECRET"
 
 # ─────────────────────────────────────────────────────────────
-# Local filesystem plugin (optional)
+# Local filesystem plugin
 # ─────────────────────────────────────────────────────────────
 # [[plugins]]
 # name    = "local"
