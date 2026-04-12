@@ -6,8 +6,8 @@ description = "Local filesystem plugin for PicoGallery"
 license     = "MIT"
 
 [dependencies]
-picogallery  = { path = "../.." }
-anyhow       = { workspace = true }
-async-trait  = { workspace = true }
-log          = { workspace = true }
-tokio        = { workspace = true }
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+log              = { workspace = true }
+tokio            = { workspace = true }

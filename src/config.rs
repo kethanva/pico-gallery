@@ -1,4 +1,4 @@
-use crate::plugin::PluginConfig;
+use picogallery_core::PluginConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

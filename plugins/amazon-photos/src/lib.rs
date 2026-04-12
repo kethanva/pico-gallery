@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
 
-use picogallery::plugin::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
 const TOKEN_FILE: &str = "amazon-photos-token.json";
 const LWA_AUTH_URL: &str = "https://api.amazon.com/auth/o2/create/codepair";
