@@ -6,13 +6,13 @@ description = "Amazon Photos plugin for PicoGallery"
 license     = "MIT"
 
 [dependencies]
-picogallery  = { path = "../.." }
-anyhow       = { workspace = true }
-async-trait  = { workspace = true }
-chrono       = { workspace = true }
-log          = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-tokio        = { workspace = true }
-reqwest      = { workspace = true }
-dirs         = { workspace = true }
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+chrono           = { workspace = true }
+log              = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+reqwest          = { workspace = true }
+dirs             = { workspace = true }

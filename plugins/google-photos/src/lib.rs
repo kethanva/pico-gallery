@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 
 // Re-export the plugin trait from the main crate.
-use picogallery::plugin::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
 // ── Token storage ─────────────────────────────────────────────────────────────
 
