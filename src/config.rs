@@ -141,6 +141,17 @@ pub struct Config {
 impl Config {
     /// Load from `path` (TOML).
     pub fn from_file(path: &Path) -> Result<Self> {
+        // Guard against huge / maliciously crafted config files before parsing.
+        const MAX_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MB
+        let file_size = std::fs::metadata(path)
+            .with_context(|| format!("stat config {}", path.display()))?
+            .len();
+        if file_size > MAX_CONFIG_BYTES {
+            return Err(anyhow::anyhow!(
+                "config file is too large ({} KB) — max 1 MB",
+                file_size / 1024
+            ));
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         toml::from_str(&text)

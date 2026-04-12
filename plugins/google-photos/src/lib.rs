@@ -25,6 +25,9 @@ use tokio::process::Command;
 
 use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
+/// Reject images larger than this before passing to the decoder.
+const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
 /// Name of the rclone remote written into our private config file.
 const REMOTE: &str = "picogallery-gdrive";
 
@@ -53,9 +56,23 @@ impl GooglePhotosPlugin {
     }
 
     /// Returns --drive-root-folder-id args if drive_folder_id is set in config.
+    /// The folder ID is validated to contain only safe characters before use.
     fn drive_root_args(&self) -> Vec<String> {
         match self.cfg.get_str("drive_folder_id") {
-            Some(id) if !id.is_empty() => vec!["--drive-root-folder-id".to_string(), id.to_string()],
+            Some(id) if !id.is_empty() => {
+                // Whitelist: Drive folder IDs are alphanumeric + hyphens + underscores only.
+                // This prevents injecting additional rclone flags via a malicious config value.
+                let safe: String = id.chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if safe != id {
+                    warn!("drive_folder_id contains invalid characters — stripped to '{}'", safe);
+                }
+                if safe.is_empty() {
+                    return vec![];
+                }
+                vec!["--drive-root-folder-id".to_string(), safe]
+            }
             _ => vec![],
         }
     }
@@ -107,6 +124,15 @@ impl GooglePhotosPlugin {
         fs::create_dir_all(self.conf_path.parent().unwrap()).await?;
         fs::write(&self.conf_path, conf).await
             .with_context(|| format!("writing {}", self.conf_path.display()))?;
+
+        // Restrict token file to owner-only (0600) — it contains OAuth refresh tokens.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&self.conf_path, perms)
+                .with_context(|| format!("setting permissions on {}", self.conf_path.display()))?;
+        }
 
         info!("Google Drive: token saved → {}", self.conf_path.display());
         Ok(())
@@ -317,10 +343,21 @@ impl PhotoPlugin for GooglePhotosPlugin {
         _dw: u32,
         _dh: u32,
     ) -> Result<Vec<u8>> {
-        let path = meta.download_url.as_deref()
+        let path_str = meta.download_url.as_deref()
             .ok_or_else(|| anyhow::anyhow!("no local path for {}", meta.filename))?;
+        let path = std::path::Path::new(path_str);
+
+        // Size guard before loading into memory.
+        let file_meta = fs::metadata(path).await
+            .with_context(|| format!("stat {}", path_str))?;
+        if file_meta.len() > MAX_IMAGE_BYTES {
+            return Err(anyhow::anyhow!(
+                "file too large ({} MB): {}", file_meta.len() / 1_048_576, path_str
+            ));
+        }
+
         fs::read(path).await
-            .with_context(|| format!("reading local photo {}", path))
+            .with_context(|| format!("reading local photo {}", path_str))
     }
 }
 

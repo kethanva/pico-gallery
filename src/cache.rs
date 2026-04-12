@@ -34,6 +34,13 @@ impl ImageCache {
             .await
             .with_context(|| format!("creating cache dir {}", dir.display()))?;
 
+        // Restrict cache directory to owner-only: cached images are private photo data.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+
         let max_bytes = max_mb * 1024 * 1024;
         let mut cache = Self {
             dir: dir.to_path_buf(),
