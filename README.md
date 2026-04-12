@@ -26,7 +26,7 @@ picogallery/
 │   ├── renderer.rs               # SDL2 / KMS-DRM renderer
 │   └── slideshow.rs              # async slideshow engine
 └── plugins/
-    ├── google-photos/            # Google Photos via rclone (no API key needed)
+    ├── google-photos/            # Google Drive plugin (drive.readonly via rclone)
     ├── amazon-photos/            # Amazon Photos via LWA
     └── local/                    # Local filesystem scanner
 ```
@@ -49,8 +49,8 @@ picogallery/
 ## Features
 
 - **No X11 / no desktop** — renders directly to the KMS/DRM framebuffer via SDL2.
-- **Plugin architecture** — Google Photos, Amazon Photos, local filesystem; add your own with one Rust trait.
-- **Google Photos via rclone** — no Google Cloud project or API key needed; rclone's own verified OAuth app handles auth.
+- **Plugin architecture** — Google Drive, Amazon Photos, local filesystem; add your own with one Rust trait.
+- **Google Drive via rclone** — `drive.readonly` scope, no Google Cloud project or API key needed.
 - **One-time sign-in** — browser opens automatically on first run; token is saved and reused forever.
 - **Disk cache with LRU eviction** — photos survive reboots and WiFi outages.
 - **Background prefetch** — next N photos are fetched while the current one displays.
@@ -76,7 +76,7 @@ picogallery/
 ```
 libsdl2-2.0-0     SDL2 with KMS/DRM backend
 libdrm2           DRM display probing (finds correct /dev/dri/cardN on Pi 4/5)
-rclone            Google Photos sync (no API key — uses rclone's verified OAuth)
+rclone            Google Drive sync (no API key — uses rclone's verified OAuth)
 ca-certificates   HTTPS root certs
 ```
 
@@ -110,12 +110,12 @@ fps                 = 15
 max_mb         = 256
 prefetch_count = 3
 
-# Google Photos — no API key or Cloud project needed
+# Google Drive — no API key or Cloud project needed
 [[plugins]]
-name     = "google-photos"
-enabled  = true
-sync_dir = "/tmp/picogallery-gphotos"   # local photo cache
-# album  = "Holiday 2024"               # optional: one album only
+name             = "google-photos"
+enabled          = true
+sync_dir         = "/tmp/picogallery-gdrive"
+drive_folder_id  = ""            # leave blank for Drive root, or paste a folder ID
 ```
 
 ### 3. Run
@@ -127,10 +127,10 @@ picogallery --config ~/.config/picogallery/config.toml
 **First run only:** a browser window opens for a one-time Google sign-in
 (rclone's own verified OAuth — nothing to set up in Google Cloud).
 Approve access, and the app stores the token at
-`~/.config/picogallery/rclone-gphotos.conf`.
+`~/.config/picogallery/rclone-gdrive.conf`.
 
 Every subsequent run starts immediately with no sign-in prompt.
-rclone syncs new photos in the background while the slideshow runs.
+rclone syncs images in the background while the slideshow runs.
 
 ### 4. Enable on boot (Pi)
 
@@ -156,13 +156,13 @@ fps                 = 15      # max FPS (lower = less CPU on Pi Zero)
 max_mb         = 256   # disk cache ceiling
 prefetch_count = 3     # photos to prefetch ahead
 
-# ── Google Photos (rclone backend) ────────────────────────────────────────────
+# ── Google Drive (rclone backend) ─────────────────────────────────────────────
 [[plugins]]
-name          = "google-photos"
-enabled       = true
-sync_dir      = "/tmp/picogallery-gphotos"   # local cache directory
-# album       = "Favourites"                 # sync one album only
-# max_transfer = "500"                       # MB cap per sync run
+name             = "google-photos"
+enabled          = true
+sync_dir         = "/tmp/picogallery-gdrive"   # local cache directory
+drive_folder_id  = ""                          # specific Drive folder ID, or "" for root
+# max_transfer   = "500"                       # MB cap per sync run
 
 # ── Local filesystem ──────────────────────────────────────────────────────────
 # [[plugins]]
@@ -176,10 +176,31 @@ sync_dir      = "/tmp/picogallery-gphotos"   # local cache directory
 ## Google Photos — API status (March 2025)
 
 > **Google removed `photoslibrary.readonly` on March 31, 2025.**
-> All read access to existing photo libraries via API is now blocked.
-> This affects the Photos Library API, rclone, and all third-party tools.
+> All read access to existing photo libraries via the Google Photos API is permanently blocked.
+> This affects the Photos Library API, rclone's Google Photos backend, and all third-party tools.
 
-### Recommended: Google Takeout + local plugin
+### Recommended: Use Google Drive
+
+PicoGallery's `google-photos` plugin now uses **Google Drive** (`drive.readonly`) as its backend,
+which is fully accessible and unrestricted.
+
+**If your photos are backed up to Google Drive** (via Google Drive for Desktop / Backup & Sync):
+
+1. Open [drive.google.com](https://drive.google.com) and navigate to the folder containing your photos
+2. Copy the folder ID from the URL: `drive.google.com/drive/folders/<FOLDER_ID>`
+3. Set `drive_folder_id` in `config.toml`
+
+```toml
+[[plugins]]
+name             = "google-photos"
+enabled          = true
+sync_dir         = "/tmp/picogallery-gdrive"
+drive_folder_id  = "1REc7j3GtIIzF25ARuhqnAZsayu3fRogb"   # your folder ID
+```
+
+**If your photos are only in Google Photos** (not in Drive):
+
+Use Google Takeout to export them once, then use the local plugin:
 
 1. Go to **[takeout.google.com](https://takeout.google.com)**
 2. Deselect all → select only **Google Photos** → Next step → Create export
@@ -200,9 +221,10 @@ paths   = ["/mnt/photos/Google Photos"]   # path to your Takeout extract
 | Approach | Status (2026) |
 |---|---|
 | Google Photos Library API | Blocked for existing libraries since March 2025 |
-| rclone Google Photos | Blocked (uses same underlying API) |
+| rclone Google Photos backend | Blocked (uses same underlying API) |
 | Google Picker API | Manual per-session selection — not suitable for slideshows |
-| **Google Takeout + local plugin** | **Works — recommended** |
+| **Google Drive plugin (this app)** | **Works — `drive.readonly`, no restrictions** |
+| **Google Takeout + local plugin** | **Works — recommended if photos not in Drive** |
 | Self-hosted Immich / Nextcloud | Works — full open API control |
 
 ---
@@ -229,7 +251,7 @@ sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential rclon
 ### Build
 
 ```bash
-# Full build (Google Photos + local)
+# Full build (Google Drive + local)
 cargo build
 
 # Local-only build (no rclone needed)
@@ -287,14 +309,15 @@ SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs 
 DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery --config ~/.config/picogallery/config.toml
 ```
 
-### Run with Google Photos (macOS)
+### Run with Google Drive (macOS)
 
 ```bash
 SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs dirname)
 DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery --config ~/.config/picogallery/config.toml
 ```
 
-First run opens a browser. After approving, the slideshow starts automatically.
+First run opens a browser for a one-time Google sign-in. Token is saved automatically at
+`~/.config/picogallery/rclone-gdrive.conf`. Every subsequent run starts immediately.
 
 ---
 
@@ -393,7 +416,7 @@ Set `gpu_mem=64` in `/boot/config.txt` (the installer does this).
 config.toml
     │
     ▼
-Plugin registry ──┬── GooglePhotosPlugin (rclone sync → local disk)
+Plugin registry ──┬── GoogleDrivePlugin (rclone drive.readonly → local disk)
                   ├── AmazonPhotosPlugin (LWA OAuth → Amazon API)
                   └── LocalPlugin (filesystem scan)
                         │  dyn PhotoPlugin

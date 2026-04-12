@@ -1,18 +1,21 @@
-/// Google Photos plugin for PicoGallery — rclone backend.
+/// Google Drive plugin for PicoGallery — rclone backend.
 ///
-/// On first run, spawns `rclone authorize "google photos"` which opens a browser
-/// for a one-time Google sign-in (uses rclone's own verified OAuth app — no
-/// Google Cloud project or API key required).  The resulting token is stored in
-/// `<config_dir>/picogallery/rclone-gphotos.conf`.  Every subsequent run reuses
+/// Uses Google Drive API (unrestricted, `drive.readonly` scope) as the photo source,
+/// since the Google Photos Library API was permanently removed on March 31, 2025.
+///
+/// On first run, spawns `rclone authorize "drive"` which opens a browser for a
+/// one-time Google sign-in (uses rclone's own verified OAuth app — no Google Cloud
+/// project or API key required).  The resulting token is stored in
+/// `<config_dir>/picogallery/rclone-gdrive.conf`.  Every subsequent run reuses
 /// that token; rclone refreshes it automatically.
 ///
-/// After auth, photos are synced from Google Photos to `sync_dir` via
+/// After auth, image files are synced from Google Drive to `sync_dir` via
 /// `rclone copy` and served from disk.
 ///
 /// Config keys (in config.toml):
-///   sync_dir      — local cache directory  (default: /tmp/picogallery-gphotos)
-///   album         — sync one album only    (default: all photos)
-///   max_transfer  — MB cap per sync run    (default: "500")
+///   sync_dir      — local cache directory    (default: /tmp/picogallery-gdrive)
+///   drive_folder  — Drive subfolder to sync  (default: "" = root)
+///   max_transfer  — MB cap per sync run      (default: "500")
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use log::{debug, info, warn};
@@ -23,7 +26,7 @@ use tokio::process::Command;
 use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
 /// Name of the rclone remote written into our private config file.
-const REMOTE: &str = "picogallery-gphotos";
+const REMOTE: &str = "picogallery-gdrive";
 
 pub struct GooglePhotosPlugin {
     cfg:       PluginConfig,
@@ -35,20 +38,25 @@ impl GooglePhotosPlugin {
         let conf_path = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("picogallery")
-            .join("rclone-gphotos.conf");
+            .join("rclone-gdrive.conf");
         Self { cfg, conf_path }
     }
 
     // ── Config helpers ────────────────────────────────────────────────────────
 
     fn sync_dir(&self) -> PathBuf {
-        PathBuf::from(self.cfg.get_str("sync_dir").unwrap_or("/tmp/picogallery-gphotos"))
+        PathBuf::from(self.cfg.get_str("sync_dir").unwrap_or("/tmp/picogallery-gdrive"))
     }
 
     fn rclone_src(&self) -> String {
-        match self.cfg.get_str("album") {
-            Some(album) => format!("{}:album/{}", REMOTE, album),
-            None        => format!("{}:media/all", REMOTE),
+        format!("{}:", REMOTE)
+    }
+
+    /// Returns --drive-root-folder-id args if drive_folder_id is set in config.
+    fn drive_root_args(&self) -> Vec<String> {
+        match self.cfg.get_str("drive_folder_id") {
+            Some(id) if !id.is_empty() => vec!["--drive-root-folder-id".to_string(), id.to_string()],
+            _ => vec![],
         }
     }
 
@@ -60,19 +68,19 @@ impl GooglePhotosPlugin {
 
     fn token_saved(&self) -> bool { self.conf_path.exists() }
 
-    /// Run `rclone authorize "google photos"`, parse the printed token, and
-    /// write a minimal rclone config that subsequent `rclone copy` calls use.
+    /// Run `rclone authorize "drive" --drive-scope drive.readonly`, parse the printed
+    /// token, and write a minimal rclone config that subsequent `rclone copy` calls use.
     async fn run_rclone_authorize(&self) -> Result<()> {
-        info!("Google Photos: starting rclone authorize — browser will open…");
-        println!("\n=== Google Photos — one-time sign-in ===");
+        info!("Google Drive: starting rclone authorize — browser will open…");
+        println!("\n=== Google Drive — one-time sign-in ===");
         println!("A browser window is opening. Sign in to Google and approve access.");
         println!("(On a headless Pi, visit the printed URL from another device.)\n");
 
         let output = Command::new("rclone")
-            .args(["authorize", "google photos"])
+            .args(["authorize", "drive", "--drive-scope", "drive.readonly"])
             .output()
             .await
-            .context("running 'rclone authorize google photos' — is rclone installed?")?;
+            .context("running 'rclone authorize drive' — is rclone installed?")?;
 
         // rclone prints the token to stdout between markers; some versions use stderr.
         let combined = format!(
@@ -93,106 +101,84 @@ impl GooglePhotosPlugin {
         // Write a self-contained rclone config with the token embedded.
         // Using --config <this_file> keeps us isolated from any existing rclone setup.
         let conf = format!(
-            "[{}]\ntype = google photos\nread_only = true\ntoken = {}\n",
+            "[{}]\ntype = drive\nscope = drive.readonly\ntoken = {}\n",
             REMOTE, token_json
         );
         fs::create_dir_all(self.conf_path.parent().unwrap()).await?;
         fs::write(&self.conf_path, conf).await
             .with_context(|| format!("writing {}", self.conf_path.display()))?;
 
-        info!("Google Photos: token saved → {}", self.conf_path.display());
+        info!("Google Drive: token saved → {}", self.conf_path.display());
         Ok(())
     }
 
     // ── Sync ──────────────────────────────────────────────────────────────────
 
-    /// Foreground sync: download recent photos quickly so the slideshow can start.
-    ///
-    /// Strategy: sync by-year (fast — only one year's photos) starting from the
-    /// current year, falling back to previous years until photos are found.
-    /// Full library sync happens in background via spawn_sync().
+    /// Foreground sync: download a batch of images quickly so the slideshow can start.
     async fn sync_initial(&self) -> Result<()> {
-        let conf = self.conf_path.to_str().unwrap_or("");
-        let dst  = self.sync_dir();
+        let conf    = self.conf_path.to_str().unwrap_or("");
+        let dst     = self.sync_dir();
         let dst_str = dst.to_str().unwrap_or("");
+        let src     = self.rclone_src();
 
-        // If the user pinned a specific album, sync that directly.
-        if self.cfg.get_str("album").is_some() {
-            info!("Google Photos: initial sync from album…");
-            let out = Command::new("rclone")
-                .args([
-                    "--config", conf, "copy", &self.rclone_src(), dst_str,
-                    "--transfers", "4",
-                    "--include", "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
-                ])
-                .output().await.context("rclone initial sync (album)")?;
-            if !out.status.success() {
-                warn!("rclone album sync: {}", String::from_utf8_lossy(&out.stderr).trim());
-            }
-            return Ok(());
+        info!("Google Drive: initial sync from {} (up to 100 MB)…", src);
+
+        let root_args = self.drive_root_args();
+        let mut cmd_args = vec![
+            "--config".to_string(), conf.to_string(),
+            "copy".to_string(),     src.clone(),
+            dst_str.to_string(),
+            "--max-transfer".to_string(), "100M".to_string(),
+            "--transfers".to_string(),    "4".to_string(),
+            "--include".to_string(),      "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}".to_string(),
+        ];
+        cmd_args.extend(root_args);
+
+        let out = Command::new("rclone")
+            .args(&cmd_args)
+            .output()
+            .await
+            .context("rclone initial sync (google drive)")?;
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && !stderr.contains("Max transfer") {
+            warn!("rclone initial sync: {}", stderr.trim());
         }
 
-        // Try by-year from current year going back up to 30 years.
-        // Cap each year at 50 MB so we get photos quickly even for busy years.
-        // rclone exits non-zero when max-transfer is hit — that's fine; we check
-        // whether files actually landed rather than trusting the exit code.
-        let current_year = current_year();
-        for year in (current_year.saturating_sub(30)..=current_year).rev() {
-            let src = format!("{}:media/by-year/{}", REMOTE, year);
-            info!("Google Photos: initial sync from {} (up to 50 MB)…", src);
-
-            let out = Command::new("rclone")
-                .args([
-                    "--config",       conf,
-                    "copy",           &src,
-                    dst_str,
-                    "--max-transfer", "50M",   // ~5-15 photos; stops download quickly
-                    "--transfers",    "4",
-                    "--include",      "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
-                ])
-                .output().await.context("rclone initial sync (by-year)")?;
-
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !out.status.success() && !stderr.contains("Max transfer") {
-                // Real error (not just hitting the transfer cap) — try next year.
-                warn!("rclone year {}: {}", year, stderr.trim());
-                continue;
-            }
-
-            // Check if we actually got some photos (exit code is unreliable with cap).
-            let found = Self::list_local_images(&dst).await;
-            if !found.is_empty() {
-                info!("Google Photos: initial sync done — {} photos from {}.", found.len(), year);
-                return Ok(());
-            }
-            info!("Google Photos: no photos in {} — trying earlier year.", year);
+        let found = Self::list_local_images(&dst).await;
+        if found.is_empty() {
+            warn!("Google Drive: no images found after initial sync. Check drive_folder config.");
+        } else {
+            info!("Google Drive: initial sync done — {} images.", found.len());
         }
-
-        warn!("Google Photos: no photos found in any year. Background sync will continue.");
         Ok(())
     }
 
-    /// Background sync: keep pulling the full library without blocking.
+    /// Background sync: keep pulling images from Drive without blocking.
     async fn spawn_sync(&self) {
-        let conf   = self.conf_path.clone();
-        let src    = self.rclone_src();
-        let dst    = self.sync_dir();
-        let max_mb = self.max_transfer_mb();
+        let conf      = self.conf_path.clone();
+        let src       = self.rclone_src();
+        let dst       = self.sync_dir();
+        let max_mb    = self.max_transfer_mb();
+        let root_args = self.drive_root_args();
 
         tokio::spawn(async move {
             info!("rclone background sync: {} → {}", src, dst.display());
+            let mut args = vec![
+                "--config".to_string(),       conf.to_str().unwrap_or("").to_string(),
+                "copy".to_string(),           src.clone(),
+                dst.to_str().unwrap_or("").to_string(),
+                "--max-transfer".to_string(), max_mb,
+                "--transfers".to_string(),    "2".to_string(),
+                "--checkers".to_string(),     "4".to_string(),
+                "--no-traverse".to_string(),
+                "--include".to_string(),      "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}".to_string(),
+            ];
+            args.extend(root_args);
             let result = Command::new("rclone")
-                .args([
-                    "--config",      conf.to_str().unwrap_or(""),
-                    "copy",          &src,
-                    dst.to_str().unwrap_or(""),
-                    "--max-transfer", &max_mb,
-                    "--transfers",   "2",
-                    "--checkers",    "4",
-                    "--no-traverse",
-                    "--include",     "*.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}",
-                ])
-                .output().await;
+                .args(&args)
+                .output()
+                .await;
 
             match result {
                 Ok(o) if o.status.success() => info!("rclone background sync complete."),
@@ -239,8 +225,8 @@ impl GooglePhotosPlugin {
 #[async_trait]
 impl PhotoPlugin for GooglePhotosPlugin {
     fn name(&self)         -> &str { "google-photos" }
-    fn display_name(&self) -> &str { "Google Photos"  }
-    fn version(&self)      -> &str { "0.3.0"          }
+    fn display_name(&self) -> &str { "Google Drive (Photos)"  }
+    fn version(&self)      -> &str { "0.4.0"                  }
 
     async fn init(&mut self, _cfg: &PluginConfig) -> Result<()> {
         fs::create_dir_all(self.sync_dir()).await
@@ -269,38 +255,39 @@ impl PhotoPlugin for GooglePhotosPlugin {
 
         // Already have a saved token — nothing to do.
         if self.token_saved() {
-            info!("Google Photos: using saved rclone token.");
+            info!("Google Drive: using saved rclone token.");
             return Ok(AuthStatus::Authenticated);
         }
 
         // First run: do the one-time browser sign-in.
-        // rclone authorize blocks until the user approves (or times out).
         self.run_rclone_authorize().await?;
         Ok(AuthStatus::Authenticated)
     }
 
     async fn refresh_auth(&mut self) -> Result<()> { Ok(()) } // rclone handles token refresh
 
-    async fn list_photos(&self, limit: usize, _offset: usize) -> Result<Vec<PhotoMeta>> {
+    async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
         let local = Self::list_local_images(&self.sync_dir()).await;
 
         if local.is_empty() {
-            // First run: foreground sync of the most recent year so the
-            // slideshow has something to show immediately.
+            // First run: foreground sync so the slideshow has something to show immediately.
             self.sync_initial().await?;
         }
 
-        // Full library sync runs in background (idempotent — skips existing files).
-        self.spawn_sync().await;
+        // Kick off one background sync pass (only on first page).
+        if offset == 0 {
+            self.spawn_sync().await;
+        }
 
         let paths = Self::list_local_images(&self.sync_dir()).await;
 
         if paths.is_empty() {
-            warn!("Google Photos: still no photos after initial sync. Check rclone config.");
+            warn!("Google Drive: still no images after initial sync. Check drive_folder_id in config.");
             return Ok(vec![]);
         }
 
         let photos: Vec<PhotoMeta> = paths.into_iter()
+            .skip(offset)
             .take(limit)
             .enumerate()
             .map(|(i, path)| {
@@ -309,8 +296,8 @@ impl PhotoPlugin for GooglePhotosPlugin {
                     .to_string_lossy()
                     .to_string();
                 PhotoMeta {
-                    id:           i.to_string(),
-                    filename:     filename,
+                    id:           (offset + i).to_string(),
+                    filename,
                     width:        0,
                     height:       0,
                     taken_at:     None,
@@ -320,7 +307,7 @@ impl PhotoPlugin for GooglePhotosPlugin {
             })
             .collect();
 
-        info!("Google Photos: {} photos available locally.", photos.len());
+        info!("Google Drive: {} photos at offset {}.", photos.len(), offset);
         Ok(photos)
     }
 
@@ -353,7 +340,6 @@ fn extract_token_json(output: &str) -> Option<String> {
     }
 
     // Fallback: find any JSON object containing both access_token and refresh_token.
-    // Walk the string looking for '{' ... '}' pairs at the top level.
     let bytes = output.as_bytes();
     let mut depth = 0usize;
     let mut start = None;
@@ -379,16 +365,6 @@ fn extract_token_json(output: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Returns the current calendar year (UTC, approximate — 365.25 days/year).
-fn current_year() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    1970 + (secs / 31_557_600) as u32
 }
 
 fn is_image(p: &Path) -> bool {
