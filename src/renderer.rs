@@ -5,7 +5,7 @@
 /// On macOS/other: SDL2 uses its native backend (Cocoa/Metal) automatically.
 use anyhow::{Context, Result};
 use image::{DynamicImage, RgbaImage};
-use log::{debug, info, warn};
+use log::{info, warn};
 use sdl2::{
     event::Event,
     keyboard::Keycode,
@@ -17,7 +17,7 @@ use sdl2::{
 };
 use std::time::{Duration, Instant};
 
-use crate::config::{DisplayConfig, Transition};
+use crate::config::DisplayConfig;
 
 // ── DRM display probe (Linux only) ───────────────────────────────────────────
 
@@ -202,22 +202,30 @@ impl Renderer {
         if duration.is_zero() { return self.show_cut(next_rgba); }
 
         let tc = self.canvas.texture_creator();
+        // Pre-bake current frame texture (outside the loop — avoids re-allocating every frame).
+        let cur_tex = match current_rgba {
+            Some(cur) => Some(rgba_to_texture(&tc, cur)?),
+            None      => None,
+        };
         let mut next_tex = rgba_to_texture(&tc, next_rgba)?;
-        let start = Instant::now();
+        // SDL_RenderCopy only respects set_alpha_mod when the texture blend mode is
+        // SDL_BLENDMODE_BLEND.  Without this the alpha_mod writes transparent pixels
+        // to the Metal framebuffer and macOS shows the white desktop behind the window.
+        next_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
 
+        let start = Instant::now();
         loop {
             let elapsed = start.elapsed();
             if elapsed >= duration { break; }
 
             let alpha = ((elapsed.as_secs_f32() / duration.as_secs_f32()) * 255.0) as u8;
+            self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
             self.canvas.clear();
 
-            if let Some(cur) = current_rgba {
-                let cur_tex = rgba_to_texture(&tc, cur)?;
-                blit_centered(&mut self.canvas, &cur_tex, cur.width(), cur.height(), self.width, self.height)?;
+            if let Some(ref cur) = cur_tex {
+                blit_centered(&mut self.canvas, cur, current_rgba.unwrap().width(), current_rgba.unwrap().height(), self.width, self.height)?;
             }
             next_tex.set_alpha_mod(alpha);
-            self.canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
             blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
             self.canvas.present();
 
