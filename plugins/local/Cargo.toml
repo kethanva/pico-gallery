@@ -1,0 +1,13 @@
+[package]
+name        = "picogallery-local"
+version     = "0.1.0"
+edition     = "2021"
+description = "Local filesystem plugin for PicoGallery"
+license     = "MIT"
+
+[dependencies]
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+log              = { workspace = true }
+tokio            = { workspace = true }
