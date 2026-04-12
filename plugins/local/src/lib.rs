@@ -12,7 +12,7 @@ use log::{debug, info, warn};
 use std::path::PathBuf;
 use tokio::fs;
 
-use picogallery::plugin::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
 
 pub struct LocalPlugin {
     cfg:   PluginConfig,

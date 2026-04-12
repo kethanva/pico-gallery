@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "core",
     "plugins/google-photos",
     "plugins/amazon-photos",
     "plugins/local",
@@ -8,16 +9,17 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-anyhow       = "1.0"
-async-trait  = "0.1"
-chrono       = { version = "0.4", features = ["serde"] }
-dirs         = "5"
-log          = "0.4"
-serde        = { version = "1.0", features = ["derive"] }
-serde_json   = "1.0"
-tokio        = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "sync", "io-util"] }
-reqwest      = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
-toml         = "0.8"
+anyhow              = "1.0"
+async-trait         = "0.1"
+chrono              = { version = "0.4", features = ["serde"] }
+dirs                = "5"
+log                 = "0.4"
+serde               = { version = "1.0", features = ["derive"] }
+serde_json          = "1.0"
+tokio               = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "sync", "io-util"] }
+reqwest             = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+toml                = "0.8"
+picogallery-core    = { path = "core" }
 
 [package]
 name        = "picogallery"
@@ -25,7 +27,7 @@ version     = "0.1.0"
 edition     = "2021"
 description = "Lightweight plugin-based photo slideshow for Raspberry Pi — no desktop environment required"
 license     = "MIT"
-repository  = "https://github.com/yourusername/picogallery"
+repository  = "https://github.com/kethanva/opentinyphotoapp"
 
 [lib]
 name = "picogallery"
@@ -36,27 +38,29 @@ name = "picogallery"
 path = "src/main.rs"
 
 [dependencies]
-anyhow       = { workspace = true }
-async-trait  = { workspace = true }
-chrono       = { workspace = true }
-dirs         = { workspace = true }
-log          = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-tokio        = { workspace = true }
-reqwest      = { workspace = true }
-toml         = { workspace = true }
-env_logger   = "0.11"
-image        = { version = "0.24", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-fast_image_resize = "2.7"
-sdl2         = { version = "0.36", default-features = false, features = ["use-pkgconfig"] }
-drm          = "0.15"
-clap         = { version = "4", features = ["derive"] }
+anyhow              = { workspace = true }
+async-trait         = { workspace = true }
+chrono              = { workspace = true }
+dirs                = { workspace = true }
+log                 = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+tokio               = { workspace = true }
+toml                = { workspace = true }
+picogallery-core    = { workspace = true }
+env_logger          = "0.11"
+image               = { version = "0.24", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+fast_image_resize   = "2.7"
+sdl2                = { version = "0.36", default-features = false, features = ["bundled"] }
+clap                = { version = "4", features = ["derive", "env"] }
 
-# Plugins (statically linked via feature flags)
-picogallery-google-photos  = { path = "plugins/google-photos", optional = true }
-picogallery-amazon-photos  = { path = "plugins/amazon-photos", optional = true }
-picogallery-local          = { path = "plugins/local",         optional = true }
+# Plugins (compiled in via feature flags — no cycle: plugins depend on core, not on this crate)
+picogallery-google-photos = { path = "plugins/google-photos", optional = true }
+picogallery-amazon-photos = { path = "plugins/amazon-photos", optional = true }
+picogallery-local         = { path = "plugins/local",         optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+drm = "0.15"
 
 [features]
 default              = ["plugin-google-photos", "plugin-local"]
@@ -65,7 +69,7 @@ plugin-amazon-photos = ["dep:picogallery-amazon-photos"]
 plugin-local         = ["dep:picogallery-local"]
 
 [profile.release]
-opt-level     = "z"   # optimise for binary size (important for Pi Zero)
+opt-level     = "z"
 lto           = true
 codegen-units = 1
 strip         = true
