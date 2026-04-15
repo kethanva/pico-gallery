@@ -1,154 +1,209 @@
 #!/usr/bin/env bash
 # ============================================================
-# PicoGallery installer for Raspberry Pi OS Lite (arm/arm64)
+# PicoGallery installer for Raspberry Pi OS (arm/arm64)
 # ============================================================
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/.../install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh | bash
 #   — or —
 #   bash install.sh
+#   — or (pin a specific version) —
+#   PICOGALLERY_VERSION=v0.2.0 bash install.sh
 #
 # What this script does:
-#   1. Installs the ONLY required system packages (libsdl2, ca-certs, Rust toolchain)
-#   2. Compiles picogallery with --release (optimised for size)
-#   3. Installs the binary to /usr/local/bin/picogallery
-#   4. Creates a systemd service that runs on boot
-#   5. Adds the current user to the 'video' and 'render' groups
-#      (required to access /dev/dri/card0 without root)
+#   1. Detects your architecture (aarch64 or armv7)
+#   2. Downloads the pre-built binary from GitHub Releases
+#   3. Installs runtime dependencies (libsdl2, libdrm, rclone)
+#   4. Installs the binary to /usr/local/bin/picogallery
+#   5. Creates a systemd service that runs on boot
+#   6. Adds the current user to video/render/input groups
+#   7. Writes a default config if none exists
+#   8. Configures GPU memory split
 #
-# NO X server, NO desktop environment, NO display manager is installed.
-# The only display stack needed is the kernel KMS/DRM driver, which is
-# already loaded on every Raspberry Pi OS installation.
+# NO compilation needed. NO Rust toolchain required.
+# NO X server, NO desktop environment, NO display manager.
 # ============================================================
 
 set -euo pipefail
-BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; RESET='\033[0m'
 
-info()    { echo -e "${GREEN}[•]${RESET} $*"; }
+REPO="kethanva/opentinyphotoapp"
+BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+CYAN='\033[0;36m'; RESET='\033[0m'
+
+info()    { echo -e "${GREEN}[+]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
-die()     { echo -e "${RED}[✗]${RESET} $*" >&2; exit 1; }
-section() { echo -e "\n${BOLD}══ $* ══${RESET}"; }
+die()     { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
+section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 
-# ── Detect architecture ────────────────────────────────────────────────────────
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+
+[[ "$(uname -s)" == "Linux" ]] || die "This installer only supports Linux (Raspberry Pi OS)."
+
+command -v curl &>/dev/null || die "curl is required. Install with: sudo apt-get install -y curl"
+
+echo -e "${BOLD}"
+echo "  ╔═══════════════════════════════════════════╗"
+echo "  ║   PicoGallery — Raspberry Pi Installer    ║"
+echo "  ╚═══════════════════════════════════════════╝"
+echo -e "${RESET}"
+
+# ── Detect architecture ──────────────────────────────────────────────────────
+
 ARCH=$(uname -m)
 case "$ARCH" in
-  armv6l)  RUST_TARGET="arm-unknown-linux-gnueabihf"  ;;   # Pi Zero / Pi 1
-  armv7l)  RUST_TARGET="armv7-unknown-linux-gnueabihf" ;;  # Pi 2 / 3 (32-bit OS)
-  aarch64) RUST_TARGET="aarch64-unknown-linux-gnu"    ;;   # Pi 3/4/5 (64-bit OS)
-  *)       die "Unsupported architecture: $ARCH" ;;
+  aarch64)       ARTIFACT_ARCH="aarch64" ;;
+  armv7l|armv6l) ARTIFACT_ARCH="armv7"   ;;
+  *)             die "Unsupported architecture: $ARCH (need aarch64 or armv7l)" ;;
 esac
-info "Architecture: $ARCH → Rust target: $RUST_TARGET"
+info "Architecture: $ARCH -> artifact: linux-${ARTIFACT_ARCH}"
 
-# ── Check we're on Raspberry Pi OS ────────────────────────────────────────────
-if ! grep -qi "raspberry" /etc/os-release 2>/dev/null; then
-  warn "This doesn't look like Raspberry Pi OS — proceeding anyway."
+# ── Resolve version ──────────────────────────────────────────────────────────
+
+section "Resolving version"
+
+if [[ -n "${PICOGALLERY_VERSION:-}" ]]; then
+  VERSION="$PICOGALLERY_VERSION"
+  info "Using pinned version: $VERSION"
+else
+  info "Fetching latest release from GitHub..."
+  VERSION=$(curl -sSL \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+
+  [[ -n "$VERSION" ]] || die "Could not determine latest release. Set PICOGALLERY_VERSION manually."
+  info "Latest release: $VERSION"
 fi
 
-# ── System packages ───────────────────────────────────────────────────────────
-section "Installing system packages"
-#
-# Runtime libraries (the ONLY ones needed):
-#   libsdl2-2.0-0   — SDL2 shared library (KMS/DRM backend, no X11)
-#   libdrm2         — DRM/KMS display probing (find correct /dev/dri/cardN)
-#   ca-certificates — HTTPS root certs for API calls
-#
-# Build-time only (can be purged after compiling):
-#   libsdl2-dev  libdrm-dev — headers
-#   clang                   — for sdl2 bindgen
-#   pkg-config              — lets Cargo locate libsdl2 and libdrm
-#
+# ── Download binary ──────────────────────────────────────────────────────────
+
+section "Downloading PicoGallery ${VERSION}"
+
+TARBALL="picogallery-${VERSION}-linux-${ARTIFACT_ARCH}.tar.gz"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
+SHA_URL="${DOWNLOAD_URL}.sha256"
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+info "Downloading: $TARBALL"
+HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "${TMPDIR}/${TARBALL}" "$DOWNLOAD_URL")
+[[ "$HTTP_CODE" == "200" ]] || die "Download failed (HTTP $HTTP_CODE). Check that ${VERSION} has a linux-${ARTIFACT_ARCH} artifact."
+
+# Verify checksum if available
+if curl -sSL -o "${TMPDIR}/${TARBALL}.sha256" "$SHA_URL" 2>/dev/null; then
+  cd "$TMPDIR"
+  if sha256sum -c "${TARBALL}.sha256" &>/dev/null; then
+    info "SHA-256 checksum verified."
+  else
+    warn "Checksum mismatch! Continuing anyway — verify manually if concerned."
+  fi
+  cd - >/dev/null
+else
+  warn "No checksum file found — skipping verification."
+fi
+
+# Extract
+info "Extracting..."
+tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
+EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "picogallery-*" | head -1)
+[[ -d "$EXTRACT_DIR" ]] || die "Extraction failed — archive structure unexpected."
+
+# ── Install runtime dependencies ─────────────────────────────────────────────
+
+section "Installing runtime dependencies"
+
 sudo apt-get update -qq
+
 sudo apt-get install -y --no-install-recommends \
-  libsdl2-dev \
   libsdl2-2.0-0 \
-  libdrm-dev \
   libdrm2 \
   ca-certificates \
-  clang \
-  pkg-config \
-  curl \
-  build-essential
-info "System packages installed."
+  rclone
 
-# ── Rust toolchain ─────────────────────────────────────────────────────────────
-section "Installing Rust"
-if command -v rustup &>/dev/null; then
-  info "rustup already present — updating."
-  rustup update stable --no-self-update
-else
-  info "Installing rustup…"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable --profile minimal
-  # shellcheck source=/dev/null
-  source "$HOME/.cargo/env"
-fi
-info "Rust $(rustc --version)"
+info "Runtime dependencies installed."
 
-# ── Clone / update source ─────────────────────────────────────────────────────
-section "Fetching source"
-SRC_DIR="$HOME/picogallery"
-if [ -d "$SRC_DIR/.git" ]; then
-  info "Updating existing checkout…"
-  git -C "$SRC_DIR" pull --ff-only
-else
-  git clone https://github.com/yourusername/picogallery "$SRC_DIR"
-fi
+# ── Install binary ───────────────────────────────────────────────────────────
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-section "Building (this takes a few minutes on Pi Zero)"
-cd "$SRC_DIR"
-# Pi Zero: single thread to avoid OOM during LLVM codegen
-if [ "$ARCH" = "armv6l" ]; then
-  CARGO_FLAGS="--jobs 1"
-  info "Pi Zero detected — building with 1 job to conserve RAM."
-else
-  CARGO_FLAGS=""
-fi
-
-~/.cargo/bin/cargo build \
-  --release \
-  --features "plugin-google-photos,plugin-local" \
-  $CARGO_FLAGS
-
-BINARY="$SRC_DIR/target/release/picogallery"
-[ -f "$BINARY" ] || die "Build failed — binary not found."
-info "Binary size: $(du -sh "$BINARY" | cut -f1)"
-
-# ── Install binary ────────────────────────────────────────────────────────────
 section "Installing binary"
-sudo install -m 755 "$BINARY" /usr/local/bin/picogallery
-info "Installed to /usr/local/bin/picogallery"
 
-# ── User groups ───────────────────────────────────────────────────────────────
+sudo install -m 755 "${EXTRACT_DIR}/picogallery" /usr/local/bin/picogallery
+info "Installed /usr/local/bin/picogallery"
+info "Version: $(picogallery --version 2>/dev/null || echo "$VERSION")"
+info "Binary size: $(du -h /usr/local/bin/picogallery | cut -f1)"
+
+# ── User groups ──────────────────────────────────────────────────────────────
+
 section "Configuring user groups"
-USER="${SUDO_USER:-$(whoami)}"
+
+TARGET_USER="${SUDO_USER:-$(whoami)}"
 for group in video render input; do
   if getent group "$group" &>/dev/null; then
-    sudo usermod -aG "$group" "$USER"
-    info "Added $USER to group: $group"
+    sudo usermod -aG "$group" "$TARGET_USER"
+    info "Added $TARGET_USER to group: $group"
   fi
 done
-warn "You will need to log out and back in for group changes to take effect."
-warn "(Or run:  newgrp video)"
 
-# ── Config ────────────────────────────────────────────────────────────────────
-section "Setting up config"
-CONFIG_DIR="$HOME/.config/picogallery"
-mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-  picogallery --print-default-config > "$CONFIG_DIR/config.toml"
-  info "Default config written to $CONFIG_DIR/config.toml"
-  echo ""
-  warn "Edit the config before starting:"
-  warn "  nano $CONFIG_DIR/config.toml"
-  warn ""
-  warn "You will need to add your Google Photos OAuth2 credentials."
-  warn "See the README for setup instructions."
+# ── Config ───────────────────────────────────────────────────────────────────
+
+section "Setting up configuration"
+
+CONFIG_DIR="/home/${TARGET_USER}/.config/picogallery"
+sudo -u "$TARGET_USER" mkdir -p "$CONFIG_DIR"
+
+if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
+  if [[ -f "${EXTRACT_DIR}/config.example.toml" ]]; then
+    sudo -u "$TARGET_USER" cp "${EXTRACT_DIR}/config.example.toml" "${CONFIG_DIR}/config.toml"
+  else
+    # Generate minimal default config
+    sudo -u "$TARGET_USER" tee "${CONFIG_DIR}/config.toml" > /dev/null <<'TOML'
+# PicoGallery configuration
+# See: https://github.com/kethanva/opentinyphotoapp
+
+[display]
+slide_duration_secs = 10
+transition          = "fade"
+transition_ms       = 800
+fill_screen         = false
+fps                 = 15
+
+[cache]
+max_mb         = 256
+prefetch_count = 3
+
+# Enable the directory plugin and point it at your photos:
+[[plugins]]
+name    = "directory"
+enabled = true
+path    = "/home/pi/Photos"
+order   = "shuffle"
+recursive = true
+
+[[plugins]]
+name    = "local"
+enabled = false
+paths   = ["/home/pi/Pictures"]
+
+[[plugins]]
+name    = "google-photos"
+enabled = false
+sync_dir = "/tmp/picogallery-gdrive"
+
+[[plugins]]
+name    = "amazon-photos"
+enabled = false
+client_id     = ""
+client_secret = ""
+TOML
+  fi
+  info "Default config written to ${CONFIG_DIR}/config.toml"
 else
-  info "Config already exists at $CONFIG_DIR/config.toml — not overwriting."
+  info "Config already exists at ${CONFIG_DIR}/config.toml — not overwriting."
 fi
 
-# ── systemd service ───────────────────────────────────────────────────────────
+# ── systemd service ──────────────────────────────────────────────────────────
+
 section "Installing systemd service"
+
 SERVICE_FILE="/etc/systemd/system/picogallery.service"
 sudo tee "$SERVICE_FILE" > /dev/null <<SERVICE
 [Unit]
@@ -158,7 +213,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${USER}
+User=${TARGET_USER}
 Group=video
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info
@@ -169,7 +224,7 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Allow /dev/dri access without root.
+# Allow /dev/dri access without root
 SupplementaryGroups=video render input
 
 [Install]
@@ -177,45 +232,58 @@ WantedBy=multi-user.target
 SERVICE
 
 sudo systemctl daemon-reload
-info "Service file written to $SERVICE_FILE"
-info "Commands:"
-info "  sudo systemctl enable picogallery   # start on boot"
-info "  sudo systemctl start  picogallery   # start now"
-info "  sudo journalctl -u picogallery -f   # watch logs"
+info "Service installed: picogallery.service"
 
-# ── GPU memory split ──────────────────────────────────────────────────────────
+# ── GPU memory ───────────────────────────────────────────────────────────────
+
 section "GPU memory optimisation"
-BOOT_CONFIG="/boot/config.txt"
-if [ -f "$BOOT_CONFIG" ] && ! grep -q "gpu_mem=" "$BOOT_CONFIG"; then
-  echo ""                          | sudo tee -a "$BOOT_CONFIG"
-  echo "# PicoGallery: GPU memory" | sudo tee -a "$BOOT_CONFIG"
-  echo "gpu_mem=64"                | sudo tee -a "$BOOT_CONFIG"
-  info "Set gpu_mem=64 in $BOOT_CONFIG"
-else
-  info "Skipping gpu_mem (already set or /boot/config.txt not found)."
-fi
 
-# Also check for /boot/firmware/config.txt (Pi OS Bookworm)
-BOOT_CONFIG2="/boot/firmware/config.txt"
-if [ -f "$BOOT_CONFIG2" ] && ! grep -q "gpu_mem=" "$BOOT_CONFIG2"; then
-  echo ""                          | sudo tee -a "$BOOT_CONFIG2"
-  echo "# PicoGallery: GPU memory" | sudo tee -a "$BOOT_CONFIG2"
-  echo "gpu_mem=64"                | sudo tee -a "$BOOT_CONFIG2"
-  info "Set gpu_mem=64 in $BOOT_CONFIG2"
-fi
+set_gpu_mem() {
+  local cfg="$1"
+  if [[ -f "$cfg" ]] && ! grep -q "^gpu_mem=" "$cfg"; then
+    echo ""                          | sudo tee -a "$cfg" > /dev/null
+    echo "# PicoGallery: GPU memory" | sudo tee -a "$cfg" > /dev/null
+    echo "gpu_mem=64"                | sudo tee -a "$cfg" > /dev/null
+    info "Set gpu_mem=64 in $cfg"
+  fi
+}
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+set_gpu_mem "/boot/config.txt"
+set_gpu_mem "/boot/firmware/config.txt"
+
+# ── Enable & start ───────────────────────────────────────────────────────────
+
+section "Enabling service"
+
+sudo systemctl enable picogallery
+info "PicoGallery will start automatically on boot."
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
 echo ""
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${RESET}"
-echo -e "${GREEN}${BOLD}  PicoGallery installed successfully!   ${RESET}"
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${RESET}"
+echo -e "${GREEN}${BOLD}════════════════════════════════════════════${RESET}"
+echo -e "${GREEN}${BOLD}  PicoGallery installed successfully!       ${RESET}"
+echo -e "${GREEN}${BOLD}════════════════════════════════════════════${RESET}"
 echo ""
-echo "  1. Edit your credentials:"
-echo "     nano ~/.config/picogallery/config.toml"
+echo "  Version : ${VERSION}"
+echo "  Binary  : /usr/local/bin/picogallery"
+echo "  Config  : ${CONFIG_DIR}/config.toml"
+echo "  Service : picogallery.service"
 echo ""
-echo "  2. Test run (interactive terminal):"
+echo "  Next steps:"
+echo ""
+echo "  1. Edit your config (set your photo source):"
+echo "     nano ${CONFIG_DIR}/config.toml"
+echo ""
+echo "  2. Test run (interactive):"
 echo "     SDL_VIDEODRIVER=kmsdrm picogallery"
 echo ""
-echo "  3. Enable on boot:"
-echo "     sudo systemctl enable --now picogallery"
+echo "  3. Start the service now:"
+echo "     sudo systemctl start picogallery"
+echo ""
+echo "  4. Watch logs:"
+echo "     sudo journalctl -u picogallery -f"
+echo ""
+echo "  5. Reboot to apply GPU memory & group changes:"
+echo "     sudo reboot"
 echo ""

@@ -1,0 +1,92 @@
+# PicoGallery — example configuration
+# Copy this file to  ~/.config/picogallery/config.toml  and edit it.
+# Or run:  picogallery --generate-config
+#
+# QUICK START
+# -----------
+# 1. Copy this file:
+#      cp config.example.toml ~/.config/picogallery/config.toml
+# 2. Edit the file and set  enabled = true  on one plugin.
+# 3. Fill in the required fields for that plugin.
+# 4. Run:  picogallery
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display
+# ─────────────────────────────────────────────────────────────────────────────
+[display]
+slide_duration_secs = 10      # seconds each photo is shown
+transition          = "fade"  # "cut" | "fade" | "slide_left" | "slide_right"
+transition_ms       = 800     # transition duration (ms); set 0 to disable
+fill_screen         = false   # true = crop-to-fill; false = letterbox (black bars)
+fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
+# width  = 1920
+# height = 1080
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache
+# ─────────────────────────────────────────────────────────────────────────────
+[cache]
+max_mb         = 256   # on-disk cache ceiling in MB
+prefetch_count = 3     # photos pre-fetched while current photo is on screen
+# dir = "/tmp/picogallery-cache"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Plugins — enable one or more by setting  enabled = true
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] directory  ★ easiest to get started
+# Serve photos from a single root directory.
+# Sub-directories are treated as albums (like Google Photos albums).
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "directory"
+enabled = false
+
+path      = "/home/pi/Photos"      # root directory (required)
+order     = "shuffle"              # "shuffle" | "alphabetical" | "date_modified"
+recursive = true                   # include sub-directories
+
+# Limit to specific sub-directories (albums). Remove or leave empty for all.
+# allowed_albums = ["Vacation 2024", "Birthday 2023"]
+
+# Re-scan the directory every hour (0 = only at startup)
+# rescan_interval_secs = 3600
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] local
+# Like "directory" but accepts multiple root paths.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "local"
+enabled = true                     # ← enabled by default
+
+paths     = ["/home/pi/Pictures", "/mnt/usb/photos"]
+recursive = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] google-photos  (requires rclone — sudo apt install rclone)
+# Uses Google Drive as the photo source (Google Photos Library API was removed
+# on March 31, 2025; Drive API via rclone is the recommended alternative).
+#
+# First run: picogallery will open a browser sign-in page.
+# Subsequent runs: the saved token is reused automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "google-photos"
+enabled = false
+
+sync_dir = "/tmp/picogallery-gdrive"   # local cache for synced photos
+# drive_folder_id = ""                 # optional: Drive folder ID to sync from
+# max_transfer    = "500"              # MB cap per sync run
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] amazon-photos
+# Requires a Login with Amazon (LWA) app — see developer.amazon.com
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "amazon-photos"
+enabled = false
+
+client_id     = "YOUR_LWA_CLIENT_ID"
+client_secret = "YOUR_LWA_CLIENT_SECRET"
