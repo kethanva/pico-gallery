@@ -52,7 +52,7 @@ picogallery-core    = { workspace = true }
 env_logger          = "0.11"
 image               = { version = "0.24", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 fast_image_resize   = "2.7"
-sdl2                = { version = "0.36", default-features = false, features = ["bundled"] }
+sdl2                = { version = "0.36", default-features = false }
 clap                = { version = "4", features = ["derive", "env"] }
 
 # Plugins (compiled in via feature flags — no cycle: plugins depend on core, not on this crate)
