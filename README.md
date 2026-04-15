@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
 ![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20Zero%2F1%2F2%2F3%2F4-red)
-[![Build & Release](https://github.com/kethanva/opentinyphotoapp/actions/workflows/release.yml/badge.svg)](https://github.com/kethanva/opentinyphotoapp/actions/workflows/release.yml)
+[![Build & Release](https://github.com/kethanva/PicoGallery/actions/workflows/release.yml/badge.svg)](https://github.com/kethanva/PicoGallery/actions/workflows/release.yml)
 
 ---
 
@@ -16,19 +16,19 @@
 No Rust toolchain, no compilation — downloads the pre-built binary and configures everything automatically.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/kethanva/PicoGallery/main/install.sh | bash
 ```
 
 Pin a specific version:
 
 ```bash
-PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh)
+PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/PicoGallery/main/install.sh)
 ```
 
 Force build from source (skips binary download):
 
 ```bash
-PICOGALLERY_BUILD=1 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh)
+PICOGALLERY_BUILD=1 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/PicoGallery/main/install.sh)
 ```
 
 **What the installer does (zero human intervention):**
@@ -105,7 +105,7 @@ git push origin v0.2.0
 ```
 
 The pipeline runs automatically. Within a few minutes, the release appears at:
-`https://github.com/kethanva/opentinyphotoapp/releases`
+`https://github.com/kethanva/PicoGallery/releases`
 
 ### Build matrix
 
