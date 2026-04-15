@@ -270,6 +270,21 @@ for group in video render input; do
   fi
 done
 
+# ── Sample Photos ─────────────────────────────────────────────────────────────
+
+section "Setting up sample photos"
+
+PHOTO_DIR="/home/${TARGET_USER}/Pictures/PicoGallery"
+sudo -u "$TARGET_USER" mkdir -p "$PHOTO_DIR"
+
+# If installing from source, we can just copy them.
+# If installing from binary, we might need to download them if they aren't in the archive.
+if [[ -d "sample_photos" ]]; then
+  info "Copying sample photos..."
+  sudo cp -r sample_photos/* "$PHOTO_DIR/"
+  sudo chown -R "$TARGET_USER:$TARGET_USER" "$PHOTO_DIR"
+fi
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 section "Setting up configuration"
@@ -300,7 +315,7 @@ prefetch_count = 3
 [[plugins]]
 name    = "directory"
 enabled = true
-path    = "/home/pi/Photos"
+path    = "/home/${TARGET_USER}/Pictures/PicoGallery"
 order   = "shuffle"
 recursive = true
 
