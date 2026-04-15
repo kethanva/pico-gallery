@@ -7,25 +7,28 @@
 #   — or —
 #   bash install.sh
 #   — or (pin a specific version) —
-#   PICOGALLERY_VERSION=v0.2.0 bash install.sh
+#   PICOGALLERY_VERSION=v0.1.0 bash install.sh
+#   — or (force build from source) —
+#   PICOGALLERY_BUILD=1 bash install.sh
 #
 # What this script does:
-#   1. Detects your architecture (aarch64 or armv7)
-#   2. Downloads the pre-built binary from GitHub Releases
-#   3. Installs runtime dependencies (libsdl2, libdrm, rclone)
-#   4. Installs the binary to /usr/local/bin/picogallery
-#   5. Creates a systemd service that runs on boot
-#   6. Adds the current user to video/render/input groups
-#   7. Writes a default config if none exists
-#   8. Configures GPU memory split
+#   1. Detects architecture (aarch64 or armv7)
+#   2. Tries to download the pre-built binary from GitHub Releases
+#   3. Falls back to building from source if no release is available
+#   4. Installs runtime dependencies (libsdl2, libdrm, rclone)
+#   5. Installs the binary to /usr/local/bin/picogallery
+#   6. Creates a systemd service that runs on boot
+#   7. Adds the current user to video/render/input groups
+#   8. Writes a default config if none exists
+#   9. Configures GPU memory split
 #
-# NO compilation needed. NO Rust toolchain required.
 # NO X server, NO desktop environment, NO display manager.
 # ============================================================
 
 set -euo pipefail
 
 REPO="kethanva/opentinyphotoapp"
+REPO_URL="https://github.com/${REPO}"
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
 CYAN='\033[0;36m'; RESET='\033[0m'
 
@@ -37,7 +40,6 @@ section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 
 [[ "$(uname -s)" == "Linux" ]] || die "This installer only supports Linux (Raspberry Pi OS)."
-
 command -v curl &>/dev/null || die "curl is required. Install with: sudo apt-get install -y curl"
 
 echo -e "${BOLD}"
@@ -50,70 +52,195 @@ echo -e "${RESET}"
 
 ARCH=$(uname -m)
 case "$ARCH" in
-  aarch64)       ARTIFACT_ARCH="aarch64" ;;
-  armv7l|armv6l) ARTIFACT_ARCH="armv7"   ;;
+  aarch64)       ARTIFACT_ARCH="aarch64"; RUST_TARGET="aarch64-unknown-linux-gnu" ;;
+  armv7l)        ARTIFACT_ARCH="armv7";   RUST_TARGET="armv7-unknown-linux-gnueabihf" ;;
+  armv6l)        ARTIFACT_ARCH="armv7";   RUST_TARGET="arm-unknown-linux-gnueabihf" ;;
   *)             die "Unsupported architecture: $ARCH (need aarch64 or armv7l)" ;;
 esac
 info "Architecture: $ARCH -> artifact: linux-${ARTIFACT_ARCH}"
 
-# ── Resolve version ──────────────────────────────────────────────────────────
-
-section "Resolving version"
-
-if [[ -n "${PICOGALLERY_VERSION:-}" ]]; then
-  VERSION="$PICOGALLERY_VERSION"
-  info "Using pinned version: $VERSION"
-else
-  info "Fetching latest release from GitHub..."
-  VERSION=$(curl -sSL \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-
-  [[ -n "$VERSION" ]] || die "Could not determine latest release. Set PICOGALLERY_VERSION manually."
-  info "Latest release: $VERSION"
-fi
-
-# ── Download binary ──────────────────────────────────────────────────────────
-
-section "Downloading PicoGallery ${VERSION}"
-
-TARBALL="picogallery-${VERSION}-linux-${ARTIFACT_ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
-SHA_URL="${DOWNLOAD_URL}.sha256"
+# ── Temp directory ───────────────────────────────────────────────────────────
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-info "Downloading: $TARBALL"
-HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "${TMPDIR}/${TARBALL}" "$DOWNLOAD_URL")
-[[ "$HTTP_CODE" == "200" ]] || die "Download failed (HTTP $HTTP_CODE). Check that ${VERSION} has a linux-${ARTIFACT_ARCH} artifact."
+# ── Resolve version & download strategy ──────────────────────────────────────
 
-# Verify checksum if available
-if curl -sSL -o "${TMPDIR}/${TARBALL}.sha256" "$SHA_URL" 2>/dev/null; then
-  cd "$TMPDIR"
-  if sha256sum -c "${TARBALL}.sha256" &>/dev/null; then
-    info "SHA-256 checksum verified."
-  else
-    warn "Checksum mismatch! Continuing anyway — verify manually if concerned."
-  fi
-  cd - >/dev/null
-else
-  warn "No checksum file found — skipping verification."
+section "Resolving version"
+
+INSTALL_MODE="download"   # "download" or "build"
+VERSION=""
+EXTRACT_DIR=""
+
+if [[ "${PICOGALLERY_BUILD:-}" == "1" ]]; then
+  INSTALL_MODE="build"
+  info "PICOGALLERY_BUILD=1 — will build from source."
 fi
 
-# Extract
-info "Extracting..."
-tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
-EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "picogallery-*" | head -1)
-[[ -d "$EXTRACT_DIR" ]] || die "Extraction failed — archive structure unexpected."
+if [[ "$INSTALL_MODE" == "download" ]]; then
+  # Determine which version to download
+  if [[ -n "${PICOGALLERY_VERSION:-}" ]]; then
+    VERSION="$PICOGALLERY_VERSION"
+    info "Using pinned version: $VERSION"
+  else
+    info "Fetching latest release from GitHub..."
+    RELEASE_JSON=$(curl -sSL -w "\n%{http_code}" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null) || true
 
-# ── Install runtime dependencies ─────────────────────────────────────────────
+    HTTP_CODE=$(echo "$RELEASE_JSON" | tail -1)
+    RELEASE_BODY=$(echo "$RELEASE_JSON" | sed '$d')
+
+    if [[ "$HTTP_CODE" == "200" ]]; then
+      VERSION=$(echo "$RELEASE_BODY" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    fi
+
+    if [[ -z "$VERSION" ]]; then
+      warn "No GitHub Release found (HTTP $HTTP_CODE)."
+      warn "This is expected on first install before the CI pipeline has run."
+
+      # Try to find the latest tag instead
+      TAGS_JSON=$(curl -sSL \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${REPO}/tags?per_page=1" 2>/dev/null) || true
+      TAG_NAME=$(echo "$TAGS_JSON" | grep '"name"' | head -1 | cut -d'"' -f4)
+
+      if [[ -n "$TAG_NAME" ]]; then
+        info "Found tag: $TAG_NAME — but no release artifacts exist for it."
+      fi
+
+      warn "Falling back to building from source..."
+      INSTALL_MODE="build"
+    else
+      info "Latest release: $VERSION"
+    fi
+  fi
+fi
+
+# ── Try downloading pre-built binary ─────────────────────────────────────────
+
+if [[ "$INSTALL_MODE" == "download" ]]; then
+  section "Downloading PicoGallery ${VERSION}"
+
+  TARBALL="picogallery-${VERSION}-linux-${ARTIFACT_ARCH}.tar.gz"
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
+  SHA_URL="${DOWNLOAD_URL}.sha256"
+
+  info "URL: $DOWNLOAD_URL"
+  HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "${TMPDIR}/${TARBALL}" "$DOWNLOAD_URL" 2>/dev/null) || true
+
+  if [[ "$HTTP_CODE" == "200" ]] && [[ -s "${TMPDIR}/${TARBALL}" ]]; then
+    info "Downloaded: $TARBALL"
+
+    # Verify checksum if available
+    if curl -sSL -o "${TMPDIR}/${TARBALL}.sha256" "$SHA_URL" 2>/dev/null; then
+      SAVED_DIR=$(pwd)
+      cd "$TMPDIR"
+      if sha256sum -c "${TARBALL}.sha256" &>/dev/null; then
+        info "SHA-256 checksum verified."
+      else
+        warn "Checksum mismatch — continuing anyway."
+      fi
+      cd "$SAVED_DIR"
+    fi
+
+    # Extract
+    info "Extracting..."
+    tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
+    EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "picogallery-*" | head -1)
+
+    if [[ -d "$EXTRACT_DIR" ]] && [[ -f "${EXTRACT_DIR}/picogallery" ]]; then
+      info "Binary extracted successfully."
+    else
+      warn "Archive did not contain expected binary."
+      warn "Falling back to building from source..."
+      INSTALL_MODE="build"
+    fi
+  else
+    warn "Download failed (HTTP $HTTP_CODE). No pre-built binary for ${VERSION} / linux-${ARTIFACT_ARCH}."
+    warn "Falling back to building from source..."
+    INSTALL_MODE="build"
+  fi
+fi
+
+# ── Build from source (fallback) ────────────────────────────────────────────
+
+if [[ "$INSTALL_MODE" == "build" ]]; then
+  section "Building from source"
+  info "This takes 5-15 minutes on a Raspberry Pi (longer on Pi Zero)."
+
+  # Install build dependencies
+  info "Installing build dependencies..."
+  sudo apt-get update -qq
+  sudo apt-get install -y --no-install-recommends \
+    libsdl2-dev \
+    libsdl2-2.0-0 \
+    libdrm-dev \
+    libdrm2 \
+    ca-certificates \
+    clang \
+    pkg-config \
+    cmake \
+    curl \
+    git \
+    build-essential \
+    rclone
+
+  # Install Rust if needed
+  if command -v rustup &>/dev/null; then
+    info "Rust already installed — updating."
+    rustup update stable --no-self-update
+  else
+    info "Installing Rust toolchain..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+      sh -s -- -y --default-toolchain stable --profile minimal
+    # shellcheck source=/dev/null
+    source "$HOME/.cargo/env"
+  fi
+  info "Rust $(rustc --version)"
+
+  # Clone or update source
+  SRC_DIR="${TMPDIR}/picogallery-src"
+  info "Cloning repository..."
+  git clone --depth 1 "${REPO_URL}.git" "$SRC_DIR"
+
+  # Build
+  info "Compiling (release mode)..."
+  cd "$SRC_DIR"
+
+  # Pi Zero / armv6l: single thread to avoid OOM
+  CARGO_JOBS=""
+  if [[ "$ARCH" == "armv6l" ]]; then
+    CARGO_JOBS="--jobs 1"
+    info "Pi Zero detected — building with 1 job to conserve RAM."
+  fi
+
+  "$HOME/.cargo/bin/cargo" build \
+    --release \
+    --features "plugin-google-photos,plugin-local,plugin-directory" \
+    $CARGO_JOBS
+
+  BUILT_BINARY="$SRC_DIR/target/release/picogallery"
+  [[ -f "$BUILT_BINARY" ]] || die "Build failed — binary not found."
+  info "Build complete. Binary size: $(du -h "$BUILT_BINARY" | cut -f1)"
+
+  # Set up extract dir to match the download path
+  EXTRACT_DIR="${TMPDIR}/picogallery-built"
+  mkdir -p "$EXTRACT_DIR"
+  cp "$BUILT_BINARY" "$EXTRACT_DIR/picogallery"
+  cp "$SRC_DIR/config.example.toml" "$EXTRACT_DIR/" 2>/dev/null || true
+  cp "$SRC_DIR/picogallery.service" "$EXTRACT_DIR/" 2>/dev/null || true
+
+  VERSION=$(grep '^version' "$SRC_DIR/Cargo.toml" | head -1 | cut -d'"' -f2)
+  VERSION="v${VERSION}"
+  cd /
+fi
+
+# ── Install runtime dependencies (if not already installed by build) ─────────
 
 section "Installing runtime dependencies"
 
 sudo apt-get update -qq
-
 sudo apt-get install -y --no-install-recommends \
   libsdl2-2.0-0 \
   libdrm2 \
@@ -128,7 +255,7 @@ section "Installing binary"
 
 sudo install -m 755 "${EXTRACT_DIR}/picogallery" /usr/local/bin/picogallery
 info "Installed /usr/local/bin/picogallery"
-info "Version: $(picogallery --version 2>/dev/null || echo "$VERSION")"
+info "Version: $(picogallery --version 2>/dev/null || echo "${VERSION:-unknown}")"
 info "Binary size: $(du -h /usr/local/bin/picogallery | cut -f1)"
 
 # ── User groups ──────────────────────────────────────────────────────────────
@@ -154,7 +281,6 @@ if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
   if [[ -f "${EXTRACT_DIR}/config.example.toml" ]]; then
     sudo -u "$TARGET_USER" cp "${EXTRACT_DIR}/config.example.toml" "${CONFIG_DIR}/config.toml"
   else
-    # Generate minimal default config
     sudo -u "$TARGET_USER" tee "${CONFIG_DIR}/config.toml" > /dev/null <<'TOML'
 # PicoGallery configuration
 # See: https://github.com/kethanva/opentinyphotoapp
@@ -265,7 +391,8 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo -e "${GREEN}${BOLD}  PicoGallery installed successfully!       ${RESET}"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════════${RESET}"
 echo ""
-echo "  Version : ${VERSION}"
+echo "  Version : ${VERSION:-source build}"
+echo "  Mode    : ${INSTALL_MODE}"
 echo "  Binary  : /usr/local/bin/picogallery"
 echo "  Config  : ${CONFIG_DIR}/config.toml"
 echo "  Service : picogallery.service"

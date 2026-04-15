@@ -25,19 +25,33 @@ Pin a specific version:
 PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh)
 ```
 
+Force build from source (skips binary download):
+
+```bash
+PICOGALLERY_BUILD=1 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh)
+```
+
 **What the installer does (zero human intervention):**
 
 | Step | Action |
 |------|--------|
 | 1 | Detects architecture (`aarch64` or `armv7`) |
-| 2 | Fetches the latest release version from the GitHub API |
-| 3 | Downloads the pre-built binary tarball and verifies its SHA-256 checksum |
-| 4 | Installs runtime dependencies: `libsdl2-2.0-0`, `libdrm2`, `ca-certificates`, `rclone` |
-| 5 | Installs the binary to `/usr/local/bin/picogallery` |
-| 6 | Adds your user to the `video`, `render`, and `input` groups |
-| 7 | Writes a default config to `~/.config/picogallery/config.toml` |
-| 8 | Installs and enables a systemd service (`picogallery.service`) |
-| 9 | Sets `gpu_mem=64` in `/boot/config.txt` (or `/boot/firmware/config.txt` on Bookworm) |
+| 2 | Tries to download a pre-built binary from GitHub Releases |
+| 3 | If no release exists, automatically falls back to cloning and building from source |
+| 4 | Verifies the SHA-256 checksum (download mode) |
+| 5 | Installs runtime dependencies: `libsdl2-2.0-0`, `libdrm2`, `ca-certificates`, `rclone` |
+| 6 | Installs the binary to `/usr/local/bin/picogallery` |
+| 7 | Adds your user to the `video`, `render`, and `input` groups |
+| 8 | Writes a default config to `~/.config/picogallery/config.toml` |
+| 9 | Installs and enables a systemd service (`picogallery.service`) |
+| 10 | Sets `gpu_mem=64` in `/boot/config.txt` (or `/boot/firmware/config.txt` on Bookworm) |
+
+**Install modes:**
+
+| Mode | When | What happens |
+|------|------|-------------|
+| Download (fast) | A GitHub Release with artifacts exists | Downloads ~4 MB binary, no Rust needed |
+| Build (fallback) | No release yet, or `PICOGALLERY_BUILD=1` | Installs Rust + build deps, compiles from source (~10 min on Pi 4) |
 
 After installation:
 
