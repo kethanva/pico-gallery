@@ -43,7 +43,7 @@ prefetch_count = 3     # photos pre-fetched while current photo is on screen
 name    = "directory"
 enabled = false
 
-path      = "/home/pi/Photos"      # root directory (required)
+path      = "/home/admin/Pictures/PicoGallery"  # root directory (required)
 order     = "shuffle"              # "shuffle" | "alphabetical" | "date_modified"
 recursive = true                   # include sub-directories
 
@@ -61,7 +61,7 @@ recursive = true                   # include sub-directories
 name    = "local"
 enabled = true                     # ← enabled by default
 
-paths     = ["/home/pi/Pictures", "/mnt/usb/photos"]
+paths     = ["/home/admin/Pictures/PicoGallery"]
 recursive = true
 
 # ─────────────────────────────────────────────────────────────────────────────
