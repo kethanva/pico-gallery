@@ -96,8 +96,7 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
     fi
 
     if [[ -z "$VERSION" ]]; then
-      warn "No GitHub Release found (HTTP $HTTP_CODE)."
-      warn "This is expected on first install before the CI pipeline has run."
+      warn "No 'Latest Release' found on GitHub yet (HTTP $HTTP_CODE)."
 
       # Try to find the latest tag instead
       TAGS_JSON=$(curl -sSL \
@@ -106,11 +105,12 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
       TAG_NAME=$(echo "$TAGS_JSON" | grep '"name"' | head -1 | cut -d'"' -f4)
 
       if [[ -n "$TAG_NAME" ]]; then
-        info "Found tag: $TAG_NAME — but no release artifacts exist for it."
+        info "Found tag: $TAG_NAME — will attempt to download from this tag."
+        VERSION="$TAG_NAME"
+      else
+        warn "No tags found either. Falling back to building from source..."
+        INSTALL_MODE="build"
       fi
-
-      warn "Falling back to building from source..."
-      INSTALL_MODE="build"
     else
       info "Latest release: $VERSION"
     fi
