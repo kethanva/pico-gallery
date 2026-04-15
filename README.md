@@ -5,6 +5,127 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
 ![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20Zero%2F1%2F2%2F3%2F4-red)
+[![Build & Release](https://github.com/kethanva/opentinyphotoapp/actions/workflows/release.yml/badge.svg)](https://github.com/kethanva/opentinyphotoapp/actions/workflows/release.yml)
+
+---
+
+## Installation on Raspberry Pi
+
+### One-line installer (recommended)
+
+No Rust toolchain, no compilation — downloads the pre-built binary and configures everything automatically.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh | bash
+```
+
+Pin a specific version:
+
+```bash
+PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh)
+```
+
+**What the installer does (zero human intervention):**
+
+| Step | Action |
+|------|--------|
+| 1 | Detects architecture (`aarch64` or `armv7`) |
+| 2 | Fetches the latest release version from the GitHub API |
+| 3 | Downloads the pre-built binary tarball and verifies its SHA-256 checksum |
+| 4 | Installs runtime dependencies: `libsdl2-2.0-0`, `libdrm2`, `ca-certificates`, `rclone` |
+| 5 | Installs the binary to `/usr/local/bin/picogallery` |
+| 6 | Adds your user to the `video`, `render`, and `input` groups |
+| 7 | Writes a default config to `~/.config/picogallery/config.toml` |
+| 8 | Installs and enables a systemd service (`picogallery.service`) |
+| 9 | Sets `gpu_mem=64` in `/boot/config.txt` (or `/boot/firmware/config.txt` on Bookworm) |
+
+After installation:
+
+```bash
+# 1. Edit your photo source
+nano ~/.config/picogallery/config.toml
+
+# 2. Test interactively
+SDL_VIDEODRIVER=kmsdrm picogallery
+
+# 3. Start the service
+sudo systemctl start picogallery
+
+# 4. Watch logs
+sudo journalctl -u picogallery -f
+
+# 5. Reboot to apply GPU memory and group changes
+sudo reboot
+```
+
+### Supported architectures
+
+| Archive | Architecture | Devices |
+|---------|-------------|---------|
+| `*-linux-aarch64.tar.gz` | 64-bit ARM | Pi Zero 2 W, Pi 3, Pi 4, Pi 5 (64-bit OS) |
+| `*-linux-armv7.tar.gz` | 32-bit ARM | Pi 2, Pi 3, Pi 4 (32-bit OS) |
+
+---
+
+## CI/CD Pipeline
+
+PicoGallery uses GitHub Actions to cross-compile for Raspberry Pi and publish pre-built binaries to GitHub Releases automatically.
+
+### Pipeline file
+
+`.github/workflows/release.yml`
+
+### Triggers
+
+| Event | Result |
+|-------|--------|
+| Push to `main` | Builds both targets; uploads as workflow artifacts (30-day retention) |
+| Push a tag `v*` (e.g. `v0.2.0`) | Builds both targets; creates a GitHub Release with downloadable archives |
+| Manual dispatch | Builds both targets; optionally creates a GitHub Release |
+
+### To publish a new release
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The pipeline runs automatically. Within a few minutes, the release appears at:
+`https://github.com/kethanva/opentinyphotoapp/releases`
+
+### Build matrix
+
+| Target triple | Arch label | Devices |
+|---------------|------------|---------|
+| `aarch64-unknown-linux-gnu` | `linux-aarch64` | Pi Zero 2 W, Pi 3/4/5 (64-bit OS) |
+| `armv7-unknown-linux-gnueabihf` | `linux-armv7` | Pi 2/3/4 (32-bit OS) |
+
+### How the cross-compilation works
+
+The pipeline runs on `ubuntu-24.04` and cross-compiles without QEMU:
+
+1. Adds the target ARM architecture to apt (`dpkg --add-architecture arm64` / `armhf`)
+2. Installs the GNU cross-toolchain (`gcc-aarch64-linux-gnu` or `gcc-arm-linux-gnueabihf`)
+3. Installs cross-architecture sysroot packages: `libdrm-dev`, `libgbm-dev`, `libudev-dev`
+4. SDL2 is built from source via the `bundled` cargo feature (cmake + cross-compiler) — no ARM SDL2 package required
+5. Sets `CARGO_TARGET_*_LINKER`, `CC`, `PKG_CONFIG_PATH`, and `PKG_CONFIG_ALLOW_CROSS` for the build
+6. Runs `cargo build --release --target <triple>`
+7. The `profile.release` section in `Cargo.toml` already strips the binary (`strip = true`)
+
+### Artifact contents
+
+Each `.tar.gz` release archive contains:
+
+```
+picogallery-<version>-linux-<arch>/
+├── picogallery          # stripped release binary
+├── picogallery.service  # systemd unit file
+├── config.example.toml  # annotated config template
+├── LICENSE
+└── README.md
+```
+
+Each archive has a matching `.sha256` checksum file. The installer verifies this automatically.
 
 ---
 
@@ -28,6 +149,7 @@ picogallery/
 └── plugins/
     ├── google-photos/            # Google Drive plugin (drive.readonly via rclone)
     ├── amazon-photos/            # Amazon Photos via LWA
+    ├── directory/                # Directory plugin (recommended for local files)
     └── local/                    # Local filesystem scanner
 ```
 
@@ -49,7 +171,7 @@ picogallery/
 ## Features
 
 - **No X11 / no desktop** — renders directly to the KMS/DRM framebuffer via SDL2.
-- **Plugin architecture** — Google Drive, Amazon Photos, local filesystem; add your own with one Rust trait.
+- **Plugin architecture** — Google Drive, Amazon Photos, local directory/filesystem; add your own with one Rust trait.
 - **Google Drive via rclone** — `drive.readonly` scope, no Google Cloud project or API key needed.
 - **One-time sign-in** — browser opens automatically on first run; token is saved and reused forever.
 - **Disk cache with LRU eviction** — photos survive reboots and WiFi outages.
@@ -164,10 +286,25 @@ sync_dir         = "/tmp/picogallery-gdrive"   # local cache directory
 drive_folder_id  = ""                          # specific Drive folder ID, or "" for root
 # max_transfer   = "500"                       # MB cap per sync run
 
-# ── Local filesystem ──────────────────────────────────────────────────────────
+# ── Amazon Photos ─────────────────────────────────────────────────────────────
+# [[plugins]]
+# name          = "amazon-photos"
+# enabled       = true
+# client_id     = "YOUR_LWA_CLIENT_ID"
+# client_secret = "YOUR_LWA_CLIENT_SECRET"
+
+# ── Directory Plugin (Recommended for local photos) ───────────────────────────
+# [[plugins]]
+# name      = "directory"
+# enabled   = true
+# path      = "/home/pi/Photos"
+# order     = "shuffle"         # "shuffle" | "alphabetical" | "date_modified"
+# recursive = true
+
+# ── Local filesystem (Legacy Multi-path) ──────────────────────────────────────
 # [[plugins]]
 # name    = "local"
-# enabled = true
+# enabled = false
 # paths   = ["/mnt/nas/photos", "/home/pi/Pictures"]
 ```
 
@@ -251,11 +388,11 @@ sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential rclon
 ### Build
 
 ```bash
-# Full build (Google Drive + local)
+# Full build (Google Drive + Amazon Photos + directory + local)
 cargo build
 
-# Local-only build (no rclone needed)
-cargo build --no-default-features --features plugin-local
+# Directory-only build (no rclone needed)
+cargo build --no-default-features --features plugin-directory
 ```
 
 ### Test with local photos
@@ -296,9 +433,10 @@ max_mb = 64
 prefetch_count = 2
 
 [[plugins]]
-name    = "local"
+name    = "directory"
 enabled = true
-paths   = ["/tmp/picogallery-test-photos"]
+path    = "/tmp/picogallery-test-photos"
+order   = "alphabetical"
 EOF
 ```
 
@@ -418,7 +556,8 @@ config.toml
     ▼
 Plugin registry ──┬── GoogleDrivePlugin (rclone drive.readonly → local disk)
                   ├── AmazonPhotosPlugin (LWA OAuth → Amazon API)
-                  └── LocalPlugin (filesystem scan)
+                  ├── DirectoryPlugin (local filesystem scanning with sorting)
+                  └── LocalPlugin (legacy filesystem scan)
                         │  dyn PhotoPlugin
                         ▼
                   Slideshow engine

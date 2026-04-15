@@ -5,6 +5,7 @@ members = [
     "plugins/google-photos",
     "plugins/amazon-photos",
     "plugins/local",
+    "plugins/directory",
 ]
 resolver = "2"
 
@@ -58,15 +59,17 @@ clap                = { version = "4", features = ["derive", "env"] }
 picogallery-google-photos = { path = "plugins/google-photos", optional = true }
 picogallery-amazon-photos = { path = "plugins/amazon-photos", optional = true }
 picogallery-local         = { path = "plugins/local",         optional = true }
+picogallery-directory     = { path = "plugins/directory",     optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
 
 [features]
-default              = ["plugin-google-photos", "plugin-local"]
+default              = ["plugin-google-photos", "plugin-local", "plugin-directory"]
 plugin-google-photos = ["dep:picogallery-google-photos"]
 plugin-amazon-photos = ["dep:picogallery-amazon-photos"]
 plugin-local         = ["dep:picogallery-local"]
+plugin-directory     = ["dep:picogallery-directory"]
 
 [profile.release]
 opt-level     = "z"
@@ -74,3 +77,22 @@ lto           = true
 codegen-units = 1
 strip         = true
 panic         = "abort"
+
+[package.metadata.deb]
+name = "picogallery"
+maintainer = "Kethan <kethanva@gmail.com>"
+copyright = "2026, Kethan"
+license-file = ["LICENSE", "0"]
+extended-description = """
+A lightweight, plugin-based photo slideshow for Raspberry Pi.
+Renders directly to the KMS/DRM framebuffer via SDL2.
+Includes support for Google Drive, Amazon Photos, and local folders.
+"""
+depends = "libdrm2, ca-certificates, rclone"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/picogallery", "/usr/bin/picogallery", "755"],
+    ["picogallery.service", "/lib/systemd/system/picogallery.service", "644"],
+    ["LICENSE", "/usr/share/doc/picogallery/copyright", "644"],
+]

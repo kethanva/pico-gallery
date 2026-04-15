@@ -305,6 +305,8 @@ impl Renderer {
                 | Event::KeyDown { keycode: Some(Keycode::Space), .. } => return Some(SlideshowCmd::Next),
                 Event::KeyDown { keycode: Some(Keycode::Left), .. }    => return Some(SlideshowCmd::Prev),
                 Event::KeyDown { keycode: Some(Keycode::P), .. }       => return Some(SlideshowCmd::TogglePause),
+                Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Left, .. } => return Some(SlideshowCmd::Prev),
+                Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Right, .. } => return Some(SlideshowCmd::Next),
                 _ => {}
             }
         }
