@@ -56,6 +56,14 @@ jobs:
             pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
             lib_dir: /usr/lib/arm-linux-gnueabihf
 
+          - target: arm-unknown-linux-gnueabihf
+            arch: armv6
+            deb_arch: armhf
+            cross_pkg: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+            pkg_config_path: /usr/lib/arm-linux-gnueabihf/pkgconfig
+            lib_dir: /usr/lib/arm-linux-gnueabihf
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -106,6 +114,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC: ${{ matrix.linker }}
           PKG_CONFIG_SYSROOT_DIR: /usr
           PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
@@ -201,3 +210,4 @@ jobs:
             |---------|-------------|---------|
             | `*-linux-aarch64.tar.gz` | 64-bit ARM | Pi Zero 2 W, Pi 3/4/5 (64-bit OS) |
             | `*-linux-armv7.tar.gz` | 32-bit ARM | Pi 2, Pi 3/4 (32-bit OS) |
+            | `*-linux-armv6.tar.gz` | 32-bit ARM | Pi Zero (1), Pi 1 |
