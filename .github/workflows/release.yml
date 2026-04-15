@@ -141,6 +141,7 @@ jobs:
           mkdir -p "dist/${ARTIFACT_NAME}"
 
           cp "$BINARY"              "dist/${ARTIFACT_NAME}/picogallery"
+          cp -r sample_photos       "dist/${ARTIFACT_NAME}/" 2>/dev/null || true
           cp picogallery.service    "dist/${ARTIFACT_NAME}/"
           cp config.example.toml    "dist/${ARTIFACT_NAME}/"
           cp LICENSE                "dist/${ARTIFACT_NAME}/" 2>/dev/null || true
