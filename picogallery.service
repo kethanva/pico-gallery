@@ -1,0 +1,23 @@
+[Unit]
+Description=PicoGallery photo slideshow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=video
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=RUST_LOG=info
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/picogallery
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Allow /dev/dri access without root.
+SupplementaryGroups=video render input
+
+[Install]
+WantedBy=multi-user.target

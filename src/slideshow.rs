@@ -122,15 +122,16 @@ impl Slideshow {
     ) -> Result<()> {
         // Prefetch ring: up to `prefetch_count` decoded images ready ahead.
         let prefetch_n = self.config.cache.prefetch_count;
-        let mut prefetched: VecDeque<(usize, PhotoMeta, Vec<u8>)> = VecDeque::new();
+        let mut prefetched: VecDeque<(usize, usize, PhotoMeta, Vec<u8>)> = VecDeque::new();
         let mut cursor = 0usize;
+        let mut current_queue_idx = 0usize;
         let mut current_rgba: Option<RgbaImage> = None;
         let mut paused = false;
 
         // Pre-warm the prefetch queue.
         for i in 0..prefetch_n.min(queue.len()) {
             if let Some(bytes) = self.fetch_photo(&queue[i].0, &queue[i].1, renderer).await {
-                prefetched.push_back((queue[i].0, queue[i].1.clone(), bytes));
+                prefetched.push_back((i, queue[i].0, queue[i].1.clone(), bytes));
             }
         }
         cursor = prefetch_n.min(queue.len());
@@ -138,7 +139,8 @@ impl Slideshow {
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
         let trans_dur = Duration::from_millis(self.config.display.transition_ms as u64);
 
-        let mut last_advance = Instant::now();
+        // Initialize last_advance so that the first photo shows immediately
+        let mut last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now);
 
         loop {
             // ── Event handling ─────────────────────────────────────────────
@@ -151,12 +153,17 @@ impl Slideshow {
                         last_advance = Instant::now();
                     }
                     SlideshowCmd::Next => {
-                        last_advance = Instant::now() - slide_dur; // force advance
+                        last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now); // force advance
                     }
                     SlideshowCmd::Prev => {
-                        // Crude: go back in queue. This requires tracking history.
-                        // For now just restart the current photo.
-                        last_advance = Instant::now();
+                        current_queue_idx = if current_queue_idx == 0 {
+                            queue.len().saturating_sub(1)
+                        } else {
+                            current_queue_idx - 1
+                        };
+                        prefetched.clear();
+                        cursor = current_queue_idx;
+                        last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now);
                     }
                 }
             }
@@ -173,7 +180,7 @@ impl Slideshow {
             }
 
             // ── Display next photo ────────────────────────────────────────
-            if let Some((_pidx, meta, bytes)) = prefetched.pop_front() {
+            if let Some((q_idx, _pidx, meta, bytes)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
                 match renderer.decode_and_scale(&bytes) {
                     Ok(rgba) => {
@@ -184,6 +191,7 @@ impl Slideshow {
                             Transition::SlideRight => renderer.show_slide_left(current_rgba.as_ref(), &rgba, trans_dur),
                         };
                         if let Err(e) = result { warn!("Render error: {}", e); }
+                        current_queue_idx = q_idx;
                         current_rgba = Some(rgba);
                         last_advance = Instant::now();
                     }
@@ -196,7 +204,7 @@ impl Slideshow {
             if cursor < queue.len() && prefetched.len() < prefetch_n {
                 let (pidx, meta) = &queue[cursor];
                 if let Some(bytes) = self.fetch_photo(pidx, meta, renderer).await {
-                    prefetched.push_back((*pidx, meta.clone(), bytes));
+                    prefetched.push_back((cursor, *pidx, meta.clone(), bytes));
                 }
                 cursor += 1;
 
