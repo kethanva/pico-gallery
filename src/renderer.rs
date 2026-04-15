@@ -26,10 +26,10 @@ mod drm_probe {
     use drm::control::{connector, Device as ControlDevice};
     use drm::Device;
     use log::{info, warn};
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::{AsFd, BorrowedFd, RawFd};
 
     pub struct DrmCard(pub std::fs::File);
-    impl AsRawFd for DrmCard { fn as_raw_fd(&self) -> RawFd { self.0.as_raw_fd() } }
+    impl AsFd for DrmCard { fn as_fd(&self) -> BorrowedFd<'_> { self.0.as_fd() } }
     impl Device for DrmCard {}
     impl ControlDevice for DrmCard {}
 
