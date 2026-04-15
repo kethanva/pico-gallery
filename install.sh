@@ -3,7 +3,7 @@
 # PicoGallery installer for Raspberry Pi OS (arm/arm64)
 # ============================================================
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/kethanva/opentinyphotoapp/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/kethanva/PicoGallery/main/install.sh | bash
 #   — or —
 #   bash install.sh
 #   — or (pin a specific version) —
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-REPO="kethanva/opentinyphotoapp"
+REPO="kethanva/PicoGallery"
 REPO_URL="https://github.com/${REPO}"
 BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
 CYAN='\033[0;36m'; RESET='\033[0m'
@@ -283,7 +283,7 @@ if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
   else
     sudo -u "$TARGET_USER" tee "${CONFIG_DIR}/config.toml" > /dev/null <<'TOML'
 # PicoGallery configuration
-# See: https://github.com/kethanva/opentinyphotoapp
+# See: https://github.com/kethanva/PicoGallery
 
 [display]
 slide_duration_secs = 10
