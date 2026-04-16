@@ -10,6 +10,10 @@
 #   PICOGALLERY_VERSION=v0.1.0 bash install.sh
 #   — or (force build from source) —
 #   PICOGALLERY_BUILD=1 bash install.sh
+#   — or (slower build with every plugin) —
+#   PICOGALLERY_FEATURES="plugin-google-photos,plugin-local,plugin-directory" bash install.sh
+#   — or (maximum-speed install, no optimisation) —
+#   PICOGALLERY_PROFILE=release-fast bash install.sh   # default on low-RAM Pis
 #
 # What this script does:
 #   1. Detects architecture (aarch64 or armv7)
@@ -58,6 +62,22 @@ case "$ARCH" in
   *)             die "Unsupported architecture: $ARCH (need aarch64 or armv7l)" ;;
 esac
 info "Architecture: $ARCH -> artifact: linux-${ARTIFACT_ARCH}"
+
+# ── Detect RAM & device model (used to size on-device builds) ────────────────
+
+MEM_KB=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_MB=$(( MEM_KB / 1024 ))
+PI_MODEL=""
+if [[ -r /proc/device-tree/model ]]; then
+  PI_MODEL=$(tr -d '\0' < /proc/device-tree/model)
+fi
+[[ -n "$PI_MODEL" ]] && info "Device: $PI_MODEL"
+info "RAM: ${MEM_MB} MB"
+
+LOW_RAM=0
+if [[ "$MEM_MB" -lt 900 ]] || [[ "$PI_MODEL" == *"Zero"* ]]; then
+  LOW_RAM=1
+fi
 
 # ── Temp directory ───────────────────────────────────────────────────────────
 
@@ -167,9 +187,55 @@ fi
 
 if [[ "$INSTALL_MODE" == "build" ]]; then
   section "Building from source"
-  info "This takes 5-15 minutes on a Raspberry Pi (longer on Pi Zero)."
 
-  # Install build dependencies
+  # ── Choose build profile ──
+  # release-fast: ~3-4x faster compile, binary ~30% larger (used on Pi Zero/low-RAM).
+  # release:     slower, smaller binary.
+  PROFILE="${PICOGALLERY_PROFILE:-}"
+  if [[ -z "$PROFILE" ]]; then
+    if [[ "$LOW_RAM" == "1" ]]; then
+      PROFILE="release-fast"
+    else
+      PROFILE="release"
+    fi
+  fi
+
+  # ── Choose feature set ──
+  # Only the 'directory' plugin is enabled by default — it's what 95% of users
+  # actually use, and dropping the other plugins roughly halves compile time.
+  # Override with PICOGALLERY_FEATURES to re-enable google-photos / local.
+  FEATURES="${PICOGALLERY_FEATURES:-plugin-directory}"
+
+  # ── Pick job count based on RAM ──
+  # Each rustc job needs ~400-600 MB. Empirical safe rule: 1 job per ~500 MB RAM.
+  CPU_COUNT=$(nproc 2>/dev/null || echo 1)
+  MAX_JOBS_FROM_RAM=$(( MEM_MB / 500 ))
+  [[ "$MAX_JOBS_FROM_RAM" -lt 1 ]] && MAX_JOBS_FROM_RAM=1
+  JOBS=$(( CPU_COUNT < MAX_JOBS_FROM_RAM ? CPU_COUNT : MAX_JOBS_FROM_RAM ))
+
+  if [[ "$LOW_RAM" == "1" ]]; then
+    info "Low-RAM device detected — using profile='${PROFILE}', jobs=${JOBS}, features='${FEATURES}'."
+    info "Expected build time: 15-25 minutes (was 40+ with full release profile)."
+  else
+    info "Profile='${PROFILE}', jobs=${JOBS}, features='${FEATURES}'."
+    info "Expected build time: 5-10 minutes."
+  fi
+
+  # ── Enable swap on very-low-RAM Pis (Pi Zero 2 = 512 MB) ──
+  SWAP_ADDED=0
+  if [[ "$MEM_MB" -lt 600 ]]; then
+    CURRENT_SWAP_MB=$(awk '/SwapTotal/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 0)
+    if [[ "$CURRENT_SWAP_MB" -lt 1024 ]]; then
+      info "Enabling 2 GB temporary swap (current swap: ${CURRENT_SWAP_MB} MB)..."
+      sudo fallocate -l 2G /var/picogallery-swap 2>/dev/null \
+        || sudo dd if=/dev/zero of=/var/picogallery-swap bs=1M count=2048 status=none
+      sudo chmod 600 /var/picogallery-swap
+      sudo mkswap /var/picogallery-swap >/dev/null
+      sudo swapon /var/picogallery-swap && SWAP_ADDED=1
+    fi
+  fi
+
+  # ── Install build dependencies ──
   info "Installing build dependencies..."
   sudo apt-get update -qq
   sudo apt-get install -y --no-install-recommends \
@@ -178,20 +244,17 @@ if [[ "$INSTALL_MODE" == "build" ]]; then
     libdrm-dev \
     libdrm2 \
     ca-certificates \
-    clang \
     pkg-config \
-    cmake \
     curl \
     git \
-    build-essential \
+    gcc \
     rclone
 
-  # Install Rust if needed
+  # ── Install Rust if needed ──
   if command -v rustup &>/dev/null; then
-    info "Rust already installed — updating."
-    rustup update stable --no-self-update
+    info "Rust already installed — skipping update (use 'rustup update' manually if stale)."
   else
-    info "Installing Rust toolchain..."
+    info "Installing Rust toolchain (minimal profile)..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain stable --profile minimal
     # shellcheck source=/dev/null
@@ -199,30 +262,42 @@ if [[ "$INSTALL_MODE" == "build" ]]; then
   fi
   info "Rust $(rustc --version)"
 
-  # Clone or update source
+  # ── Clone source (shallow) ──
   SRC_DIR="${TMPDIR}/picogallery-src"
-  info "Cloning repository..."
-  git clone --depth 1 "${REPO_URL}.git" "$SRC_DIR"
+  info "Cloning repository (shallow, single-branch)..."
+  git clone --depth 1 --single-branch "${REPO_URL}.git" "$SRC_DIR"
 
-  # Build
-  info "Compiling (release mode)..."
+  # ── Build ──
   cd "$SRC_DIR"
+  info "Compiling — this runs in the background; progress suppressed to reduce I/O."
 
-  # Pi Zero / armv6l: single thread to avoid OOM
-  CARGO_JOBS=""
-  if [[ "$ARCH" == "armv6l" ]]; then
-    CARGO_JOBS="--jobs 1"
-    info "Pi Zero detected — building with 1 job to conserve RAM."
+  START_TS=$(date +%s)
+
+  # CARGO_INCREMENTAL=0: release-fast already sets incremental=false, but belt-and-braces.
+  # CARGO_NET_RETRY=10:  tolerate flaky Pi network during crate downloads.
+  CARGO_INCREMENTAL=0 \
+  CARGO_NET_RETRY=10 \
+  CARGO_TERM_PROGRESS_WHEN=never \
+    "$HOME/.cargo/bin/cargo" build \
+      --profile "$PROFILE" \
+      --no-default-features \
+      --features "$FEATURES" \
+      --jobs "$JOBS"
+
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  info "Build finished in $(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s."
+
+  # cargo puts release-fast output under target/release-fast/, release under target/release/
+  BUILT_BINARY="$SRC_DIR/target/${PROFILE}/picogallery"
+  [[ -f "$BUILT_BINARY" ]] || die "Build failed — binary not found at $BUILT_BINARY"
+  info "Binary size: $(du -h "$BUILT_BINARY" | cut -f1)"
+
+  # Tear down temporary swap.
+  if [[ "$SWAP_ADDED" == "1" ]]; then
+    sudo swapoff /var/picogallery-swap || true
+    sudo rm -f /var/picogallery-swap || true
+    info "Temporary swap removed."
   fi
-
-  "$HOME/.cargo/bin/cargo" build \
-    --release \
-    --features "plugin-google-photos,plugin-local,plugin-directory" \
-    $CARGO_JOBS
-
-  BUILT_BINARY="$SRC_DIR/target/release/picogallery"
-  [[ -f "$BUILT_BINARY" ]] || die "Build failed — binary not found."
-  info "Build complete. Binary size: $(du -h "$BUILT_BINARY" | cut -f1)"
 
   # Set up extract dir to match the download path
   EXTRACT_DIR="${TMPDIR}/picogallery-built"
@@ -230,6 +305,9 @@ if [[ "$INSTALL_MODE" == "build" ]]; then
   cp "$BUILT_BINARY" "$EXTRACT_DIR/picogallery"
   cp "$SRC_DIR/config.example.toml" "$EXTRACT_DIR/" 2>/dev/null || true
   cp "$SRC_DIR/picogallery.service" "$EXTRACT_DIR/" 2>/dev/null || true
+  if [[ -d "$SRC_DIR/sample_photos" ]]; then
+    cp -r "$SRC_DIR/sample_photos" "$EXTRACT_DIR/" 2>/dev/null || true
+  fi
 
   VERSION=$(grep '^version' "$SRC_DIR/Cargo.toml" | head -1 | cut -d'"' -f2)
   VERSION="v${VERSION}"
@@ -277,11 +355,16 @@ section "Setting up sample photos"
 PHOTO_DIR="/home/${TARGET_USER}/Pictures/PicoGallery"
 sudo -u "$TARGET_USER" mkdir -p "$PHOTO_DIR"
 
-# If installing from source, we can just copy them.
-# If installing from binary, we might need to download them if they aren't in the archive.
-if [[ -d "sample_photos" ]]; then
-  info "Copying sample photos..."
-  sudo cp -r sample_photos/* "$PHOTO_DIR/"
+SAMPLE_SRC=""
+if [[ -d "${EXTRACT_DIR}/sample_photos" ]]; then
+  SAMPLE_SRC="${EXTRACT_DIR}/sample_photos"
+elif [[ -d "sample_photos" ]]; then
+  SAMPLE_SRC="sample_photos"
+fi
+
+if [[ -n "$SAMPLE_SRC" ]] && [[ -z "$(ls -A "$PHOTO_DIR" 2>/dev/null)" ]]; then
+  info "Copying sample photos from ${SAMPLE_SRC}..."
+  sudo cp -r "$SAMPLE_SRC"/* "$PHOTO_DIR/" 2>/dev/null || true
   sudo chown -R "$TARGET_USER:$TARGET_USER" "$PHOTO_DIR"
 fi
 
