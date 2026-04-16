@@ -86,6 +86,14 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 # ── Resolve version & download strategy ──────────────────────────────────────
 
+# Default to download unless user forces source build, or a prior step
+# (eg. low-RAM detection) already switched us to build mode.
+if [[ "${PICOGALLERY_BUILD:-0}" == "1" ]]; then
+  INSTALL_MODE="build"
+else
+  INSTALL_MODE="${INSTALL_MODE:-download}"
+fi
+
 section "Resolving version"
 
 if [[ "$INSTALL_MODE" == "download" ]]; then
