@@ -259,13 +259,19 @@ impl PhotoPlugin for DirectoryPlugin {
     fn version(&self)      -> &str { "0.1.0"           }
 
     async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
-        // Resolve and validate the root path.
+        // Resolve and validate the root path. Expand a leading `~` to $HOME
+        // so that configs written on one user's system still work for another.
         let path_str = self.cfg.require_str("path")
             .context("directory plugin requires a 'path' config key")?;
 
-        let canonical = PathBuf::from(path_str)
+        let expanded = expand_home(path_str);
+
+        let canonical = expanded
             .canonicalize()
-            .with_context(|| format!("directory plugin: cannot resolve path '{path_str}'"))?;
+            .with_context(|| format!(
+                "directory plugin: cannot resolve path '{}'",
+                expanded.display()
+            ))?;
 
         if !canonical.is_dir() {
             return Err(anyhow::anyhow!(
@@ -364,6 +370,23 @@ impl PhotoPlugin for DirectoryPlugin {
         debug!("Directory plugin: read {} bytes from {}", bytes.len(), canonical.display());
         Ok(bytes)
     }
+}
+
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Other `~username` forms are left untouched (we never spawn a `getpwnam`).
+/// If $HOME cannot be resolved, the input is returned as-is.
+fn expand_home(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
 }
 
 // ── Image helpers ─────────────────────────────────────────────────────────────

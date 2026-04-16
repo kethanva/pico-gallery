@@ -979,6 +979,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs",
  "log",
  "picogallery-core",
  "serde",
@@ -1004,6 +1005,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs",
  "log",
  "picogallery-core",
  "tokio",
