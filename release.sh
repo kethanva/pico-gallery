@@ -1,111 +1,89 @@
 #!/usr/bin/env bash
-# release.sh — stage, commit, push, and tag a patch release (0.0.Z only)
-#
+# ── release.sh ────────────────────────────────────────────────────────────────
+# Automates the entire release process: version bumping, staging, tagging, and pushing.
+# 
 # Usage:
-#   ./release.sh            # auto-increments patch, prompts for message
-#   ./release.sh "my msg"   # auto-increments patch, uses given message
+#   ./release.sh                  # Increments patch version, uses default message
+#   ./release.sh "message"        # Increments patch version, uses custom message
+#   ./release.sh 1.2.3 "message"  # Sets specific version and message
+# ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
-green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
+green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
 die()   { red "ERROR: $*" >&2; exit 1; }
 
-# ── Require clean working tree (except for tracked modifications) ─────────────
+# ── Environment Checks ───────────────────────────────────────────────────────
+[[ -f Cargo.toml ]] || die "Cargo.toml not found. Run this from the project root."
+git rev-parse --is-inside-work-tree &>/dev/null || die "Not a git repository."
 
-if ! git rev-parse --is-inside-work-tree &>/dev/null; then
-  die "Not inside a git repository."
-fi
+# ── Sync with Remote ─────────────────────────────────────────────────────────
+blue "Syncing with remote..."
+git fetch --tags origin || blue "Warning: Could not fetch from origin. Continuing locally..."
 
-# ── Auto-increment patch version (0.0.Z) ─────────────────────────────────────
-# Source of truth is the latest v0.0.Z git tag, not Cargo.toml,
-# so the version always advances correctly regardless of what Cargo.toml says.
-
-LAST_TAG=$(git tag | grep -E '^v0\.0\.[0-9]+$' | sort -t. -k3 -n | tail -1)
-if [[ -z "$LAST_TAG" ]]; then
-  NEXT_PATCH=1
+# ── Determine Version ────────────────────────────────────────────────────────
+# Check if first arg is a version number (X.Y.Z)
+if [[ $# -gt 0 && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    VERSION="$1"
+    shift
 else
-  CURRENT_PATCH="${LAST_TAG##*.}"
-  NEXT_PATCH=$(( CURRENT_PATCH + 1 ))
+    # Find the latest tag that looks like a version
+    LAST_TAG=$(git tag -l "v*" --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+    
+    if [[ -n "$LAST_TAG" ]]; then
+        # Increment patch version
+        IFS='.' read -r major minor patch <<< "${LAST_TAG#v}"
+        VERSION="$major.$minor.$((patch + 1))"
+        blue "Auto-incrementing from last tag $LAST_TAG -> $VERSION"
+    else
+        # Fallback to current version in Cargo.toml
+        VERSION=$(grep -m 1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+        blue "No prior tags found. Using version from Cargo.toml: $VERSION"
+    fi
 fi
 
-VERSION="0.0.${NEXT_PATCH}"
-TAG="v${VERSION}"
+TAG="v$VERSION"
 
-blue "Last tag     : ${LAST_TAG:-none}"
-blue "Next version : $VERSION"
-
-# Abort if tag already exists
-if git tag | grep -qx "$TAG"; then
-  die "Tag $TAG already exists. Something is out of sync."
-fi
-
-# ── Resolve commit message ────────────────────────────────────────────────────
-
-MSG="${1:-}"
-if [[ -z "$MSG" ]]; then
-  read -rp "Commit message (default: 'chore: release $TAG'): " MSG
-  MSG="${MSG:-chore: release $TAG}"
-fi
-
-# ── Bump version in Cargo.toml / Cargo.lock ──────────────────────────────────
-
-blue "Bumping version to $VERSION in Cargo.toml..."
-sed -i.bak "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+# ── Bump Version in Cargo.toml ───────────────────────────────────────────────
+blue "Updating Cargo.toml to version $VERSION..."
+# Portable sed handles both macOS (BSD) and Linux (GNU)
+sed -i.bak "/^\[package\]/,/^version/ s/^version[[:space:]]*=[[:space:]]*\".*\"/version = \"$VERSION\"/" Cargo.toml
 rm -f Cargo.toml.bak
 
-# Regenerate Cargo.lock without building
-cargo generate-lockfile 2>/dev/null || true
-
-# ── Stage important files ─────────────────────────────────────────────────────
-
-blue "Staging files..."
-
-STAGE=(
-  Cargo.toml
-  Cargo.lock
-  build.rs
-  Cross.toml
-  config.example.toml
-  install.sh
-  picogallery.service
-  README.md
-  src/
-  plugins/
-)
-
-for f in "${STAGE[@]}"; do
-  if [[ -e "$f" ]]; then
-    git add "$f"
-  fi
-done
-
-# Show what's staged
-STAGED=$(git diff --cached --name-only)
-if [[ -z "$STAGED" ]]; then
-  die "Nothing staged to commit."
+# Update Cargo.lock if possible
+if command -v cargo &>/dev/null; then
+    blue "Updating Cargo.lock..."
+    cargo generate-lockfile &>/dev/null || true
 fi
-blue "Staged files:"
-echo "$STAGED" | sed 's/^/  /'
 
-# ── Commit ────────────────────────────────────────────────────────────────────
+# ── Commit and Tag ────────────────────────────────────────────────────────────
+blue "Staging changes..."
+git add .
 
-blue "Committing: $MSG"
-git commit -m "$MSG"
+MSG="${*:-chore: release $TAG}"
 
-# ── Push branch ───────────────────────────────────────────────────────────────
+# Only commit if there are changes (including the version bump)
+if git diff --cached --quiet; then
+    blue "No changes detected. Is the code already at $VERSION?"
+else
+    blue "Committing: $MSG"
+    git commit -m "$MSG"
+fi
 
+# Check for existing tag
+if git tag -l | grep -qx "$TAG"; then
+    blue "Tag $TAG already exists locally. Skipping tag creation."
+else
+    blue "Creating tag $TAG..."
+    git tag -a "$TAG" -m "$MSG"
+fi
+
+# ── Push to GitHub ────────────────────────────────────────────────────────────
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-blue "Pushing branch '$BRANCH' to origin..."
-git push origin "$BRANCH"
+blue "Pushing $BRANCH and tags to origin..."
+git push origin "$BRANCH" --follow-tags
 
-# ── Create and push tag ───────────────────────────────────────────────────────
-
-blue "Creating tag $TAG..."
-git tag "$TAG"
-git push origin "$TAG"
-
-green "Done — $TAG released on branch $BRANCH."
+green "✅ Successfully released $TAG to GitHub!"
