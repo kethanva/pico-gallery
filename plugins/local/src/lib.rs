@@ -55,6 +55,20 @@ impl LocalPlugin {
     }
 }
 
+/// Expand a leading `~` or `~/` to $HOME. Other `~username` forms pass through
+/// unchanged so we avoid spawning a `getpwnam`.
+fn expand_home(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
 /// Extension-based pre-filter (fast). Magic-byte check happens at read time.
 fn is_image(p: &Path) -> bool {
     matches!(
@@ -88,9 +102,10 @@ impl PhotoPlugin for LocalPlugin {
             self.paths = arr.iter()
                 .filter_map(|v| v.as_str())
                 .filter_map(|s| {
-                    // Canonicalize at startup to catch non-existent or suspicious paths early.
-                    let p = PathBuf::from(s);
-                    match p.canonicalize() {
+                    // Expand `~` to $HOME before canonicalize so user-agnostic
+                    // configs (e.g. "~/Pictures") work on any host.
+                    let expanded = expand_home(s);
+                    match expanded.canonicalize() {
                         Ok(c) => Some(c),
                         Err(e) => {
                             warn!("Local plugin: skipping path '{}': {}", s, e);

@@ -9,5 +9,6 @@ license     = "MIT"
 picogallery-core = { workspace = true }
 anyhow           = { workspace = true }
 async-trait      = { workspace = true }
+dirs             = { workspace = true }
 log              = { workspace = true }
 tokio            = { workspace = true }
