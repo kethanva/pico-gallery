@@ -494,6 +494,10 @@ Type=simple
 User=${TARGET_USER}
 Group=video
 Environment=RUST_LOG=info
+# SDL2 / mesa / dbus need XDG_RUNTIME_DIR. systemd-logind only creates
+# /run/user/%U for interactive sessions; point at it anyway and let the
+# binary create a /tmp fallback if the dir doesn't exist.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/picogallery
 Restart=on-failure
