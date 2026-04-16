@@ -86,4 +86,51 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 blue "Pushing $BRANCH and tags to origin..."
 git push origin "$BRANCH" --follow-tags
 
-green "✅ Successfully released $TAG to GitHub!"
+# ── Resolve repo slug (owner/name) from origin URL ────────────────────────────
+ORIGIN_URL=$(git remote get-url origin)
+REPO_SLUG=$(echo "$ORIGIN_URL" | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$|\1|')
+
+# ── Wait for the CI workflow triggered by this tag ────────────────────────────
+if ! command -v gh &>/dev/null; then
+    blue "gh CLI not installed — skipping release verification."
+    blue "Watch progress at: https://github.com/${REPO_SLUG}/actions"
+    green "✅ Tag $TAG pushed. Release will be created by CI."
+    exit 0
+fi
+
+blue "Locating CI workflow run for $TAG..."
+RUN_ID=""
+for _ in 1 2 3 4 5; do
+    sleep 3
+    RUN_ID=$(gh run list \
+        --repo "$REPO_SLUG" \
+        --event push \
+        --limit 20 \
+        --json databaseId,headBranch,status \
+        --jq ".[] | select(.headBranch == \"$TAG\") | .databaseId" 2>/dev/null | head -1)
+    [[ -n "$RUN_ID" ]] && break
+done
+
+if [[ -z "$RUN_ID" ]]; then
+    blue "Could not find workflow run for $TAG. Check https://github.com/${REPO_SLUG}/actions"
+    green "✅ Tag $TAG pushed."
+    exit 0
+fi
+
+blue "Watching run $RUN_ID (this takes 5-10 min for ARM cross-builds)..."
+if ! gh run watch "$RUN_ID" --repo "$REPO_SLUG" --exit-status; then
+    die "CI workflow for $TAG failed. See https://github.com/${REPO_SLUG}/actions/runs/${RUN_ID}"
+fi
+
+# ── Verify the release has assets ─────────────────────────────────────────────
+blue "Verifying release assets..."
+ASSET_COUNT=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+if [[ "$ASSET_COUNT" -gt 0 ]]; then
+    green "✅ Release $TAG is live on GitHub with $ASSET_COUNT asset(s)."
+else
+    die "CI finished but release $TAG has no assets. Check https://github.com/${REPO_SLUG}/releases"
+fi
+
+echo
+green "Install on Pi with:"
+echo "  curl -sSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh | bash"
