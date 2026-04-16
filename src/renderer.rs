@@ -35,30 +35,106 @@ mod drm_probe {
 
     /// Scan /dev/dri/card0..3 and return (device_path, width, height) for the
     /// first card that has a connected display. Returns None if nothing found.
+    ///
+    /// Emits verbose diagnostics at info-level so users can see exactly why a
+    /// probe failed: missing /dev/dri, permission denied, no connectors, no
+    /// connected state, etc. Accepts connectors whose state is `Unknown` but
+    /// which advertise modes — some Pi DRM drivers don't populate the
+    /// `Connected` state reliably.
     pub fn probe() -> Option<(String, u32, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. List /dev/dri so we know whether the kernel even exposes DRM.
+        match std::fs::read_dir("/dev/dri") {
+            Ok(entries) => {
+                let names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        let mode = e
+                            .metadata()
+                            .map(|m| m.permissions().mode() & 0o777)
+                            .unwrap_or(0);
+                        format!("{} (mode {:o})", name, mode)
+                    })
+                    .collect();
+                info!("DRM probe: /dev/dri contains: [{}]", names.join(", "));
+            }
+            Err(e) => {
+                warn!("DRM probe: cannot read /dev/dri — {} (is the kernel module loaded?)", e);
+                return None;
+            }
+        }
+
         for n in 0..4 {
             let path = format!("/dev/dri/card{}", n);
+
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+
+            // Read-only is enough for enumeration; requires only `video` group.
             let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
                 Ok(f) => f,
                 Err(e) => {
-                    // card may not exist or may not be accessible — keep trying
-                    info!("DRM probe: skipping {} ({})", path, e);
+                    warn!(
+                        "DRM probe: cannot open {} — {} (is the current user in the `video` group?)",
+                        path, e
+                    );
                     continue;
                 }
             };
+
             let card = DrmCard(file);
-            let res  = match card.resource_handles() { Ok(r) => r, Err(_) => continue };
+            let res = match card.resource_handles() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("DRM probe: {} no resource handles — {}", path, e);
+                    continue;
+                }
+            };
+            info!(
+                "DRM probe: {} has {} connector(s), {} crtc(s)",
+                path,
+                res.connectors().len(),
+                res.crtcs().len()
+            );
+
             for &conn_h in res.connectors() {
-                let info = match card.get_connector(conn_h, false) { Ok(i) => i, Err(_) => continue };
-                if info.state() != connector::State::Connected { continue; }
+                let info = match card.get_connector(conn_h, false) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        info!("DRM probe:   connector {:?} err: {}", conn_h, e);
+                        continue;
+                    }
+                };
+                let state = info.state();
+                let iface = info.interface();
+                let n_modes = info.modes().len();
+                info!(
+                    "DRM probe:   {:?} state={:?} modes={}",
+                    iface, state, n_modes
+                );
+
+                // Accept Connected, or Unknown-with-modes (some Pi drivers
+                // never set Connected even when HDMI is live).
+                let usable = matches!(state, connector::State::Connected)
+                    || (matches!(state, connector::State::Unknown) && n_modes > 0);
+                if !usable {
+                    continue;
+                }
+
                 if let Some(mode) = info.modes().first() {
                     let (w, h) = (mode.size().0 as u32, mode.size().1 as u32);
-                    info!("DRM probe: {} — {:?} connected, native {}×{}", path, info.interface(), w, h);
+                    info!(
+                        "DRM probe: SELECTED {} — {:?} state={:?} native {}×{}",
+                        path, iface, state, w, h
+                    );
                     return Some((path, w, h));
                 }
             }
         }
-        warn!("DRM probe: no connected display found in /dev/dri/card0..3");
+        warn!("DRM probe: no usable display found in /dev/dri/card0..3 — check HDMI cable, monitor power, and that the current user is in the `video` group");
         None
     }
 }
@@ -122,7 +198,51 @@ impl Renderer {
         }
 
         let sdl_ctx = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {}", e))?;
-        let video   = sdl_ctx.video().map_err(|e| anyhow::anyhow!("SDL video: {}", e))?;
+
+        // Try to bring up the video subsystem. If kmsdrm was requested and fails,
+        // log every SDL video driver that *is* available and retry without the
+        // SDL_VIDEODRIVER override so SDL can pick its own default (fbdev/etc).
+        let video = match sdl_ctx.video() {
+            Ok(v) => v,
+            Err(e) => {
+                let requested = std::env::var("SDL_VIDEODRIVER").ok();
+                let num = unsafe { sdl2::sys::SDL_GetNumVideoDrivers() };
+                let drivers: Vec<String> = (0..num)
+                    .filter_map(|i| unsafe {
+                        let ptr = sdl2::sys::SDL_GetVideoDriver(i);
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                        }
+                    })
+                    .collect();
+                warn!(
+                    "SDL video init failed with SDL_VIDEODRIVER={:?}: {}",
+                    requested, e
+                );
+                warn!("SDL was compiled with these video drivers: [{}]", drivers.join(", "));
+
+                // Retry only if kmsdrm was the problem and SDL has *some* other driver.
+                #[cfg(target_os = "linux")]
+                {
+                    if requested.as_deref() == Some("kmsdrm") && drivers.len() > 1 {
+                        warn!("Retrying SDL video init without SDL_VIDEODRIVER override...");
+                        std::env::remove_var("SDL_VIDEODRIVER");
+                        std::env::remove_var("SDL_VIDEO_KMSDRM_DEVICE");
+                        sdl_ctx
+                            .video()
+                            .map_err(|e2| anyhow::anyhow!("SDL video (fallback): {}", e2))?
+                    } else {
+                        return Err(anyhow::anyhow!("SDL video: {}", e));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(anyhow::anyhow!("SDL video: {}", e));
+                }
+            }
+        };
 
         // ── Resolution: config > DRM probe > SDL2 desktop query ───────────────
         let (w, h) = if config.width > 0 && config.height > 0 {
