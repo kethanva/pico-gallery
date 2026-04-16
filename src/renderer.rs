@@ -38,7 +38,14 @@ mod drm_probe {
     pub fn probe() -> Option<(String, u32, u32)> {
         for n in 0..4 {
             let path = format!("/dev/dri/card{}", n);
-            let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).ok()?;
+            let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    // card may not exist or may not be accessible — keep trying
+                    info!("DRM probe: skipping {} ({})", path, e);
+                    continue;
+                }
+            };
             let card = DrmCard(file);
             let res  = match card.resource_handles() { Ok(r) => r, Err(_) => continue };
             for &conn_h in res.connectors() {
@@ -85,19 +92,29 @@ impl Renderer {
         // ── KMS/DRM backend selection (Linux only) ────────────────────────────
         #[cfg(target_os = "linux")]
         {
-            // Only force kmsdrm if:
-            // 1. User hasn't overridden via environment
-            // 2. We are NOT in a graphical session (X11 or Wayland)
-            // 3. We actually found a DRM device to use
-            let has_x11 = std::env::var("DISPLAY").is_ok();
+            let env_driver = std::env::var("SDL_VIDEODRIVER").ok();
+            let has_x11    = std::env::var("DISPLAY").is_ok();
             let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-            let env_driver = std::env::var("SDL_VIDEODRIVER");
 
-            if env_driver.is_err() && !has_x11 && !has_wayland {
-                if let Some(ref path) = probed_path {
+            // Use kmsdrm if:
+            //   a) the caller/service already requested it explicitly, OR
+            //   b) no graphical session is present and no driver override was given
+            let want_kmsdrm = match env_driver.as_deref() {
+                Some("kmsdrm") => true,
+                None if !has_x11 && !has_wayland => true,
+                _ => false,
+            };
+
+            if want_kmsdrm {
+                if env_driver.is_none() {
                     info!("No graphical session detected; forcing SDL_VIDEODRIVER=kmsdrm");
                     std::env::set_var("SDL_VIDEODRIVER", "kmsdrm");
-                    if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
+                }
+                // Always apply the probed device so SDL picks the right card
+                // (Pi 4 has the display on card1, not card0 which SDL defaults to).
+                if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
+                    if let Some(ref path) = probed_path {
+                        info!("Setting SDL_VIDEO_KMSDRM_DEVICE={}", path);
                         std::env::set_var("SDL_VIDEO_KMSDRM_DEVICE", path);
                     }
                 }
