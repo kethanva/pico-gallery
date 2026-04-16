@@ -6,9 +6,17 @@
 #   ./release.sh                  # Increments patch version, uses default message
 #   ./release.sh "message"        # Increments patch version, uses custom message
 #   ./release.sh 1.2.3 "message"  # Sets specific version and message
+#   ./release.sh --no-wait ...    # Don't wait for CI; exit once tag is pushed
 # ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
+
+# ── Parse Flags ──────────────────────────────────────────────────────────────
+WAIT_FOR_CI=1
+if [[ "${1:-}" == "--no-wait" || "${1:-}" == "-n" ]]; then
+    WAIT_FOR_CI=0
+    shift
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
@@ -91,6 +99,14 @@ ORIGIN_URL=$(git remote get-url origin)
 REPO_SLUG=$(echo "$ORIGIN_URL" | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$|\1|')
 
 # ── Wait for the CI workflow triggered by this tag ────────────────────────────
+if [[ "$WAIT_FOR_CI" == "0" ]]; then
+    green "✅ Tag $TAG pushed. Skipping CI wait (--no-wait)."
+    echo "Watch progress at: https://github.com/${REPO_SLUG}/actions"
+    echo "Install URL (once CI completes):"
+    echo "  curl -sSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh | bash"
+    exit 0
+fi
+
 if ! command -v gh &>/dev/null; then
     blue "gh CLI not installed — skipping release verification."
     blue "Watch progress at: https://github.com/${REPO_SLUG}/actions"
