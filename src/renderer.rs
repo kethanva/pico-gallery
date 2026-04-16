@@ -296,12 +296,21 @@ impl Renderer {
         };
         info!("SDL video driver in use: {}", active_driver);
         if matches!(active_driver.as_str(), "dummy" | "offscreen") {
+            let have_dri = std::path::Path::new("/dev/dri").exists();
+            let hint = if !have_dri {
+                "/dev/dri does not exist — the kernel DRM module isn't loaded. \
+                 On Raspberry Pi (especially DietPi/minimal images) add this to \
+                 /boot/firmware/config.txt (or /boot/config.txt on older releases) \
+                 and reboot:\n\
+                 \n    dtoverlay=vc4-kms-v3d\n    max_framebuffers=2\n"
+            } else {
+                "/dev/dri exists but SDL couldn't open a device. Run `ls -l /dev/dri` \
+                 and confirm the current user is in the `video` group, that HDMI is \
+                 connected, and that libgbm1 + libegl1 are installed."
+            };
             return Err(anyhow::anyhow!(
-                "SDL fell back to the '{}' driver — no real display backend is available. \
-                 Check that /dev/dri/cardN is accessible (run `ls -l /dev/dri` and confirm \
-                 the current user is in the `video` group), that HDMI is connected, and \
-                 that libgbm1 + libegl1 are installed.",
-                active_driver
+                "SDL fell back to the '{}' driver — no real display backend is available.\n{}",
+                active_driver, hint
             ));
         }
 
