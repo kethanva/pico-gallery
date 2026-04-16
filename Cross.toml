@@ -10,13 +10,20 @@
 # workflow `env:` block; cross auto-forwards any CARGO_* / PKG_CONFIG_* vars
 # to the container, so no [target.*.env] section is needed here.
 
+# NOTE: image tag `:main` tracks the cross-rs main branch (Ubuntu 22.04 base),
+# which ships libsdl2-dev 2.0.20+. Older `:0.2.5` images use Ubuntu 20.04 with
+# SDL2 2.0.10 — that version lacks the `SDL_Metal_DestroyView` stub on Linux,
+# causing a linker failure from sdl2 crate's Drop impl for WindowContext.
+
 [target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config",
 ]
 
 [target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main"
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config",
