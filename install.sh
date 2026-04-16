@@ -244,6 +244,8 @@ if [[ "$INSTALL_MODE" == "build" ]]; then
     libdrm-dev \
     libdrm2 \
     libgbm-dev \
+    libegl-dev \
+    libegl1 \
     ca-certificates \
     pkg-config \
     curl \
@@ -324,6 +326,7 @@ sudo apt-get install -y --no-install-recommends \
   libsdl2-2.0-0 \
   libdrm2 \
   libgbm1 \
+  libegl1 \
   ca-certificates \
   rclone
 
@@ -508,7 +511,6 @@ Wants=network-online.target
 Type=simple
 User=${TARGET_USER}
 Group=video
-Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/picogallery
