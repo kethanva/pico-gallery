@@ -151,6 +151,44 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn init(config: DisplayConfig) -> Result<Self> {
+        // ── XDG_RUNTIME_DIR (Linux only) ──────────────────────────────────────
+        // SDL2 / mesa / dbus all complain when this is unset under systemd or
+        // when running over SSH. Point it at /run/user/$UID if that exists
+        // (systemd-logind creates it for interactive sessions) or fall back
+        // to a private /tmp/runtime-$UID dir with 0700 perms.
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+                let uid: u32 = std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|s| {
+                        s.lines()
+                            .find(|l| l.starts_with("Uid:"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(1000);
+                let run_user = format!("/run/user/{}", uid);
+                let chosen = if std::path::Path::new(&run_user).is_dir() {
+                    run_user
+                } else {
+                    let fallback = format!("/tmp/runtime-{}", uid);
+                    if let Err(e) = std::fs::create_dir_all(&fallback) {
+                        warn!("Could not create {}: {}", fallback, e);
+                    } else {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &fallback,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    fallback
+                };
+                info!("Setting XDG_RUNTIME_DIR={}", chosen);
+                std::env::set_var("XDG_RUNTIME_DIR", chosen);
+            }
+        }
+
         // ── DRM display probe (Linux only) ────────────────────────────────────
         // Finds the correct /dev/dri/cardN (Pi 4/5 has display on card1, not card0)
         // and the native resolution. On macOS this block is compiled away entirely.
@@ -243,6 +281,29 @@ impl Renderer {
                 }
             }
         };
+
+        // Log the driver SDL actually chose. If it fell back to `dummy` or
+        // `offscreen`, the window will create successfully but nothing will
+        // ever render — bail out with a clear message instead of silently
+        // running a no-op slideshow.
+        let active_driver = unsafe {
+            let ptr = sdl2::sys::SDL_GetCurrentVideoDriver();
+            if ptr.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        };
+        info!("SDL video driver in use: {}", active_driver);
+        if matches!(active_driver.as_str(), "dummy" | "offscreen") {
+            return Err(anyhow::anyhow!(
+                "SDL fell back to the '{}' driver — no real display backend is available. \
+                 Check that /dev/dri/cardN is accessible (run `ls -l /dev/dri` and confirm \
+                 the current user is in the `video` group), that HDMI is connected, and \
+                 that libgbm1 + libegl1 are installed.",
+                active_driver
+            ));
+        }
 
         // ── Resolution: config > DRM probe > SDL2 desktop query ───────────────
         let (w, h) = if config.width > 0 && config.height > 0 {
