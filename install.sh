@@ -515,9 +515,47 @@ SERVICE
 sudo systemctl daemon-reload
 info "Service installed: picogallery.service"
 
-# ── GPU memory ───────────────────────────────────────────────────────────────
+# ── KMS/DRM & GPU memory ─────────────────────────────────────────────────────
+#
+# SDL2's kmsdrm video backend needs /dev/dri/cardN. The kernel only creates
+# those nodes when vc4-kms-v3d is enabled via dtoverlay. Raspberry Pi OS Lite
+# ships with this on by default, but *DietPi* and other minimal distros strip
+# it, which is why picogallery falls back to the 'offscreen' driver and nothing
+# ever renders.
+#
+# With vc4-kms-v3d the firmware ignores gpu_mem= in favour of CMA, but we keep
+# the gpu_mem line for old fkms/firmware setups that still honour it.
 
-section "GPU memory optimisation"
+section "Configuring KMS/DRM & GPU memory"
+
+REBOOT_REQUIRED=0
+
+ensure_dtoverlay() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 0
+
+  # Already active? Nothing to do.
+  if grep -qE '^[[:space:]]*dtoverlay=vc4-kms-v3d([[:space:]]|,|$)' "$cfg"; then
+    info "vc4-kms-v3d already enabled in $cfg"
+    return 0
+  fi
+
+  # Older firmware may have the fake-KMS variant — comment it out so the real
+  # KMS overlay wins.
+  if grep -qE '^[[:space:]]*dtoverlay=vc4-fkms-v3d' "$cfg"; then
+    sudo sed -i 's|^\([[:space:]]*\)dtoverlay=vc4-fkms-v3d|\1#dtoverlay=vc4-fkms-v3d|' "$cfg"
+    info "Disabled legacy vc4-fkms-v3d in $cfg"
+  fi
+
+  {
+    echo ""
+    echo "# PicoGallery: enable KMS DRM so /dev/dri/cardN exists (SDL kmsdrm)"
+    echo "dtoverlay=vc4-kms-v3d"
+    echo "max_framebuffers=2"
+  } | sudo tee -a "$cfg" > /dev/null
+  info "Enabled vc4-kms-v3d in $cfg  (REBOOT REQUIRED)"
+  REBOOT_REQUIRED=1
+}
 
 set_gpu_mem() {
   local cfg="$1"
@@ -529,8 +567,18 @@ set_gpu_mem() {
   fi
 }
 
-set_gpu_mem "/boot/config.txt"
-set_gpu_mem "/boot/firmware/config.txt"
+for cfg in /boot/firmware/config.txt /boot/config.txt; do
+  ensure_dtoverlay "$cfg"
+  set_gpu_mem     "$cfg"
+done
+
+# Post-flight: does /dev/dri exist NOW? If not, a reboot is needed for the
+# overlay to take effect.
+if [[ ! -d /dev/dri ]] || ! ls /dev/dri/card* &>/dev/null; then
+  warn "/dev/dri is empty right now — the vc4 DRM module isn't loaded yet."
+  warn "This is expected on a fresh DietPi install; a reboot will create /dev/dri/cardN."
+  REBOOT_REQUIRED=1
+fi
 
 # ── Enable & start ───────────────────────────────────────────────────────────
 
@@ -569,3 +617,11 @@ echo ""
 echo "  5. Reboot to apply GPU memory & group changes:"
 echo "     sudo reboot"
 echo ""
+
+if [[ "${REBOOT_REQUIRED:-0}" == "1" ]]; then
+  echo -e "${YELLOW}${BOLD}⚠  REBOOT REQUIRED${RESET}"
+  echo -e "${YELLOW}   The kernel DRM device /dev/dri/cardN isn't present yet.${RESET}"
+  echo -e "${YELLOW}   Run ${BOLD}sudo reboot${RESET}${YELLOW} before starting picogallery,${RESET}"
+  echo -e "${YELLOW}   otherwise SDL will fall back to the 'offscreen' driver and fail.${RESET}"
+  echo ""
+fi
