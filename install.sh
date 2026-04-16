@@ -243,6 +243,7 @@ if [[ "$INSTALL_MODE" == "build" ]]; then
     libsdl2-2.0-0 \
     libdrm-dev \
     libdrm2 \
+    libgbm-dev \
     ca-certificates \
     pkg-config \
     curl \
@@ -322,6 +323,7 @@ sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
   libsdl2-2.0-0 \
   libdrm2 \
+  libgbm1 \
   ca-certificates \
   rclone
 

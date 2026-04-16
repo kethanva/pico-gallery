@@ -59,8 +59,11 @@ After installation:
 # 1. Edit your photo source
 nano ~/.config/picogallery/config.toml
 
-# 2. Test interactively
+# 2. Test interactively (Linux console)
 SDL_VIDEODRIVER=kmsdrm picogallery
+
+# 2b. Test interactively (macOS / Linux Desktop)
+picogallery
 
 # 3. Start the service
 sudo systemctl start picogallery

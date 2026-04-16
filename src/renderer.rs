@@ -68,31 +68,41 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn init(config: DisplayConfig) -> Result<Self> {
-        // ── KMS/DRM backend (Linux only) ──────────────────────────────────────
-        #[cfg(target_os = "linux")]
-        {
-            // Only force kmsdrm if the user hasn't overridden (e.g. SDL_VIDEODRIVER=x11 for dev).
-            if std::env::var("SDL_VIDEODRIVER").is_err() {
-                std::env::set_var("SDL_VIDEODRIVER", "kmsdrm");
-            }
-        }
-
         // ── DRM display probe (Linux only) ────────────────────────────────────
         // Finds the correct /dev/dri/cardN (Pi 4/5 has display on card1, not card0)
         // and the native resolution. On macOS this block is compiled away entirely.
         #[cfg(target_os = "linux")]
-        let (probed_w, probed_h) = {
+        let (probed_w, probed_h, probed_path) = {
             if let Some((dev_path, w, h)) = drm_probe::probe() {
-                if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
-                    std::env::set_var("SDL_VIDEO_KMSDRM_DEVICE", &dev_path);
-                }
-                (w, h)
+                (w, h, Some(dev_path))
             } else {
-                (0u32, 0u32)
+                (0u32, 0u32, None)
             }
         };
         #[cfg(not(target_os = "linux"))]
-        let (probed_w, probed_h) = (0u32, 0u32);
+        let (probed_w, probed_h, _probed_path) = (0u32, 0u32, None::<String>);
+
+        // ── KMS/DRM backend selection (Linux only) ────────────────────────────
+        #[cfg(target_os = "linux")]
+        {
+            // Only force kmsdrm if:
+            // 1. User hasn't overridden via environment
+            // 2. We are NOT in a graphical session (X11 or Wayland)
+            // 3. We actually found a DRM device to use
+            let has_x11 = std::env::var("DISPLAY").is_ok();
+            let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+            let env_driver = std::env::var("SDL_VIDEODRIVER");
+
+            if env_driver.is_err() && !has_x11 && !has_wayland {
+                if let Some(ref path) = probed_path {
+                    info!("No graphical session detected; forcing SDL_VIDEODRIVER=kmsdrm");
+                    std::env::set_var("SDL_VIDEODRIVER", "kmsdrm");
+                    if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
+                        std::env::set_var("SDL_VIDEO_KMSDRM_DEVICE", path);
+                    }
+                }
+            }
+        }
 
         let sdl_ctx = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {}", e))?;
         let video   = sdl_ctx.video().map_err(|e| anyhow::anyhow!("SDL video: {}", e))?;
