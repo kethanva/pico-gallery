@@ -24,7 +24,7 @@ picogallery-core    = { path = "core" }
 
 [package]
 name        = "picogallery"
-version     = "0.1.0"
+version     = "0.4.0"
 edition     = "2021"
 description = "Lightweight plugin-based photo slideshow for Raspberry Pi — no desktop environment required"
 license     = "MIT"
