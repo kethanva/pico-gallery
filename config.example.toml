@@ -41,9 +41,9 @@ prefetch_count = 3     # photos pre-fetched while current photo is on screen
 # ─────────────────────────────────────────────────────────────────────────────
 [[plugins]]
 name    = "directory"
-enabled = false
+enabled = true                     # ← enabled by default
 
-path      = "/home/admin/Pictures/PicoGallery"  # root directory (required)
+path      = "/home/pi/Pictures/PicoGallery"  # root directory (required)
 order     = "shuffle"              # "shuffle" | "alphabetical" | "date_modified"
 recursive = true                   # include sub-directories
 
@@ -56,12 +56,14 @@ recursive = true                   # include sub-directories
 # ─────────────────────────────────────────────────────────────────────────────
 # [PLUGIN] local
 # Like "directory" but accepts multiple root paths.
+# (Requires the binary to be built with `plugin-local` — the default Raspberry Pi
+#  install only compiles `plugin-directory` to keep build time low.)
 # ─────────────────────────────────────────────────────────────────────────────
 [[plugins]]
 name    = "local"
-enabled = true                     # ← enabled by default
+enabled = false
 
-paths     = ["/home/admin/Pictures/PicoGallery"]
+paths     = ["/home/pi/Pictures/PicoGallery"]
 recursive = true
 
 # ─────────────────────────────────────────────────────────────────────────────
