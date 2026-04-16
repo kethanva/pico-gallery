@@ -88,15 +88,6 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 section "Resolving version"
 
-INSTALL_MODE="download"   # "download" or "build"
-VERSION=""
-EXTRACT_DIR=""
-
-if [[ "${PICOGALLERY_BUILD:-}" == "1" ]]; then
-  INSTALL_MODE="build"
-  info "PICOGALLERY_BUILD=1 — will build from source."
-fi
-
 if [[ "$INSTALL_MODE" == "download" ]]; then
   # Determine which version to download
   if [[ -n "${PICOGALLERY_VERSION:-}" ]]; then
@@ -116,21 +107,7 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
     fi
 
     if [[ -z "$VERSION" ]]; then
-      warn "No 'Latest Release' found on GitHub yet (HTTP $HTTP_CODE)."
-
-      # Try to find the latest tag instead
-      TAGS_JSON=$(curl -sSL \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${REPO}/tags?per_page=1" 2>/dev/null) || true
-      TAG_NAME=$(echo "$TAGS_JSON" | grep '"name"' | head -1 | cut -d'"' -f4)
-
-      if [[ -n "$TAG_NAME" ]]; then
-        info "Found tag: $TAG_NAME — will attempt to download from this tag."
-        VERSION="$TAG_NAME"
-      else
-        warn "No tags found either. Falling back to building from source..."
-        INSTALL_MODE="build"
-      fi
+      die "No official 'Latest Release' found on GitHub (HTTP $HTTP_CODE). Please check $REPO_URL/releases"
     else
       info "Latest release: $VERSION"
     fi
@@ -172,21 +149,18 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
     if [[ -d "$EXTRACT_DIR" ]] && [[ -f "${EXTRACT_DIR}/picogallery" ]]; then
       info "Binary extracted successfully."
     else
-      warn "Archive did not contain expected binary."
-      warn "Falling back to building from source..."
-      INSTALL_MODE="build"
+      die "Archive did not contain expected binary for ${VERSION}."
     fi
   else
-    warn "Download failed (HTTP $HTTP_CODE). No pre-built binary for ${VERSION} / linux-${ARTIFACT_ARCH}."
-    warn "Falling back to building from source..."
-    INSTALL_MODE="build"
+    die "Download failed (HTTP $HTTP_CODE). No pre-built binary found for ${VERSION} on architecture ${ARTIFACT_ARCH}."
   fi
 fi
 
-# ── Build from source (fallback) ────────────────────────────────────────────
-
-if [[ "$INSTALL_MODE" == "build" ]]; then
-  section "Building from source"
+# ── Build from source (Disabled per request) ──────────────────────────────────
+# To re-enable, revert the changes that commented out this section.
+if [[ "${INSTALL_MODE:-}" == "build" ]]; then
+  section "Building from source (DISABLED)"
+  die "Source builds are disabled in this version of the installer. Please use a Release."
 
   # ── Choose build profile ──
   # release-fast: ~3-4x faster compile, binary ~30% larger (used on Pi Zero/low-RAM).
