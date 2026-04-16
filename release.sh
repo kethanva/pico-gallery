@@ -21,15 +21,22 @@ if ! git rev-parse --is-inside-work-tree &>/dev/null; then
 fi
 
 # ── Auto-increment patch version (0.0.Z) ─────────────────────────────────────
+# Source of truth is the latest v0.0.Z git tag, not Cargo.toml,
+# so the version always advances correctly regardless of what Cargo.toml says.
 
-CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
-PATCH="${CURRENT##*.}"
-NEXT_PATCH=$(( PATCH + 1 ))
+LAST_TAG=$(git tag | grep -E '^v0\.0\.[0-9]+$' | sort -t. -k3 -n | tail -1)
+if [[ -z "$LAST_TAG" ]]; then
+  NEXT_PATCH=1
+else
+  CURRENT_PATCH="${LAST_TAG##*.}"
+  NEXT_PATCH=$(( CURRENT_PATCH + 1 ))
+fi
+
 VERSION="0.0.${NEXT_PATCH}"
 TAG="v${VERSION}"
 
-blue "Current version : $CURRENT"
-blue "Next version    : $VERSION"
+blue "Last tag     : ${LAST_TAG:-none}"
+blue "Next version : $VERSION"
 
 # Abort if tag already exists
 if git tag | grep -qx "$TAG"; then
