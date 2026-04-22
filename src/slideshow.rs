@@ -123,7 +123,6 @@ impl Slideshow {
         // Prefetch ring: up to `prefetch_count` decoded images ready ahead.
         let prefetch_n = self.config.cache.prefetch_count;
         let mut prefetched: VecDeque<(usize, usize, PhotoMeta, Vec<u8>)> = VecDeque::new();
-        let mut cursor = 0usize;
         let mut current_queue_idx = 0usize;
         let mut current_rgba: Option<RgbaImage> = None;
         let mut paused = false;
@@ -134,7 +133,7 @@ impl Slideshow {
                 prefetched.push_back((i, queue[i].0, queue[i].1.clone(), bytes));
             }
         }
-        cursor = prefetch_n.min(queue.len());
+        let mut cursor = prefetch_n.min(queue.len());
 
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
         let trans_dur = Duration::from_millis(self.config.display.transition_ms as u64);

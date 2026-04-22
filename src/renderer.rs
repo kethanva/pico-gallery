@@ -466,7 +466,13 @@ impl Renderer {
             let frame_time = start.elapsed() - elapsed;
             if frame_time < budget { std::thread::sleep(budget - frame_time); }
         }
-        self.show_cut(next_rgba)
+
+        // Final frame: reuse the pre-baked texture instead of re-uploading via show_cut.
+        next_tex.set_alpha_mod(255);
+        self.canvas.clear();
+        blit_centered(&mut self.canvas, &next_tex, nw, nh, self.width, self.height)?;
+        self.canvas.present();
+        Ok(())
     }
 
     pub fn show_slide_left(
