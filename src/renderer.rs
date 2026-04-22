@@ -445,7 +445,9 @@ impl Renderer {
         // to the Metal framebuffer and macOS shows the white desktop behind the window.
         next_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
 
-        let start = Instant::now();
+        let cur_dims = current_rgba.map(|r| (r.width(), r.height()));
+        let budget   = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let start    = Instant::now();
         loop {
             let elapsed = start.elapsed();
             if elapsed >= duration { break; }
@@ -454,16 +456,15 @@ impl Renderer {
             self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
             self.canvas.clear();
 
-            if let Some(ref cur) = cur_tex {
-                blit_centered(&mut self.canvas, cur, current_rgba.unwrap().width(), current_rgba.unwrap().height(), self.width, self.height)?;
+            if let (Some(ref cur), Some((cw, ch))) = (&cur_tex, cur_dims) {
+                blit_centered(&mut self.canvas, cur, cw, ch, self.width, self.height)?;
             }
             next_tex.set_alpha_mod(alpha);
             blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
             self.canvas.present();
 
-            let budget = Duration::from_millis(1000 / self.config.fps as u64);
-            let used   = start.elapsed() - elapsed;
-            if used < budget { std::thread::sleep(budget - used); }
+            let frame_time = start.elapsed() - elapsed;
+            if frame_time < budget { std::thread::sleep(budget - frame_time); }
         }
         self.show_cut(next_rgba)
     }
@@ -476,10 +477,15 @@ impl Renderer {
     ) -> Result<()> {
         if duration.is_zero() { return self.show_cut(next_rgba); }
 
-        let tc    = self.canvas.texture_creator();
-        let w     = self.width as i32;
-        let h     = self.height as i32;
-        let start = Instant::now();
+        let tc      = self.canvas.texture_creator();
+        let w       = self.width as i32;
+        let h       = self.height as i32;
+
+        // Pre-bake textures once before the animation loop.
+        let cur_tex  = current_rgba.map(|cur| rgba_to_texture(&tc, cur)).transpose()?;
+        let next_tex = rgba_to_texture(&tc, next_rgba)?;
+        let budget   = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let start    = Instant::now();
 
         loop {
             let elapsed = start.elapsed();
@@ -490,23 +496,26 @@ impl Renderer {
             let t = if t < 0.5 { 4.0*t*t*t } else { 1.0 - (-2.0*t + 2.0_f32).powi(3) / 2.0 };
             let offset = (w as f32 * t) as i32;
 
-            self.canvas.clear();
             self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+            self.canvas.clear();
             self.canvas.fill_rect(Rect::new(0, 0, w as u32, h as u32)).ok();
 
-            if let Some(cur) = current_rgba {
-                let tex = rgba_to_texture(&tc, cur)?;
-                self.canvas.copy(&tex, None, Rect::new(-offset, 0, self.width, self.height)).ok();
+            if let Some(ref cur) = cur_tex {
+                self.canvas.copy(cur, None, Rect::new(-offset, 0, self.width, self.height)).ok();
             }
-            let next_tex = rgba_to_texture(&tc, next_rgba)?;
             self.canvas.copy(&next_tex, None, Rect::new(w - offset, 0, self.width, self.height)).ok();
             self.canvas.present();
 
-            let budget = Duration::from_millis(1000 / self.config.fps as u64);
-            let used   = start.elapsed() - elapsed;
-            if used < budget { std::thread::sleep(budget - used); }
+            let frame_time = start.elapsed() - elapsed;
+            if frame_time < budget { std::thread::sleep(budget - frame_time); }
         }
-        self.show_cut(next_rgba)
+
+        // Final frame: reuse the pre-baked texture instead of re-allocating.
+        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        self.canvas.clear();
+        blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
+        self.canvas.present();
+        Ok(())
     }
 
     // ── Event loop ────────────────────────────────────────────────────────────
@@ -548,15 +557,16 @@ fn rgba_to_texture<'tc>(
     let mut tex = tc
         .create_texture_streaming(PixelFormatEnum::RGBA32, w, h)
         .context("creating texture")?;
+    let raw      = rgba.as_raw();
+    let row_bytes = w as usize * 4;
     tex.with_lock(None, |buf: &mut [u8], pitch: usize| {
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let px  = rgba.get_pixel(x as u32, y as u32).0;
-                let off = y * pitch + x * 4;
-                buf[off]     = px[0];
-                buf[off + 1] = px[1];
-                buf[off + 2] = px[2];
-                buf[off + 3] = px[3];
+        if pitch == row_bytes {
+            buf[..raw.len()].copy_from_slice(raw);
+        } else {
+            for y in 0..h as usize {
+                let src = y * row_bytes;
+                let dst = y * pitch;
+                buf[dst..dst + row_bytes].copy_from_slice(&raw[src..src + row_bytes]);
             }
         }
     }).map_err(|e| anyhow::anyhow!("texture lock: {}", e))?;
