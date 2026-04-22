@@ -369,49 +369,47 @@ impl Renderer {
                 img.width(), img.height()
             ));
         }
-        Ok(self.scale_image(img).into_rgba8())
+        Ok(self.scale_image(img))
     }
 
-    fn scale_image(&self, img: DynamicImage) -> DynamicImage {
+    fn scale_image(&self, img: DynamicImage) -> RgbaImage {
         let (sw, sh) = (img.width(), img.height());
         let (dw, dh) = (self.width, self.height);
 
-        let (nw, nh) = if self.config.fill_screen {
-            let scale = f32::max(dw as f32 / sw as f32, dh as f32 / sh as f32);
-            ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32)
+        // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
+        let scale = if self.config.fill_screen {
+            f32::max(dw as f32 / sw as f32, dh as f32 / sh as f32)
         } else {
-            let scale = f32::min(dw as f32 / sw as f32, dh as f32 / sh as f32);
-            ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32)
+            f32::min(dw as f32 / sw as f32, dh as f32 / sh as f32)
         };
+        let (nw, nh) = ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32);
 
         use fast_image_resize as fir;
-        let src = fir::Image::from_vec_u8(
-            std::num::NonZeroU32::new(sw).unwrap(),
-            std::num::NonZeroU32::new(sh).unwrap(),
-            img.into_rgba8().into_raw(),
-            fir::PixelType::U8x4,
-        ).unwrap_or_else(|_| fir::Image::new(
-            std::num::NonZeroU32::new(1).unwrap(),
-            std::num::NonZeroU32::new(1).unwrap(),
-            fir::PixelType::U8x4,
-        ));
+        let src = match (std::num::NonZeroU32::new(sw), std::num::NonZeroU32::new(sh)) {
+            (Some(sw_nz), Some(sh_nz)) => {
+                match fir::Image::from_vec_u8(sw_nz, sh_nz, img.into_rgba8().into_raw(), fir::PixelType::U8x4) {
+                    Ok(i) => i,
+                    Err(_) => return RgbaImage::new(self.width, self.height),
+                }
+            }
+            _ => return RgbaImage::new(self.width, self.height),
+        };
 
+        let (dst_w, dst_h) = (nw.max(1), nh.max(1));
         let mut dst = fir::Image::new(
-            std::num::NonZeroU32::new(nw.max(1)).unwrap(),
-            std::num::NonZeroU32::new(nh.max(1)).unwrap(),
+            std::num::NonZeroU32::new(dst_w).unwrap(),
+            std::num::NonZeroU32::new(dst_h).unwrap(),
             fir::PixelType::U8x4,
         );
 
         let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
         if let Err(e) = resizer.resize(&src.view(), &mut dst.view_mut()) {
             warn!("Image resize error: {}", e);
-            return DynamicImage::new_rgba8(self.width, self.height);
+            return RgbaImage::new(self.width, self.height);
         }
 
-        let raw = dst.into_vec();
-        image::ImageBuffer::from_raw(nw, nh, raw)
-            .map(DynamicImage::ImageRgba8)
-            .unwrap_or_else(|| DynamicImage::new_rgba8(self.width, self.height))
+        RgbaImage::from_raw(dst_w, dst_h, dst.into_vec())
+            .unwrap_or_else(|| RgbaImage::new(self.width, self.height))
     }
 
     // ── Display methods ──────────────────────────────────────────────────────
@@ -445,22 +443,24 @@ impl Renderer {
         // to the Metal framebuffer and macOS shows the white desktop behind the window.
         next_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
 
-        let cur_dims = current_rgba.map(|r| (r.width(), r.height()));
-        let budget   = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
-        let start    = Instant::now();
+        let cur_dims   = current_rgba.map(|r| (r.width(), r.height()));
+        let (nw, nh)   = (next_rgba.width(), next_rgba.height());
+        let budget     = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let inv_dur    = 1.0 / duration.as_secs_f32();
+        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        let start      = Instant::now();
         loop {
             let elapsed = start.elapsed();
             if elapsed >= duration { break; }
 
-            let alpha = ((elapsed.as_secs_f32() / duration.as_secs_f32()) * 255.0) as u8;
-            self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+            let alpha = (elapsed.as_secs_f32() * inv_dur * 255.0) as u8;
             self.canvas.clear();
 
             if let (Some(ref cur), Some((cw, ch))) = (&cur_tex, cur_dims) {
                 blit_centered(&mut self.canvas, cur, cw, ch, self.width, self.height)?;
             }
             next_tex.set_alpha_mod(alpha);
-            blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
+            blit_centered(&mut self.canvas, &next_tex, nw, nh, self.width, self.height)?;
             self.canvas.present();
 
             let frame_time = start.elapsed() - elapsed;
@@ -479,26 +479,25 @@ impl Renderer {
 
         let tc      = self.canvas.texture_creator();
         let w       = self.width as i32;
-        let h       = self.height as i32;
 
         // Pre-bake textures once before the animation loop.
         let cur_tex  = current_rgba.map(|cur| rgba_to_texture(&tc, cur)).transpose()?;
         let next_tex = rgba_to_texture(&tc, next_rgba)?;
         let budget   = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let inv_dur  = 1.0 / duration.as_secs_f32();
+        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         let start    = Instant::now();
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= duration { break; }
 
-            let t = elapsed.as_secs_f32() / duration.as_secs_f32();
+            let t = elapsed.as_secs_f32() * inv_dur;
             // ease-in-out cubic
             let t = if t < 0.5 { 4.0*t*t*t } else { 1.0 - (-2.0*t + 2.0_f32).powi(3) / 2.0 };
             let offset = (w as f32 * t) as i32;
 
-            self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
             self.canvas.clear();
-            self.canvas.fill_rect(Rect::new(0, 0, w as u32, h as u32)).ok();
 
             if let Some(ref cur) = cur_tex {
                 self.canvas.copy(cur, None, Rect::new(-offset, 0, self.width, self.height)).ok();
@@ -511,7 +510,6 @@ impl Renderer {
         }
 
         // Final frame: reuse the pre-baked texture instead of re-allocating.
-        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         self.canvas.clear();
         blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
         self.canvas.present();

@@ -12,6 +12,11 @@ use tokio::fs;
 
 const INDEX_FILE: &str = "index.json";
 const MAX_ENTRY_BYTES: u64 = 20 * 1024 * 1024; // never cache a single item > 20 MB
+/// Persist the LRU index every N puts. Batching avoids a full-JSON fs::write
+/// on every cached photo — painful on Pi Zero's slow SD card. On crash, at
+/// most (N-1) recent entries may become orphaned files inside the cache dir;
+/// they'll be picked up by the next index-rewrite cycle.
+const PUTS_PER_INDEX_SAVE: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
@@ -25,6 +30,7 @@ pub struct ImageCache {
     max_bytes: u64,
     used_bytes: u64,
     lru: VecDeque<CacheEntry>,
+    puts_since_save: u32,
 }
 
 impl ImageCache {
@@ -47,6 +53,7 @@ impl ImageCache {
             max_bytes,
             used_bytes: 0,
             lru: VecDeque::new(),
+            puts_since_save: 0,
         };
 
         cache.load_index().await;
@@ -101,8 +108,23 @@ impl ImageCache {
         });
         self.used_bytes += size;
         debug!("Cache PUT: {} ({} KB)", key, size / 1024);
-        self.save_index().await;
+
+        // Batch index writes — see PUTS_PER_INDEX_SAVE doc comment.
+        self.puts_since_save += 1;
+        if self.puts_since_save >= PUTS_PER_INDEX_SAVE {
+            self.save_index().await;
+            self.puts_since_save = 0;
+        }
         Ok(())
+    }
+
+    /// Force a sync of the LRU index to disk. Call before clean shutdown
+    /// so any batched-but-unsaved entries become durable.
+    pub async fn flush(&mut self) {
+        if self.puts_since_save > 0 {
+            self.save_index().await;
+            self.puts_since_save = 0;
+        }
     }
 
     /// True if the key is present (without promoting in LRU).

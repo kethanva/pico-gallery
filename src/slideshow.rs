@@ -146,7 +146,11 @@ impl Slideshow {
             // ── Event handling ─────────────────────────────────────────────
             if let Some(cmd) = renderer.poll_events() {
                 match cmd {
-                    SlideshowCmd::Quit => { info!("Quit requested."); return Ok(()); }
+                    SlideshowCmd::Quit => {
+                        info!("Quit requested.");
+                        self.cache.lock().await.flush().await;
+                        return Ok(());
+                    }
                     SlideshowCmd::TogglePause => {
                         paused = !paused;
                         info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
