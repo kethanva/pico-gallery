@@ -28,7 +28,7 @@ version = "0.0.16"
 edition     = "2021"
 description = "Lightweight plugin-based photo slideshow for Raspberry Pi — no desktop environment required"
 license     = "MIT"
-repository  = "https://github.com/kethanva/PicoGallery"
+repository  = "https://github.com/kethanva/pico-gallery"
 build       = "build.rs"
 
 [lib]
