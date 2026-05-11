@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=admin
+User=pi
 Group=video
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info

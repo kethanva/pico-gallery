@@ -96,7 +96,7 @@ incremental   = false
 
 [package.metadata.deb]
 name = "picogallery"
-maintainer = "Kethan <kethanva@gmail.com>"
+maintainer = "Kethan <kethanva@users.noreply.github.com>"
 copyright = "2026, Kethan"
 license-file = ["LICENSE", "0"]
 extended-description = """
