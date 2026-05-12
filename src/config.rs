@@ -1,5 +1,7 @@
 use picogallery_core::PluginConfig;
 use anyhow::{Context, Result};
+use chrono::{Local, NaiveTime};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,26 @@ pub struct DisplayConfig {
     /// Frames per second cap.  Lower = less CPU on Pi Zero.
     #[serde(default = "default_fps")]
     pub fps: u32,
+
+    // ── Optional display schedule ────────────────────────────────────────────
+    //
+    // Both fields must be set to activate scheduling; if either is absent the
+    // display is always on (default behaviour).  Times are in 24-hour HH:MM
+    // format and interpreted in local time.
+    //
+    // Example — on 07:00, off 22:00 each day:
+    //   on_time  = "07:00"
+    //   off_time = "22:00"
+    //
+    // The schedule is optional and off by default.
+
+    /// Time at which the display turns on each day (HH:MM, local time).
+    #[serde(default)]
+    pub on_time: Option<String>,
+
+    /// Time at which the display turns off each day (HH:MM, local time).
+    #[serde(default)]
+    pub off_time: Option<String>,
 }
 
 impl Default for DisplayConfig {
@@ -60,6 +82,66 @@ impl Default for DisplayConfig {
             width: 0,
             height: 0,
             fps: default_fps(),
+            on_time:  None,
+            off_time: None,
+        }
+    }
+}
+
+impl DisplayConfig {
+    /// Returns `true` when the display should be on right now.
+    ///
+    /// Scheduling is disabled (always on) when:
+    /// - neither `on_time` nor `off_time` is set, or
+    /// - only one of the two is set (configuration error), or
+    /// - either value cannot be parsed as `HH:MM`, or
+    /// - both values are identical (zero-width window).
+    pub fn schedule_active_now(&self) -> bool {
+        let (Some(on_str), Some(off_str)) = (&self.on_time, &self.off_time) else {
+            // Scheduling not configured — always on.
+            return true;
+        };
+
+        let parse = |s: &str| -> Option<NaiveTime> {
+            let mut parts = s.splitn(2, ':');
+            let h: u32 = parts.next()?.parse().ok()?;
+            let m: u32 = parts.next()?.parse().ok()?;
+            NaiveTime::from_hms_opt(h, m, 0)
+        };
+
+        let (on, off) = match (parse(on_str), parse(off_str)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                warn!(
+                    "display.on_time/off_time could not be parsed as HH:MM \
+                     (got '{}' / '{}') — scheduling disabled",
+                    on_str, off_str
+                );
+                return true;
+            }
+        };
+
+        if on == off {
+            return true; // zero-width window → treat as disabled
+        }
+
+        let now = Local::now().time();
+
+        if on < off {
+            // Normal window: active between on_time and off_time on the same day.
+            now >= on && now < off
+        } else {
+            // Overnight window (e.g., on=22:00 off=06:00): active if past on OR before off.
+            now >= on || now < off
+        }
+    }
+
+    /// Returns a human-readable description of the configured schedule, or
+    /// `None` if scheduling is disabled.
+    pub fn schedule_description(&self) -> Option<String> {
+        match (&self.on_time, &self.off_time) {
+            (Some(on), Some(off)) => Some(format!("{on} → {off}")),
+            _ => None,
         }
     }
 }

@@ -4,7 +4,7 @@
 /// while the current one is on screen, so transitions are instant on slow Pi
 /// Zero I/O.  All plugin calls are async and non-blocking.
 use anyhow::Result;
-use image::RgbaImage;
+use image::{Rgba, RgbaImage};
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -126,6 +126,9 @@ impl Slideshow {
         let mut current_queue_idx = 0usize;
         let mut current_rgba: Option<RgbaImage> = None;
         let mut paused = false;
+        // Tracks whether the display is currently powered on so we emit
+        // vcgencmd and the black frame only at the exact on→off / off→on edges.
+        let mut display_was_on = true;
 
         // Pre-warm the prefetch queue.
         for i in 0..prefetch_n.min(queue.len()) {
@@ -169,6 +172,42 @@ impl Slideshow {
                         last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now);
                     }
                 }
+            }
+
+            // ── Display schedule ───────────────────────────────────────────
+            //
+            // When the schedule says the display should be off:
+            //  1. Render a black frame once (at the off-edge transition).
+            //  2. Ask vcgencmd to cut HDMI power (Pi only; silent no-op elsewhere).
+            //  3. Sleep cheaply — still polling events so Quit is always handled.
+            // When the schedule says the display should come back on:
+            //  1. Ask vcgencmd to restore HDMI power.
+            //  2. Force an immediate photo advance so content appears at once.
+            if !self.config.display.schedule_active_now() {
+                if display_was_on {
+                    let w = renderer.width().max(1);
+                    let h = renderer.height().max(1);
+                    let black = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+                    if let Err(e) = renderer.show_cut(&black) {
+                        warn!("schedule: could not show black frame: {e}");
+                    }
+                    crate::display_power::set_power(false).await;
+                    display_was_on = false;
+                    info!("Display schedule: display off.");
+                }
+                // 1-second sleep keeps the loop responsive without burning CPU.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            if !display_was_on {
+                crate::display_power::set_power(true).await;
+                display_was_on = true;
+                // Force immediate photo advance so the screen doesn't stay black.
+                last_advance = Instant::now()
+                    .checked_sub(slide_dur)
+                    .unwrap_or_else(Instant::now);
+                info!("Display schedule: display on.");
             }
 
             if paused {

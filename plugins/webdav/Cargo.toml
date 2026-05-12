@@ -1,0 +1,19 @@
+[package]
+name        = "picogallery-webdav"
+version     = "0.1.0"
+edition     = "2021"
+description = "WebDAV/Nextcloud plugin for PicoGallery — syncs photos from any WebDAV server"
+license     = "MIT"
+
+[dependencies]
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+chrono           = { workspace = true }
+log              = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+reqwest          = { workspace = true }
+dirs             = { workspace = true }
+quick-xml        = "0.36"

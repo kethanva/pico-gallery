@@ -6,6 +6,7 @@ members = [
     "plugins/amazon-photos",
     "plugins/local",
     "plugins/directory",
+    "plugins/webdav",
 ]
 resolver = "2"
 
@@ -61,6 +62,7 @@ picogallery-google-photos = { path = "plugins/google-photos", optional = true }
 picogallery-amazon-photos = { path = "plugins/amazon-photos", optional = true }
 picogallery-local         = { path = "plugins/local",         optional = true }
 picogallery-directory     = { path = "plugins/directory",     optional = true }
+picogallery-webdav        = { path = "plugins/webdav",        optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
@@ -69,11 +71,12 @@ drm = "0.15"
 cc = "1"
 
 [features]
-default              = ["plugin-google-photos", "plugin-local", "plugin-directory"]
+default              = ["plugin-google-photos", "plugin-local", "plugin-directory", "plugin-webdav"]
 plugin-google-photos = ["dep:picogallery-google-photos"]
 plugin-amazon-photos = ["dep:picogallery-amazon-photos"]
 plugin-local         = ["dep:picogallery-local"]
 plugin-directory     = ["dep:picogallery-directory"]
+plugin-webdav        = ["dep:picogallery-webdav"]
 
 [profile.release]
 opt-level     = "z"
