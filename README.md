@@ -13,6 +13,9 @@
 
 | Version | Feature |
 |---------|---------|
+| **current** | **EXIF auto-rotation** — portrait photos taken on phones now display upright. Orientation is corrected before scaling so aspect ratio is always correct. Pure Rust (`kamadak-exif`), no C deps. |
+| **current** | **Metadata overlay (OSD)** — album, capture date, and filename shown as a subtle pill in the bottom-left corner of each photo. Disable with `show_osd = false`. |
+| **current** | **Photo ordering** — choose `shuffle` (default), `chronological`, or `newest_first` via `order` in `[display]`. |
 | **current** | **WebDAV/Nextcloud plugin** — sync photos from Nextcloud, Synology, ownCloud, or any WebDAV server. No shell tools; pure Rust. Works offline after first sync. |
 | **current** | **Display scheduling** — configure `on_time`/`off_time` to cut HDMI power at night automatically. Inactive by default; opt-in per-frame. |
 | 0.0.16 | Cross-fade, slide, and cut transitions; async prefetch; LRU disk cache |
@@ -279,6 +282,9 @@ Times are interpreted in the system's **local time zone**.
 
 - **No X11 / no desktop** — renders directly to the KMS/DRM framebuffer via SDL2.
 - **Plugin architecture** — Google Drive, Amazon Photos, local directory/filesystem, WebDAV/Nextcloud; add your own with one Rust trait.
+- **EXIF auto-rotation** — portrait photos from phones display upright automatically. Orientation is corrected before the scaler runs so aspect ratio is always right.
+- **Metadata overlay (OSD)** — album, capture date, and filename in the bottom-left corner. Toggle with `show_osd = true/false`. Uses a built-in bitmap font — no system fonts needed.
+- **Photo ordering** — `shuffle` (default), `chronological` (oldest first), or `newest_first`. Set via `order` in `[display]`.
 - **WebDAV / Nextcloud plugin** — sync from Nextcloud, Synology, ownCloud, or any WebDAV server. Pure Rust. Works offline after first sync.
 - **Display scheduling** — configure `on_time`/`off_time` to cut HDMI power automatically. Opt-in; off by default.
 - **Google Drive via rclone** — `drive.readonly` scope, no Google Cloud project or API key needed.
@@ -405,6 +411,12 @@ fps                 = 15      # max FPS (lower = less CPU on Pi Zero)
 # Optional display schedule — both required to activate (default: always on)
 # on_time  = "07:00"          # display on  at 07:00 local time
 # off_time = "22:00"          # display off at 22:00 local time
+
+# Photo order: "shuffle" (default) | "chronological" | "newest_first"
+# order = "shuffle"
+
+# Metadata pill in bottom-left: album, date, filename (default: true)
+# show_osd = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache
@@ -639,6 +651,8 @@ picogallery/
 │   ├── main.rs                   # binary entry point + plugin registry
 │   ├── config.rs                 # TOML config structs + display schedule logic
 │   ├── cache.rs                  # LRU disk image cache
+│   ├── exif_util.rs              # EXIF orientation reading + auto-rotation
+│   ├── osd.rs                    # metadata overlay (album / date / filename)
 │   ├── renderer.rs               # SDL2 / KMS-DRM renderer + transitions
 │   ├── display_power.rs          # vcgencmd HDMI power control (Linux/Pi)
 │   └── slideshow.rs              # async slideshow engine + schedule enforcement
@@ -683,11 +697,12 @@ Plugin registry
               │  dyn PhotoPlugin
               ▼
 Slideshow engine
-    ├─ build_queue(): list photos from all enabled plugins, shuffle
+    ├─ build_queue(): list photos from all enabled plugins, apply order (shuffle / chrono / newest)
     ├─ display_loop():
     │   ├─ poll SDL2 events (Quit / Next / Prev / Pause)
     │   ├─ check display schedule → if off: black frame + vcgencmd display_power 0
-    │   ├─ prefetch loop: fetch → disk cache → decode → RgbaImage
+    │   ├─ prefetch loop: fetch → disk cache → decode → EXIF-rotate → scale → RgbaImage
+    │   ├─ OSD: stamp album / date / filename pill onto RgbaImage (if show_osd = true)
     │   └─ transition: Cut / Fade / SlideLeft / SlideRight
     └─ cache flush on exit
               │
@@ -795,6 +810,7 @@ transition    = "cut"   # no animation — saves CPU
 transition_ms = 0
 fps           = 10
 fill_screen   = false   # letterbox cheaper than crop+scale
+show_osd      = false   # disable OSD to skip per-photo pixel iteration
 
 [cache]
 prefetch_count = 2
@@ -802,6 +818,12 @@ max_mb         = 128
 ```
 
 Set `gpu_mem=64` in `/boot/config.txt` (the installer does this).
+
+### EXIF rotation and RAM on Pi Zero
+
+EXIF auto-rotation is always active (it fixes sideways portraits). When a photo needs rotation, the decoder temporarily holds two copies of the decoded image in RAM — the original and the rotated version — before handing off to the scaler. For a typical 12 MP phone photo (4032×3024) this peaks at about **98 MB** briefly before the scaler reduces it to display resolution and frees the originals.
+
+Pi Zero W has 512 MB RAM, so 12 MP photos are fine. If you're seeing out-of-memory crashes with very high-resolution sources (24 MP+), resize photos before uploading or use `fill_screen = false` (letterbox) to reduce scaler work.
 
 For the WebDAV plugin on Pi Zero, set a low sync interval to avoid competing with the renderer:
 

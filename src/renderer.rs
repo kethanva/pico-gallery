@@ -352,7 +352,12 @@ impl Renderer {
 
     // ── Image decode & scale ─────────────────────────────────────────────────
 
-    pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<RgbaImage> {
+    /// Decode, EXIF-correct, and scale an image in one pass.
+    ///
+    /// Returns `(scaled_rgba, exif_date)`.  EXIF is parsed once per call so
+    /// callers do not need a second parse to retrieve the capture date.
+    /// `exif_date` is `None` when EXIF is absent or `DateTimeOriginal` is missing.
+    pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<(RgbaImage, Option<String>)> {
         // Reject suspiciously large blobs before handing to the decoder.
         const MAX_DECODE_BYTES: usize = 50 * 1024 * 1024;
         if bytes.len() > MAX_DECODE_BYTES {
@@ -369,13 +374,14 @@ impl Renderer {
                 img.width(), img.height()
             ));
         }
-        // Apply EXIF orientation *before* scaling so the scaler sees the correct
-        // aspect ratio.  A portrait phone photo (EXIF orientation 6 = "rotate 90° CW")
-        // is stored sideways in the JPEG; correcting it here means the scaler will
-        // produce a portrait-sized output instead of a landscape one.
+        // Read EXIF once for both orientation and date — avoids a second parse in
+        // the OSD path.  Orientation is applied *before* scaling so the scaler sees
+        // the correct aspect ratio (a portrait phone photo stored sideways in the
+        // JPEG gets rotated first, then scaled to display dimensions).
         let orientation = crate::exif_util::read_orientation(bytes);
+        let exif_date   = crate::exif_util::read_date(bytes);
         let img = crate::exif_util::apply_orientation(img, orientation);
-        Ok(self.scale_image(img))
+        Ok((self.scale_image(img), exif_date))
     }
 
     fn scale_image(&self, img: DynamicImage) -> RgbaImage {

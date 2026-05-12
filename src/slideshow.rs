@@ -238,10 +238,11 @@ impl Slideshow {
             if let Some((q_idx, _pidx, meta, bytes)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
                 match renderer.decode_and_scale(&bytes) {
-                    Ok(mut rgba) => {
+                    Ok((mut rgba, exif_date)) => {
                         // Stamp metadata overlay before handing to the transition.
+                        // exif_date comes from the same EXIF parse that corrected
+                        // orientation — no second parse needed.
                         if self.config.display.show_osd {
-                            let exif_date = crate::exif_util::read_date(&bytes);
                             crate::osd::draw_photo_info(
                                 &mut rgba,
                                 &meta,
