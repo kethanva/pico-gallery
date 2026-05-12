@@ -85,6 +85,16 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
         }
     }
 
+    #[cfg(feature = "plugin-webdav")]
+    {
+        if let Some(pcfg) = cfg.plugin_config("webdav") {
+            info!("Registering plugin: webdav");
+            plugins.push(Box::new(
+                picogallery_webdav::WebDavPlugin::new(pcfg.clone()),
+            ));
+        }
+    }
+
     plugins
 }
 
@@ -128,6 +138,11 @@ async fn main() -> Result<()> {
     };
 
     config.ensure_dirs()?;
+
+    // ── Display schedule ──────────────────────────────────────────────────────
+    if let Some(desc) = config.display.schedule_description() {
+        info!("Display schedule active: on/off window = {desc}");
+    }
 
     // ── Plugins ───────────────────────────────────────────────────────────────
     let mut plugins = build_plugins(&config);

@@ -10,5 +10,6 @@ pub mod plugin {
 }
 pub mod cache;
 pub mod config;
+pub mod display_power;
 pub mod renderer;
 pub mod slideshow;

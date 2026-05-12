@@ -22,6 +22,18 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 # width  = 1920
 # height = 1080
 
+# ── Display schedule (optional, both fields required to activate) ─────────────
+#
+# Times are in 24-hour HH:MM format, interpreted in local time.
+# When active, the display turns on at on_time and off at off_time each day.
+# Between off_time and on_time the screen shows black and HDMI power is cut
+# (via vcgencmd display_power on Raspberry Pi; black-frame only on other Linux).
+#
+# Leave both commented out (default) to keep the display on at all times.
+#
+# on_time  = "07:00"   # display turns on at 07:00 each morning
+# off_time = "22:00"   # display turns off at 22:00 each evening
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,3 +104,44 @@ enabled = false
 
 client_id     = "YOUR_LWA_CLIENT_ID"
 client_secret = "YOUR_LWA_CLIENT_SECRET"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] webdav  ★ Nextcloud / ownCloud / Synology NAS
+#
+# Syncs photos from any WebDAV server to a local cache and serves them from
+# disk.  Works offline after the first sync (equivalent to photOS's
+# WebDAV-mount + rsync approach, but entirely in Rust — no shell tools).
+#
+# Tested with: Nextcloud, ownCloud, Synology DSM, nginx-dav-ext, Apache mod_dav
+#
+# SETUP (Nextcloud example)
+# 1. Find your WebDAV URL in Nextcloud → Files → "…" menu → WebDAV.
+#    It looks like: https://cloud.example.com/remote.php/dav/files/USERNAME
+# 2. Set your username and password (or an app-password from Security settings).
+# 3. Set remote_path to the folder you want to sync (e.g. "/Photos").
+# 4. Set enabled = true and restart picogallery.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "webdav"
+enabled = false
+
+# Full URL of the WebDAV endpoint (required).
+# Nextcloud: https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME
+# Synology:  https://nas.example.com:5006/photo
+# ownCloud:  https://cloud.example.com/remote.php/webdav
+url      = "https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME"
+
+username = "your-username"
+password = "your-password"     # consider using an app-password for better security
+
+# Sub-path on the server to sync (default: "/" = everything under url).
+remote_path = "/Photos"
+
+# Local directory where synced photos are cached (created automatically).
+sync_dir = "/tmp/picogallery-webdav"
+
+# Re-sync every N seconds in the background; 0 = startup sync only (default: 3600).
+sync_interval_secs = 3600
+
+# Set to true to accept self-signed TLS certificates (e.g. a local NAS).
+# skip_tls_verify = false
