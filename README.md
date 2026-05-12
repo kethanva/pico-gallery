@@ -1,6 +1,6 @@
 # PicoGallery
 
-> Lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
+> A very lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
