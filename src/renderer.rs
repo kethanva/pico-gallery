@@ -407,9 +407,15 @@ impl Renderer {
         // Example: 12 MP → 48 MB decoded + 8 MB display copy = 56 MB peak.
         //          24 MP → 96 MB decoded + 8 MB display copy = 104 MB peak.
         // On Pi Zero (512 MB) a limit of 12–16 MP is a safe default.
+        //
+        // Comparison uses multiplied pixel counts (no division on the hot path)
+        // — ARM11 has no hardware integer divider, so this matters per photo.
         if self.config.max_megapixels > 0 {
-            let mp = (img.width() as u64 * img.height() as u64 + 500_000) / 1_000_000;
-            if mp > self.config.max_megapixels as u64 {
+            let max_pixels    = self.config.max_megapixels as u64 * 1_000_000;
+            let actual_pixels = img.width() as u64 * img.height() as u64;
+            if actual_pixels > max_pixels {
+                // Divide only on the error path (rare).
+                let mp = actual_pixels / 1_000_000;
                 return Err(anyhow::anyhow!(
                     "image {}×{} ({} MP) exceeds max_megapixels={} — skipping \
                      (set a higher limit or resize photos before uploading)",
@@ -419,8 +425,11 @@ impl Renderer {
         }
 
         // ── EXIF (single parse) ────────────────────────────────────────────────
-        let orientation = crate::exif_util::read_orientation(bytes);
-        let exif_date   = crate::exif_util::read_date(bytes);
+        // Reads orientation + capture date in one Reader::read_from_container
+        // pass — halves heap allocations vs two separate parses.
+        let exif = crate::exif_util::read_exif(bytes);
+        let orientation = exif.orientation;
+        let exif_date   = exif.date;
 
         // ── Scale, then rotate the small image ────────────────────────────────
         // Swap target dimensions for 90°/270° so the scaler sees the correct
