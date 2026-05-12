@@ -21,6 +21,19 @@ impl Default for Transition {
     fn default() -> Self { Self::Fade }
 }
 
+/// Order in which photos are presented.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoOrder {
+    /// Random shuffle on each startup (default).
+    #[default]
+    Shuffle,
+    /// Oldest photo first, sorted by EXIF capture date.
+    Chronological,
+    /// Newest photo first, sorted by EXIF capture date.
+    NewestFirst,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayConfig {
     /// Duration each photo is shown, in seconds.
@@ -70,6 +83,15 @@ pub struct DisplayConfig {
     /// Time at which the display turns off each day (HH:MM, local time).
     #[serde(default)]
     pub off_time: Option<String>,
+
+    /// Order photos are shown: shuffle (default), chronological, newest_first.
+    #[serde(default)]
+    pub order: PhotoOrder,
+
+    /// Show a metadata pill (album, date, filename) in the bottom-left corner.
+    /// Defaults to true; set false to show photos without any overlay.
+    #[serde(default = "default_true")]
+    pub show_osd: bool,
 }
 
 impl Default for DisplayConfig {
@@ -84,6 +106,8 @@ impl Default for DisplayConfig {
             fps: default_fps(),
             on_time:  None,
             off_time: None,
+            order: PhotoOrder::Shuffle,
+            show_osd: true,
         }
     }
 }
@@ -149,6 +173,7 @@ impl DisplayConfig {
 fn default_slide_duration() -> u64 { 10 }
 fn default_transition_ms() -> u32  { 800 }
 fn default_fps() -> u32            { 15 }
+fn default_true() -> bool          { true }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 

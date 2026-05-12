@@ -103,12 +103,25 @@ impl Slideshow {
             }
         }
 
-        // Shuffle deterministically (simple Fisher-Yates with timestamp seed).
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(42);
-        shuffle(&mut all, seed);
+        use crate::config::PhotoOrder;
+        match self.config.display.order {
+            PhotoOrder::Shuffle => {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(42);
+                shuffle(&mut all, seed);
+                info!("Photo order: shuffle ({} photos)", all.len());
+            }
+            PhotoOrder::Chronological => {
+                all.sort_by_key(|(_, m)| m.taken_at);
+                info!("Photo order: chronological ({} photos)", all.len());
+            }
+            PhotoOrder::NewestFirst => {
+                all.sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
+                info!("Photo order: newest first ({} photos)", all.len());
+            }
+        }
 
         Ok(all)
     }
@@ -225,7 +238,16 @@ impl Slideshow {
             if let Some((q_idx, _pidx, meta, bytes)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
                 match renderer.decode_and_scale(&bytes) {
-                    Ok(rgba) => {
+                    Ok(mut rgba) => {
+                        // Stamp metadata overlay before handing to the transition.
+                        if self.config.display.show_osd {
+                            let exif_date = crate::exif_util::read_date(&bytes);
+                            crate::osd::draw_photo_info(
+                                &mut rgba,
+                                &meta,
+                                exif_date.as_deref(),
+                            );
+                        }
                         let result = match self.config.display.transition {
                             Transition::Cut => renderer.show_cut(&rgba),
                             Transition::Fade => renderer.show_fade(current_rgba.as_ref(), &rgba, trans_dur),

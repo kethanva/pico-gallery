@@ -369,6 +369,12 @@ impl Renderer {
                 img.width(), img.height()
             ));
         }
+        // Apply EXIF orientation *before* scaling so the scaler sees the correct
+        // aspect ratio.  A portrait phone photo (EXIF orientation 6 = "rotate 90° CW")
+        // is stored sideways in the JPEG; correcting it here means the scaler will
+        // produce a portrait-sized output instead of a landscape one.
+        let orientation = crate::exif_util::read_orientation(bytes);
+        let img = crate::exif_util::apply_orientation(img, orientation);
         Ok(self.scale_image(img))
     }
 
