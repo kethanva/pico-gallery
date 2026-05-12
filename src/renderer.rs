@@ -354,39 +354,97 @@ impl Renderer {
 
     /// Decode, EXIF-correct, and scale an image in one pass.
     ///
-    /// Returns `(scaled_rgba, exif_date)`.  EXIF is parsed once per call so
-    /// callers do not need a second parse to retrieve the capture date.
-    /// `exif_date` is `None` when EXIF is absent or `DateTimeOriginal` is missing.
+    /// Returns `(display_rgba, exif_date)`.
+    ///
+    /// # Memory strategy
+    ///
+    /// Photos are scaled to display resolution *first*, then the small
+    /// display-sized image (~8 MB) is rotated.  This is cheaper than rotating
+    /// the full-resolution original (~48–96 MB) first:
+    ///
+    /// ```text
+    ///   scale-then-rotate  peak ≈ full-res + display-size  (e.g. 48+8 = 56 MB)
+    ///   rotate-then-scale  peak ≈ full-res + full-res-copy (e.g. 48+48 = 96 MB)
+    /// ```
+    ///
+    /// For 90°/270° rotations the scale target dimensions are swapped
+    /// (height↔width) so the scaler outputs the correct portrait/landscape
+    /// size for the rotated result — same visual output, half the RAM.
+    ///
+    /// # Configurable safety limits
+    ///
+    /// Both limits are checked before the expensive decode step:
+    /// - `max_image_mb`   — raw file size gate (default 50 MB)
+    /// - `max_megapixels` — decoded pixel count gate (0 = no limit)
     pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<(RgbaImage, Option<String>)> {
-        // Reject suspiciously large blobs before handing to the decoder.
-        const MAX_DECODE_BYTES: usize = 50 * 1024 * 1024;
-        if bytes.len() > MAX_DECODE_BYTES {
+        // ── Raw-size gate ──────────────────────────────────────────────────────
+        let max_bytes = if self.config.max_image_mb > 0 {
+            self.config.max_image_mb as usize * 1_048_576
+        } else {
+            50 * 1_048_576 // default 50 MB
+        };
+        if bytes.len() > max_bytes {
             return Err(anyhow::anyhow!(
-                "image blob too large ({} MB) — refusing to decode",
-                bytes.len() / 1_048_576
+                "image file {} MB exceeds max_image_mb={} — skipping \
+                 (set a higher limit or resize photos before uploading)",
+                bytes.len() / 1_048_576,
+                max_bytes / 1_048_576,
             ));
         }
+
         let img = image::load_from_memory(bytes).context("decoding image")?;
-        // Reject extreme dimensions that could cause OOM during RGBA conversion.
+
+        // ── Hard dimension ceiling (OOM guard) ─────────────────────────────────
         if img.width() > 16_000 || img.height() > 16_000 {
             return Err(anyhow::anyhow!(
-                "image dimensions {}×{} exceed safety limit",
+                "image {}×{} px exceeds the 16 000-px dimension safety limit",
                 img.width(), img.height()
             ));
         }
-        // Read EXIF once for both orientation and date — avoids a second parse in
-        // the OSD path.  Orientation is applied *before* scaling so the scaler sees
-        // the correct aspect ratio (a portrait phone photo stored sideways in the
-        // JPEG gets rotated first, then scaled to display dimensions).
+
+        // ── Configurable megapixel gate ────────────────────────────────────────
+        // Peak RAM during decode = decoded RGBA size = W × H × 4 bytes.
+        // Example: 12 MP → 48 MB decoded + 8 MB display copy = 56 MB peak.
+        //          24 MP → 96 MB decoded + 8 MB display copy = 104 MB peak.
+        // On Pi Zero (512 MB) a limit of 12–16 MP is a safe default.
+        if self.config.max_megapixels > 0 {
+            let mp = (img.width() as u64 * img.height() as u64 + 500_000) / 1_000_000;
+            if mp > self.config.max_megapixels as u64 {
+                return Err(anyhow::anyhow!(
+                    "image {}×{} ({} MP) exceeds max_megapixels={} — skipping \
+                     (set a higher limit or resize photos before uploading)",
+                    img.width(), img.height(), mp, self.config.max_megapixels,
+                ));
+            }
+        }
+
+        // ── EXIF (single parse) ────────────────────────────────────────────────
         let orientation = crate::exif_util::read_orientation(bytes);
         let exif_date   = crate::exif_util::read_date(bytes);
-        let img = crate::exif_util::apply_orientation(img, orientation);
-        Ok((self.scale_image(img), exif_date))
+
+        // ── Scale, then rotate the small image ────────────────────────────────
+        // Swap target dimensions for 90°/270° so the scaler sees the correct
+        // target aspect ratio; the rotation brings it back to display orientation.
+        let (target_w, target_h) = if matches!(orientation, 5 | 6 | 7 | 8) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+
+        let scaled  = self.scale_image_to(img, target_w, target_h);
+        let oriented = crate::exif_util::apply_orientation_rgba(scaled, orientation);
+
+        Ok((oriented, exif_date))
     }
 
+    // scale_image is kept for any future callers that don't need orientation.
+    #[allow(dead_code)]
     fn scale_image(&self, img: DynamicImage) -> RgbaImage {
+        self.scale_image_to(img, self.width, self.height)
+    }
+
+    fn scale_image_to(&self, img: DynamicImage, dw: u32, dh: u32) -> RgbaImage {
         let (sw, sh) = (img.width(), img.height());
-        let (dw, dh) = (self.width, self.height);
 
         // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
         let scale = if self.config.fill_screen {
@@ -401,10 +459,10 @@ impl Renderer {
             (Some(sw_nz), Some(sh_nz)) => {
                 match fir::Image::from_vec_u8(sw_nz, sh_nz, img.into_rgba8().into_raw(), fir::PixelType::U8x4) {
                     Ok(i) => i,
-                    Err(_) => return RgbaImage::new(self.width, self.height),
+                    Err(_) => return RgbaImage::new(dw, dh),
                 }
             }
-            _ => return RgbaImage::new(self.width, self.height),
+            _ => return RgbaImage::new(dw, dh),
         };
 
         let (dst_w, dst_h) = (nw.max(1), nh.max(1));
@@ -417,11 +475,11 @@ impl Renderer {
         let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
         if let Err(e) = resizer.resize(&src.view(), &mut dst.view_mut()) {
             warn!("Image resize error: {}", e);
-            return RgbaImage::new(self.width, self.height);
+            return RgbaImage::new(dw, dh);
         }
 
         RgbaImage::from_raw(dst_w, dst_h, dst.into_vec())
-            .unwrap_or_else(|| RgbaImage::new(self.width, self.height))
+            .unwrap_or_else(|| RgbaImage::new(dw, dh))
     }
 
     // ── Display methods ──────────────────────────────────────────────────────
