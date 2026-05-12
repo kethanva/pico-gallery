@@ -22,6 +22,27 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 # width  = 1920
 # height = 1080
 
+# ── Photo ordering ────────────────────────────────────────────────────────────
+#
+# Controls the order photos are presented.
+#   "shuffle"        — random order, reshuffled each startup (default)
+#   "chronological"  — oldest photo first, sorted by EXIF capture date
+#   "newest_first"   — newest photo first, sorted by EXIF capture date
+#
+# Photos without a capture date are sorted to the end for the date-based modes.
+#
+# order = "shuffle"
+
+# ── Metadata overlay (OSD) ────────────────────────────────────────────────────
+#
+# Shows a subtle info pill in the bottom-left corner of each photo containing
+# the album name, capture date (from EXIF), and filename.  White text on a
+# darkened background — readable against any photo.
+#
+# Set to false to show photos without any overlay.
+#
+# show_osd = true
+
 # ── Display schedule (optional, both fields required to activate) ─────────────
 #
 # Times are in 24-hour HH:MM format, interpreted in local time.

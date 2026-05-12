@@ -11,5 +11,7 @@ pub mod plugin {
 pub mod cache;
 pub mod config;
 pub mod display_power;
+pub mod exif_util;
+pub mod osd;
 pub mod renderer;
 pub mod slideshow;
