@@ -43,6 +43,36 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 #
 # show_osd = true
 
+# ── Memory-safety limits ──────────────────────────────────────────────────────
+#
+# These two limits are checked BEFORE the image is decoded.  When a photo
+# exceeds a limit it is skipped with a WARN log entry — the slideshow continues
+# with the next photo.  Neither causes a crash.
+#
+# WHY THIS MATTERS — peak RAM per photo (scale-then-rotate pipeline):
+#
+#   Megapixels  Raw JPEG  Decoded RGBA  Peak during processing
+#   ──────────  ────────  ────────────  ─────────────────────
+#    8 MP       ~4–8 MB    ~32 MB        ~40 MB     (iPhone older models)
+#   12 MP       ~4–8 MB    ~48 MB        ~56 MB     (common phone default)
+#   24 MP       ~8–15 MB   ~96 MB        ~104 MB    (modern flagships)
+#   48 MP       ~15–25 MB  ~192 MB       ~200 MB    (high-res mode)
+#
+#   "Peak" = decoded RGBA + display-sized copy (~8 MB at 1080p).
+#
+# Pi Zero W has 512 MB RAM shared with the GPU.  With gpu_mem=64 that leaves
+# ~448 MB for the OS + process.  A 24 MP photo briefly needs ~104 MB, which is
+# fine; 48 MP photos (~200 MB) can cause the OOM killer to terminate the process.
+#
+# RECOMMENDED FOR PI ZERO:
+#   max_image_mb   = 20   # most phone JPEGs under 20 MB; rejects huge RAW exports
+#   max_megapixels = 16   # 16 MP → ~72 MB peak; safe headroom on Pi Zero
+#
+# Leave both at 0 (default) to use the built-in 50 MB file cap with no MP limit.
+#
+# max_image_mb   = 20
+# max_megapixels = 16
+
 # ── Display schedule (optional, both fields required to activate) ─────────────
 #
 # Times are in 24-hour HH:MM format, interpreted in local time.

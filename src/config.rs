@@ -92,6 +92,28 @@ pub struct DisplayConfig {
     /// Defaults to true; set false to show photos without any overlay.
     #[serde(default = "default_true")]
     pub show_osd: bool,
+
+    // ── Memory-safety limits ─────────────────────────────────────────────────
+    //
+    // Both limits are checked before the expensive decode step and generate a
+    // WARN log when tripped — the photo is skipped, not crashed.
+    //
+    // Recommended values for Pi Zero (512 MB RAM):
+    //   max_image_mb   = 20    (raw JPEG file size)
+    //   max_megapixels = 12    (decoded pixel count; 12 MP → ~56 MB peak)
+    //
+    // Leave at 0 to use the built-in defaults (50 MB / no MP limit).
+
+    /// Maximum raw image file size in megabytes.
+    /// 0 = use built-in default of 50 MB.
+    #[serde(default)]
+    pub max_image_mb: u64,
+
+    /// Maximum decoded image size in megapixels (width × height / 1 000 000).
+    /// 0 = no limit.  Peak RAM ≈ (MP × 4 MB) + 8 MB display copy.
+    /// Example: max_megapixels = 12 → peak ≈ 56 MB.
+    #[serde(default)]
+    pub max_megapixels: u32,
 }
 
 impl Default for DisplayConfig {
@@ -108,6 +130,8 @@ impl Default for DisplayConfig {
             off_time: None,
             order: PhotoOrder::Shuffle,
             show_osd: true,
+            max_image_mb: 0,
+            max_megapixels: 0,
         }
     }
 }

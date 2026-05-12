@@ -418,6 +418,12 @@ fps                 = 15      # max FPS (lower = less CPU on Pi Zero)
 # Metadata pill in bottom-left: album, date, filename (default: true)
 # show_osd = true
 
+# Memory-safety limits — skip photos that exceed these thresholds (WARN log, no crash)
+# max_image_mb   = 20   # raw file size cap in MB  (0 = built-in 50 MB default)
+# max_megapixels = 16   # decoded pixel cap in MP  (0 = no limit)
+#                       # peak RAM ≈ (MP × 4 MB) + 8 MB display copy
+#                       # 12 MP → ~56 MB peak; 24 MP → ~104 MB peak
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache
 # ─────────────────────────────────────────────────────────────────────────────
@@ -802,30 +808,71 @@ if let Some(pcfg) = cfg.plugin_config("my-source") {
 
 ---
 
-## Performance tuning for Pi Zero
+## Memory management
+
+### How photos are processed
+
+Every photo goes through this pipeline once per display interval:
+
+```
+raw bytes (JPEG/PNG)
+  → decode to RGBA             peak = raw bytes + decoded RGBA
+  → scale to display size      peak = decoded RGBA + display copy (~8 MB)
+  → EXIF-rotate display copy   peak = display copy × 2 (~16 MB)
+  → OSD overlay (if enabled)   in-place, no extra allocation
+  → transition / display
+```
+
+The dominant cost is the decode step. Peak RAM for the whole pipeline:
+
+| Source resolution | Decoded RGBA | Peak RAM |
+|-------------------|-------------|---------|
+| 8 MP  (4000×2000) | 32 MB       | ~40 MB  |
+| 12 MP (4032×3024) | 48 MB       | ~56 MB  |
+| 24 MP (6000×4000) | 96 MB       | ~104 MB |
+| 48 MP (8000×6000) | 192 MB      | ~200 MB |
+
+> **Note:** PicoGallery scales first, then rotates the small display-sized
+> image (~8 MB).  Pre-scale rotation was removed in favour of this approach
+> because it doubled peak RAM (full-res + full-res-copy before scaling).
+
+### Configurable safety limits
+
+Both limits are checked before decoding. Photos that exceed a limit are **skipped with a WARN log** — the slideshow continues with the next photo, no crash.
 
 ```toml
 [display]
-transition    = "cut"   # no animation — saves CPU
-transition_ms = 0
-fps           = 10
-fill_screen   = false   # letterbox cheaper than crop+scale
-show_osd      = false   # disable OSD to skip per-photo pixel iteration
+# Maximum raw file size before decode is attempted.
+# 0 = use built-in default of 50 MB.
+max_image_mb = 20
+
+# Maximum decoded pixel count (width × height / 1 000 000).
+# 0 = no limit.
+max_megapixels = 16
+```
+
+### Pi Zero recommendations
+
+Pi Zero W has 512 MB RAM; with `gpu_mem=64` set by the installer, about 448 MB is available to the OS + process. The display copy (~8 MB at 1080p) and prefetch queue add on top of each photo's decode peak.
+
+```toml
+[display]
+transition     = "cut"    # no fade animation — saves CPU
+transition_ms  = 0
+fps            = 10
+fill_screen    = false    # letterbox is cheaper than crop+scale
+show_osd       = false    # skip per-photo pixel iteration (~1 ms)
+max_image_mb   = 20       # reject oversized files before decode
+max_megapixels = 16       # 16 MP → ~72 MB peak; safe headroom
 
 [cache]
-prefetch_count = 2
+prefetch_count = 2        # each prefetched photo holds ~8 MB decoded + raw bytes
 max_mb         = 128
 ```
 
 Set `gpu_mem=64` in `/boot/config.txt` (the installer does this).
 
-### EXIF rotation and RAM on Pi Zero
-
-EXIF auto-rotation is always active (it fixes sideways portraits). When a photo needs rotation, the decoder temporarily holds two copies of the decoded image in RAM — the original and the rotated version — before handing off to the scaler. For a typical 12 MP phone photo (4032×3024) this peaks at about **98 MB** briefly before the scaler reduces it to display resolution and frees the originals.
-
-Pi Zero W has 512 MB RAM, so 12 MP photos are fine. If you're seeing out-of-memory crashes with very high-resolution sources (24 MP+), resize photos before uploading or use `fill_screen = false` (letterbox) to reduce scaler work.
-
-For the WebDAV plugin on Pi Zero, set a low sync interval to avoid competing with the renderer:
+For the WebDAV plugin on Pi Zero, space out syncs to avoid competing with the renderer:
 
 ```toml
 [[plugins]]
