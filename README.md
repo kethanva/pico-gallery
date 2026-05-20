@@ -105,6 +105,29 @@ sudo journalctl -u picogallery -f
 sudo reboot
 ```
 
+### Uninstallation
+
+To completely remove PicoGallery from your system, run the following commands:
+
+```bash
+# 1. Stop and remove the service
+sudo systemctl stop picogallery
+sudo systemctl disable picogallery
+sudo rm /etc/systemd/system/picogallery.service
+sudo systemctl daemon-reload
+
+# 2. Remove the binary
+sudo rm /usr/local/bin/picogallery
+
+# 3. (Optional) Remove your configuration
+rm -rf ~/.config/picogallery
+
+# 4. (Optional) Remove sample photos / default directory
+rm -rf ~/Pictures/PicoGallery
+```
+
+Note: You can also manually revert the `gpu_mem` and `dtoverlay` changes in `/boot/config.txt` or `/boot/firmware/config.txt` if desired.
+
 ### Supported architectures
 
 | Archive | Architecture | Devices |
