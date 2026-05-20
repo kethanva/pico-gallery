@@ -1,0 +1,134 @@
+{
+  "/Volumes/SSD/projects/pico-gallery/build.rs": {
+    "mtime": 1776345605.4061801,
+    "hash": "63c145451e3e1d165a8a1effa3948ee3"
+  },
+  "/Volumes/SSD/projects/pico-gallery/core/src/lib.rs": {
+    "mtime": 1776278447.9538162,
+    "hash": "978ef5c5b8c44d5221e38639ff50d080"
+  },
+  "/Volumes/SSD/projects/pico-gallery/plugins/google-photos/src/lib.rs": {
+    "mtime": 1776278447.9570184,
+    "hash": "83bc30873194f119b6cc01b520428405"
+  },
+  "/Volumes/SSD/projects/pico-gallery/plugins/directory/src/lib.rs": {
+    "mtime": 1776347248.308852,
+    "hash": "b0dea9fab7aba04b2ac7e7b1bc837f48"
+  },
+  "/Volumes/SSD/projects/pico-gallery/plugins/local/src/lib.rs": {
+    "mtime": 1776347276.642624,
+    "hash": "2352a928a3aea746506ec747b233bef1"
+  },
+  "/Volumes/SSD/projects/pico-gallery/plugins/amazon-photos/src/lib.rs": {
+    "mtime": 1776278447.959953,
+    "hash": "6a3927bec8b9c10b49d1be87bc15bb56"
+  },
+  "/Volumes/SSD/projects/pico-gallery/plugins/webdav/src/lib.rs": {
+    "mtime": 1778567740.4199882,
+    "hash": "0270284a0fd6404e42df43c54a3b69f4"
+  },
+  "/Volumes/SSD/projects/pico-gallery/mnt/user-data/outputs/picogallery/plugins/local/src/lib.rs": {
+    "mtime": 1776278504.3210778,
+    "hash": "13193434f5312e561b0bf2eed57372b2"
+  },
+  "/Volumes/SSD/projects/pico-gallery/mnt/user-data/outputs/picogallery/plugins/amazon-photos/src/lib.rs": {
+    "mtime": 1776278504.3218427,
+    "hash": "9bbd2e67afc0c260f47e902cc2a64296"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/cache.rs": {
+    "mtime": 1776867208.229332,
+    "hash": "45a5c7bea92d6d2044903d76e4ca4363"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/renderer.rs": {
+    "mtime": 1778612440.0601802,
+    "hash": "0fd66ae5356ab3e8ae4dd7a04853fec1"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/display_power.rs": {
+    "mtime": 1778567702.7391436,
+    "hash": "01abb02dcdadc504ae4c35f4b1e132a0"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/config.rs": {
+    "mtime": 1778598487.1407902,
+    "hash": "66379c3213a3d8ebebe05b6e8efa1518"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/lib.rs": {
+    "mtime": 1778597618.64955,
+    "hash": "9acca494cf6eb1503f531e2ff09d714b"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/sdl_metal_stubs.c": {
+    "mtime": 1776345599.5631292,
+    "hash": "1ca5e6e1f4a76ba9d2c49286e9fcfabb"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/osd.rs": {
+    "mtime": 1778612472.6120439,
+    "hash": "95bced0ce038aad3feea4a265b5c549b"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/main.rs": {
+    "mtime": 1778567580.1934505,
+    "hash": "ef65f4b128db8037c68645cbc013af37"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/exif_util.rs": {
+    "mtime": 1778612426.6827633,
+    "hash": "07b19230b84097a9612c84b43d3c8733"
+  },
+  "/Volumes/SSD/projects/pico-gallery/src/slideshow.rs": {
+    "mtime": 1778598091.4080951,
+    "hash": "e959a590a532bf0427cb0f1224b858bd"
+  },
+  "/Volumes/SSD/projects/pico-gallery/README.md": {
+    "mtime": 1778598545.0533369,
+    "hash": "08289891bc819ce6b191fbcedff0e0d4"
+  },
+  "/Volumes/SSD/projects/pico-gallery/architecture_docs/options/display-rendering.md": {
+    "mtime": 1776278447.951089,
+    "hash": "e07b806ceadccb256251095139fa1374"
+  },
+  "/Volumes/SSD/projects/pico-gallery/how_to_docs/opentinyphotoapp.txt": {
+    "mtime": 1776278504.312364,
+    "hash": "a49eb4f25d4ebf5bc9d16c12ac16e17f"
+  },
+  "/Volumes/SSD/projects/pico-gallery/README.md.pdf": {
+    "mtime": 1776278504.3292177,
+    "hash": "476f63354ae731038643c6bd67a040d9"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/01.png": {
+    "mtime": 1776280232.0764222,
+    "hash": "a3b390322003e4aee173efe38ffacc62"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/03.png": {
+    "mtime": 1776280232.0826278,
+    "hash": "d2e1fd4fe1c1b8d1c68a5e2f2087f06c"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/02.png": {
+    "mtime": 1776280232.0797787,
+    "hash": "dd6f6be7547080189629f26b733adb9b"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/06.png": {
+    "mtime": 1776280232.092933,
+    "hash": "c4df6e6641cfff4f4280ff61e52585d2"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/07.png": {
+    "mtime": 1776280232.0958047,
+    "hash": "0aab6a0c86e1ad9295924a99c4800c12"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/05.png": {
+    "mtime": 1776280232.0893495,
+    "hash": "ca544c029ba0c5a09ce1e2d5c28e9c02"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/04.png": {
+    "mtime": 1776280232.0862327,
+    "hash": "2a99ad838b390ac758b02bd9aa2bd5d1"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/10.png": {
+    "mtime": 1776280232.1458063,
+    "hash": "1075cbb1f46858f4bacfe4b5d38f339d"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/09.png": {
+    "mtime": 1776280232.1033785,
+    "hash": "acd9c4b627b32fe2b23814d8ce3a8104"
+  },
+  "/Volumes/SSD/projects/pico-gallery/sample_photos/08.png": {
+    "mtime": 1776280232.0992203,
+    "hash": "8c3454a94cbb3d28b509a2a4930d224a"
+  }
+}
