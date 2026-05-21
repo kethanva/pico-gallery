@@ -1,0 +1,17 @@
+[package]
+name        = "picogallery-immich"
+version     = "0.1.0"
+edition     = "2021"
+description = "Immich plugin for PicoGallery — streams photos from a self-hosted Immich server"
+license     = "MIT"
+
+[dependencies]
+picogallery-core = { workspace = true }
+anyhow           = { workspace = true }
+async-trait      = { workspace = true }
+chrono           = { workspace = true }
+log              = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tokio            = { workspace = true }
+reqwest          = { workspace = true }
