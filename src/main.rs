@@ -95,6 +95,16 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
         }
     }
 
+    #[cfg(feature = "plugin-immich")]
+    {
+        if let Some(pcfg) = cfg.plugin_config("immich") {
+            info!("Registering plugin: immich");
+            plugins.push(Box::new(
+                picogallery_immich::ImmichPlugin::new(pcfg.clone()),
+            ));
+        }
+    }
+
     plugins
 }
 
@@ -344,6 +354,43 @@ enabled = false
 
 client_id     = "YOUR_LWA_CLIENT_ID"
 client_secret = "YOUR_LWA_CLIENT_SECRET"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Immich plugin  (self-hosted photo server — LAN or remote)
+# Streams photos from an Immich server over HTTP/HTTPS — no local sync needed.
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUP
+# 1. In the Immich web UI → Account Settings → API Keys → New API Key.
+# 2. Paste the key below and set `url` to your Immich base URL.
+# 3. Optional: restrict to one album by setting `album_id`.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "immich"
+enabled = false
+
+# Base URL of the Immich server, including scheme and port. No trailing slash.
+url     = "http://immich.lan:2283"
+
+# Immich API key (x-api-key header).
+api_key = "YOUR_IMMICH_API_KEY"
+
+# Asset variant served to the slideshow:
+#   "preview"   — large preview JPEG (recommended for Pi Zero, low bandwidth)
+#   "thumbnail" — small thumbnail (fastest, lowest quality)
+#   "original"  — original file (may be heavy; use on fast LAN only)
+image_size = "preview"
+
+# Optional: only show photos from this album (Immich album UUID).
+# album_id = ""
+
+# Only display assets marked as favourite.
+# favorites_only = false
+
+# Pagination size per metadata request. Lower = less peak RAM on Pi Zero.
+# page_size = 250
+
+# Accept self-signed TLS certificates (only enable if you understand the risk).
+# skip_tls_verify = false
 "#,
         photo_dir = photo_dir_str,
     )

@@ -961,6 +961,7 @@ dependencies = [
  "picogallery-core",
  "picogallery-directory",
  "picogallery-google-photos",
+ "picogallery-immich",
  "picogallery-local",
  "picogallery-webdav",
  "sdl2",
@@ -1020,6 +1021,21 @@ dependencies = [
  "dirs",
  "log",
  "picogallery-core",
+ "tokio",
+]
+
+[[package]]
+name = "picogallery-immich"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "log",
+ "picogallery-core",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
