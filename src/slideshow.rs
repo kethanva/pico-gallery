@@ -248,6 +248,7 @@ impl Slideshow {
                                 &meta,
                                 exif_date.as_deref(),
                             );
+                            crate::osd::draw_nav_arrows(&mut rgba);
                         }
                         let result = match self.config.display.transition {
                             Transition::Cut => renderer.show_cut(&rgba),

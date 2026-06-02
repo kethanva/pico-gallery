@@ -1,987 +1,468 @@
 # PicoGallery
 
-> A very lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
+> Lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
 ![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20Zero%2F1%2F2%2F3%2F4-red)
 [![Build & Release](https://github.com/kethanva/pico-gallery/actions/workflows/release.yml/badge.svg)](https://github.com/kethanva/pico-gallery/actions/workflows/release.yml)
 
----
-
-## What's new
-
-| Version | Feature |
-|---------|---------|
-| **current** | **EXIF auto-rotation** — portrait photos taken on phones now display upright. Orientation is corrected before scaling so aspect ratio is always correct. Pure Rust (`kamadak-exif`), no C deps. |
-| **current** | **Metadata overlay (OSD)** — album, capture date, and filename shown as a subtle pill in the bottom-left corner of each photo. Disable with `show_osd = false`. |
-| **current** | **Photo ordering** — choose `shuffle` (default), `chronological`, or `newest_first` via `order` in `[display]`. |
-| **current** | **WebDAV/Nextcloud plugin** — sync photos from Nextcloud, Synology, ownCloud, or any WebDAV server. No shell tools; pure Rust. Works offline after first sync. |
-| **current** | **Display scheduling** — configure `on_time`/`off_time` to cut HDMI power at night automatically. Inactive by default; opt-in per-frame. |
-| 0.0.16 | Cross-fade, slide, and cut transitions; async prefetch; LRU disk cache |
-| 0.0.16 | Directory plugin with album support; Google Drive; Amazon Photos |
+Renders straight to the KMS/DRM framebuffer via SDL2. Runs on a Pi Zero W with ~8 MB RSS.
 
 ---
 
-## Choosing a photo source
+## Photo source plugins
 
 | Plugin | Best for | Requires |
-|--------|----------|---------|
-| **`directory`** ★ default | USB drive, local folder, NAS mount | Nothing extra |
-| **`webdav`** ★ recommended for families | Nextcloud, Synology, ownCloud — add photos from your phone | Network access |
+|---|---|---|
+| `directory` ★ default | USB drive, local folder, NAS mount | Nothing extra |
+| `webdav` | Nextcloud, Synology, ownCloud — upload from phone | Network |
+| `photoprism` | Another Pi (4/5) running PhotoPrism — AI tagging, faces, albums | Network |
 | `google-photos` | Google Drive folder | rclone |
 | `amazon-photos` | Amazon Photos library | LWA developer app |
 | `local` | Multiple root paths | Nothing extra |
 
-**TL;DR for a new frame:**
-- Easiest: copy JPEGs to an SD card or USB drive → use the `directory` plugin.
-- Best for sharing with family: set up Nextcloud on a home server or a VPS → use the `webdav` plugin; everyone uploads from their phone and the frame picks up new photos automatically.
-
 ---
 
-## Installation on Raspberry Pi
-
-### One-line installer (recommended)
-
-No Rust toolchain, no compilation — downloads the pre-built binary and configures everything automatically.
+## Install on Raspberry Pi
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/kethanva/pico-gallery/main/install.sh | bash
 ```
 
-Pin a specific version:
+Pin a version: `PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL …/install.sh)`
+Force source build: `PICOGALLERY_BUILD=1 bash <(curl -sSL …/install.sh)`
+
+Installer detects arch, downloads the pre-built binary (or builds from source if no release), installs runtime deps (`libsdl2-2.0-0`, `libdrm2`, `ca-certificates`, `rclone`), adds you to `video`/`render`/`input` groups, writes a default config to `~/.config/picogallery/config.toml`, enables the systemd service, and sets `gpu_mem=64`.
+
+After install:
 
 ```bash
-PICOGALLERY_VERSION=v0.1.0 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/pico-gallery/main/install.sh)
-```
-
-Force build from source (skips binary download):
-
-```bash
-PICOGALLERY_BUILD=1 bash <(curl -sSL https://raw.githubusercontent.com/kethanva/pico-gallery/main/install.sh)
-```
-
-**What the installer does (zero human intervention):**
-
-| Step | Action |
-|------|--------|
-| 1 | Detects architecture (`aarch64` or `armv7`) |
-| 2 | Tries to download a pre-built binary from GitHub Releases |
-| 3 | If no release exists, automatically falls back to cloning and building from source |
-| 4 | Verifies the SHA-256 checksum (download mode) |
-| 5 | Installs runtime dependencies: `libsdl2-2.0-0`, `libdrm2`, `ca-certificates`, `rclone` |
-| 6 | Installs the binary to `/usr/local/bin/picogallery` |
-| 7 | Adds your user to the `video`, `render`, and `input` groups |
-| 8 | Writes a default config to `~/.config/picogallery/config.toml` |
-| 9 | Installs and enables a systemd service (`picogallery.service`) |
-| 10 | Sets `gpu_mem=64` in `/boot/config.txt` (or `/boot/firmware/config.txt` on Bookworm) |
-
-**Install modes:**
-
-| Mode | When | What happens |
-|------|------|-------------|
-| Download (fast) | A GitHub Release with artifacts exists | Downloads ~4 MB binary, no Rust needed |
-| Build (fallback) | No release yet, or `PICOGALLERY_BUILD=1` | Installs Rust + build deps, compiles from source (~10 min on Pi 4) |
-
-After installation:
-
-```bash
-# 1. Edit your photo source
-nano ~/.config/picogallery/config.toml
-
-# 2. Test interactively (Linux console)
-SDL_VIDEODRIVER=kmsdrm picogallery
-
-# 2b. Test interactively (macOS / Linux Desktop)
-picogallery
-
-# 3. Start the service
-sudo systemctl start picogallery
-
-# 4. Watch logs
+nano ~/.config/picogallery/config.toml   # pick a plugin
+sudo systemctl restart picogallery
 sudo journalctl -u picogallery -f
-
-# 5. Reboot to apply GPU memory and group changes
-sudo reboot
+sudo reboot                              # apply gpu_mem + group changes
 ```
 
-### Uninstallation
-
-To completely remove PicoGallery from your system, run the following commands:
+### Uninstall
 
 ```bash
-# 1. Stop and remove the service
-sudo systemctl stop picogallery
-sudo systemctl disable picogallery
-sudo rm /etc/systemd/system/picogallery.service
+sudo systemctl disable --now picogallery
+sudo rm /etc/systemd/system/picogallery.service /usr/local/bin/picogallery
 sudo systemctl daemon-reload
-
-# 2. Remove the binary
-sudo rm /usr/local/bin/picogallery
-
-# 3. (Optional) Remove your configuration
-rm -rf ~/.config/picogallery
-
-# 4. (Optional) Remove sample photos / default directory
-rm -rf ~/Pictures/PicoGallery
+rm -rf ~/.config/picogallery ~/Pictures/PicoGallery   # optional
 ```
-
-Note: You can also manually revert the `gpu_mem` and `dtoverlay` changes in `/boot/config.txt` or `/boot/firmware/config.txt` if desired.
 
 ### Supported architectures
 
-| Archive | Architecture | Devices |
-|---------|-------------|---------|
-| `*-linux-aarch64.tar.gz` | 64-bit ARM | Pi Zero 2 W, Pi 3, Pi 4, Pi 5 (64-bit OS) |
-| `*-linux-armv7.tar.gz` | 32-bit ARM | Pi 2, Pi 3, Pi 4 (32-bit OS) |
+| Archive | Devices |
+|---|---|
+| `*-linux-aarch64.tar.gz` | Pi Zero 2 W, Pi 3/4/5 (64-bit OS) |
+| `*-linux-armv7.tar.gz` | Pi 2/3/4 (32-bit OS) |
 
 ---
 
-## Default plugin — `directory`
+## Plugin: `directory` (default)
 
-Out of the box PicoGallery points at `~/Pictures/PicoGallery` on the Pi. Drop any JPEG, PNG, WebP, or GIF into that folder (or a sub-folder — each sub-folder becomes an "album") and the frame picks it up on the next restart.
-
-```bash
-# Create the default folder and copy some photos
-mkdir -p ~/Pictures/PicoGallery
-scp *.jpg pi@raspberrypi.local:~/Pictures/PicoGallery/
-sudo systemctl restart picogallery
-```
-
-Sub-folders work as albums:
-
-```
-~/Pictures/PicoGallery/
-├── Vacation 2024/
-│   ├── beach.jpg
-│   └── sunset.jpg
-└── Birthday/
-    └── cake.jpg
-```
-
-To change the source folder, edit `~/.config/picogallery/config.toml`:
+Default points at `~/Pictures/PicoGallery`. Drop JPEG/PNG/WebP/GIF there; sub-folders become albums.
 
 ```toml
 [[plugins]]
-name    = "directory"
-enabled = true
-path    = "/mnt/usb/photos"   # USB drive, NAS mount, etc.
-order   = "shuffle"           # "shuffle" | "alphabetical" | "date_modified"
+name      = "directory"
+enabled   = true
+path      = "~/Pictures/PicoGallery"
+order     = "shuffle"          # shuffle | alphabetical | date_modified
+recursive = true
+# allowed_albums = ["Vacation 2024", "Family"]
+# rescan_interval_secs = 3600
+```
+
+---
+
+## Plugin: `webdav` (Nextcloud / Synology / ownCloud)
+
+Syncs photos from any WebDAV server to a local cache; serves offline. Background re-sync keeps the frame fresh. Pure Rust — no davfs2, no rclone.
+
+WebDAV URL examples:
+- Nextcloud: `https://cloud.example.com/remote.php/dav/files/USERNAME`
+- Synology DSM: `https://nas.local:5006/photo`
+- ownCloud: `https://cloud.example.com/remote.php/webdav`
+
+```toml
+[[plugins]]
+name        = "webdav"
+enabled     = true
+url         = "https://cloud.example.com/remote.php/dav/files/USERNAME"
+username    = "alice"
+password    = "your-app-password"     # use an app password, not your login
+remote_path = "/Photos"
+sync_dir    = "/tmp/picogallery-webdav"
+sync_interval_secs = 3600             # 0 = startup only
+# skip_tls_verify = true              # self-signed LAN cert
+```
+
+Upload from anywhere: Nextcloud mobile / web / desktop apps, Finder (`Go → Connect to Server`), Windows mapped network drive, or `rclone copy`.
+
+---
+
+## Plugin: `photoprism` (stream from a PhotoPrism server)
+
+Thin REST client for a [PhotoPrism](https://www.photoprism.app) server — typically a Pi 4/5 (or any always-on host) running PhotoPrism in Docker, with the Pi Zero as the display "client". No local sync and no SD-card writes: the plugin opens one session, lists photos via `GET /api/v1/photos`, and streams the smallest pre-generated thumbnail that still fills the display. RAM-cheap enough for a Pi Zero 2 W.
+
+```
+┌─────────────────┐        LAN / HTTP         ┌──────────────────────┐
+│  Pi Zero 2 W    │  ─── GET /api/v1/... ───▶  │  Pi 4/5 (or NAS/PC)  │
+│  picogallery    │  ◀── JPEG thumbnails ───   │  PhotoPrism + Docker │
+│  (this plugin)  │                            │  photo library       │
+└─────────────────┘                            └──────────────────────┘
+```
+
+### What you need
+
+| On the **server** (Pi 4/5, NAS, PC) | On the **client** (the Pi running picogallery) |
+|---|---|
+| Docker + `docker compose` | picogallery built with the `photoprism` feature (default build includes it) |
+| PhotoPrism container reachable on the LAN (default port `2342`) | Network route to the server (same LAN, or VPN) |
+| An admin user + password (or app password) | `url`, `username`, `password` in `[[plugins]]` |
+| Photos imported and **indexed** (thumbnails generated) | — |
+
+The plugin only reads pre-generated thumbnails, so the **photos must be indexed on the server first** — an un-indexed library returns zero photos.
+
+### Step 1 — Stand up the PhotoPrism server
+
+On the server machine (e.g. a Pi 4/5), create `~/photoprism/docker-compose.yml`. SQLite is fine for small/test libraries; for anything over a few thousand photos use the [official MariaDB compose](https://docs.photoprism.app/getting-started/raspberry-pi/) instead.
+
+```yaml
+# ~/photoprism/docker-compose.yml  (SQLite — simplest)
+services:
+  photoprism:
+    image: photoprism/photoprism:latest
+    container_name: photoprism
+    restart: unless-stopped
+    ports:
+      - "2342:2342"
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      PHOTOPRISM_ADMIN_USER:     "admin"
+      PHOTOPRISM_ADMIN_PASSWORD: "CHANGE-ME"      # ≥ 8 chars
+      PHOTOPRISM_AUTH_MODE:      "password"
+      PHOTOPRISM_SITE_URL:       "http://photoprism.local:2342/"
+      PHOTOPRISM_HTTP_HOST:      "0.0.0.0"        # listen on the LAN, not just localhost
+      PHOTOPRISM_HTTP_PORT:      "2342"
+      PHOTOPRISM_DATABASE_DRIVER: "sqlite"
+      PHOTOPRISM_DISABLE_TLS:    "true"           # plain HTTP on a trusted LAN
+    volumes:
+      - "./originals:/photoprism/originals"       # drop your photos here
+      - "./storage:/photoprism/storage"           # DB, cache, generated thumbnails
+```
+
+Bring it up and load photos:
+
+```bash
+cd ~/photoprism
+mkdir -p originals storage
+cp -r /path/to/your/photos/* originals/   # or import later via the web UI
+docker compose up -d
+
+# Watch it come up, then open the UI to import + index:
+docker logs -f photoprism                 # wait for "http server started"
+#   → browse http://photoprism.local:2342  (login: admin / CHANGE-ME)
+#   → Library ▸ Index  (generates the thumbnails the plugin streams)
+```
+
+`PHOTOPRISM_HTTP_HOST=0.0.0.0` is the key line — without it PhotoPrism only listens on localhost and the Pi Zero can't reach it. Confirm reachability from the client Pi:
+
+```bash
+curl -fsS http://photoprism.local:2342/api/v1/status   # → {"status":"operational"}
+```
+
+If `photoprism.local` doesn't resolve, use the server's IP (`http://192.168.1.50:2342`) everywhere instead.
+
+### Step 2 — Point picogallery at it (client config)
+
+Edit `~/.config/picogallery/config.toml` on the Pi Zero. Disable other plugins, enable this one:
+
+```toml
+[[plugins]]
+name     = "photoprism"
+enabled  = true
+url      = "http://photoprism.local:2342"   # base URL, NO trailing /api
+username = "admin"
+password = "CHANGE-ME"
+# app_password = "abcd-efgh-ijkl-mnop"   # PhotoPrism v0.10+: Settings ▸ Account ▸ Apps
+                                         #   and Devices — revocable per-device, preferred
+                                         #   over the admin password on a wall display
+
+# ── Filters (all optional, combined with AND) ──────────────────────────────
+# album      = "january-2024"            # album UID or slug
+# favorites  = true                      # only favourites
+# quality    = 3                         # 1=low … 5=excellent (drops lower)
+# country    = "fr"                      # ISO country code
+# year       = 2024
+# media_type = "image"                   # image | raw | live | animated | video
+# query      = "label:beach keyword:sunset"  # raw PhotoPrism Q-language (appended)
+
+# ── Ordering / paging ──────────────────────────────────────────────────────
+# order    = "newest"                    # newest | oldest | added | name | random | similar
+# per_page = 100                         # photos fetched per request (1–1000)
+
+# ── Thumbnail size — saves Pi Zero RAM ─────────────────────────────────────
+# Sizes (longest edge px): tile_500, fit_720, fit_1280, fit_1920, fit_2048,
+#                          fit_2560, fit_3840, fit_4096, fit_7680
+# max_thumb      = "fit_1920"            # cap requested size at 1920px → ~8 MB peak at 1080p
+# allow_original = true                  # fall back to /dl/<hash> when no thumb is big enough
+
+# ── Transport ──────────────────────────────────────────────────────────────
+# skip_tls_verify      = false           # true only for self-signed HTTPS on the LAN
+# request_timeout_secs = 30
+```
+
+Restart and watch the log:
+
+```bash
+sudo systemctl restart picogallery
+sudo journalctl -u picogallery -f
+#   look for:  PhotoPrism: logged in as admin (session abcd1234…)
+```
+
+### How auth + fetching works
+
+- **Login:** `POST /api/v1/session` with the username/password (or app password). The returned session ID plus preview/download tokens are cached and reused; the plugin auto-re-logs in on an HTTP 401 and sends `DELETE /api/v1/session/{id}` on shutdown.
+- **Listing:** `GET /api/v1/photos?count=&offset=&order=&merged=true&q=<filters>` — typed filters above are translated to PhotoPrism's `key:value` Q-syntax and merged with any raw `query`.
+- **Image bytes:** thumbnail via `GET /api/v1/t/{hash}/{preview_token}/{size}`, or the original via `GET /api/v1/dl/{hash}?t={download_token}` when `allow_original = true` and no thumbnail is large enough. Video-only items are skipped.
+
+### Pi Zero RAM profile
+
+The plugin picks the smallest thumbnail whose longest edge ≥ the display, capped by `max_thumb`:
+
+| Display | Thumbnail picked | Wire bytes | Peak decoded |
+|---|---|---|---|
+| 720×480   | `tile_500` | ~80 KB  | ~1 MB |
+| 1280×720  | `fit_1280` | ~200 KB | ~3.6 MB |
+| 1920×1080 | `fit_1920` | ~500 KB | ~8 MB |
+| 3840×2160 | `fit_3840` | ~1.5 MB | ~32 MB |
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `login failed (HTTP 401)` | Wrong `username`/`password`, or `PHOTOPRISM_AUTH_MODE` isn't `password`. |
+| Connection refused / timeout | Server bound to localhost — set `PHOTOPRISM_HTTP_HOST=0.0.0.0`; check firewall/port `2342`; verify with the `curl …/status` above. |
+| Logs in but **no photos appear** | Library not indexed — run **Library ▸ Index** in the PhotoPrism UI; or filters too narrow (`album`/`year`/`query`). |
+| `not a recognised image format` | Item is video-only or thumbnails aren't generated yet — re-index. |
+| TLS / certificate errors | Self-signed LAN cert → set `skip_tls_verify = true` (LAN only). |
+
+> **Want a throwaway server to test against first?** `dev/run-photoprism-local.sh` boots PhotoPrism on `http://localhost:2342` (admin / insecure), seeds and indexes a few photos, writes a matching config, and launches picogallery. See [Run locally](#run-locally-macos--linux-dev-box) below.
+
+---
+
+## Plugin: `google-photos` (Google Drive)
+
+```toml
+[[plugins]]
+name            = "google-photos"
+enabled         = true
+sync_dir        = "/tmp/picogallery-gdrive"
+drive_folder_id = ""        # paste a Drive folder ID, or "" for root
+# max_transfer = "500"      # MB cap per sync run
+```
+
+First run opens a browser sign-in (`drive.readonly` scope, no Google Cloud project needed). Token saved to `~/.config/picogallery/rclone-gdrive.conf` and reused.
+
+> **Google Photos Library API was removed on 2025-03-31.** This plugin uses **Google Drive** instead, which is unrestricted. If your photos are only in Google Photos and not in Drive, export with [Takeout](https://takeout.google.com) and use the `local` plugin.
+
+---
+
+## Plugin: `amazon-photos`
+
+```toml
+[[plugins]]
+name          = "amazon-photos"
+enabled       = true
+client_id     = "YOUR_LWA_CLIENT_ID"
+client_secret = "YOUR_LWA_CLIENT_SECRET"
+```
+
+Requires a Login with Amazon developer app — see developer.amazon.com.
+
+---
+
+## Plugin: `local` (multiple paths)
+
+```toml
+[[plugins]]
+name      = "local"
+enabled   = true
+paths     = ["/mnt/usb/photos", "~/Pictures"]
 recursive = true
 ```
 
 ---
 
-## WebDAV / Nextcloud plugin
-
-The WebDAV plugin lets the frame pull photos directly from any WebDAV server — Nextcloud, ownCloud, Synology DSM, or a plain Apache/nginx WebDAV share. Photos are synced to local disk on startup and served offline. The background sync loop fetches new photos hourly so the frame stays current without any manual intervention.
-
-This is the same model used by [photOS](https://github.com/avanc/photOS) (davfs2 + rsync) but implemented entirely in Rust — no shell tools, no mounted filesystems, no external binaries.
-
-### End-to-end: Nextcloud setup
-
-**On the server (one time):**
-
-1. Install Nextcloud on a home server, VPS, or NAS. The [All-in-One installer](https://github.com/nextcloud/all-in-one) takes about 10 minutes on a Debian/Ubuntu box.
-2. Create a user for the frame, or use an existing account.
-3. In Nextcloud → **Settings → Security → Devices & sessions**, generate an **App Password** — use that instead of your main password.
-
-**Finding your WebDAV URL:**
-
-In Nextcloud, go to **Files → ⋯ (top-right) → WebDAV**. The URL looks like:
-
-```
-https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME
-```
-
-For Synology DSM it is:
-
-```
-https://nas.local:5006/photo          # DSM Photo Station
-https://nas.local:5006/home/Photos    # DSM personal folder
-```
-
-For ownCloud it is:
-
-```
-https://cloud.example.com/remote.php/webdav
-```
-
-**Configure PicoGallery:**
-
-```toml
-[[plugins]]
-name     = "webdav"
-enabled  = true
-
-# Full WebDAV endpoint URL (required)
-url      = "https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME"
-
-username = "your-username"
-password = "your-app-password"    # app password, not your Nextcloud login password
-
-# Sub-folder on the server to sync (default: "/" — everything under url)
-remote_path = "/Photos"
-
-# Local cache on the Pi (created automatically)
-sync_dir = "/tmp/picogallery-webdav"
-
-# Re-sync every hour in the background (0 = startup only)
-sync_interval_secs = 3600
-
-# Uncomment for self-signed certs (local NAS without a valid cert)
-# skip_tls_verify = true
-```
-
-Restart the service:
-
-```bash
-sudo systemctl restart picogallery
-sudo journalctl -u picogallery -f   # watch the initial sync progress
-```
-
-### How to transfer photos to the frame
-
-Once the WebDAV plugin is running, any of these methods add photos to the frame automatically on the next sync:
-
-| Method | Instructions |
-|--------|-------------|
-| **Nextcloud mobile app** | Install on iOS/Android → sign in → upload to the `Photos` folder |
-| **Nextcloud web** | Open `cloud.example.com` in a browser → drag files into the `Photos` folder |
-| **Nextcloud desktop sync** | Install on any PC/Mac; add the `Photos` folder to your sync |
-| **WebDAV from Finder (macOS)** | Go → Connect to Server → paste your WebDAV URL → drag photos in |
-| **WebDAV from Windows** | Map a network drive using the WebDAV URL → copy photos in |
-| **rclone (advanced)** | `rclone copy ~/Pictures/ nextcloud:Photos/` |
-
-New photos appear on the frame within `sync_interval_secs` (default 1 hour) without touching the Pi.
-
-### Offline operation
-
-After the first sync, the frame shows photos from the local `sync_dir` cache. A network outage — or taking the frame to a location with no WiFi — does not interrupt the slideshow. New photos are pulled on the next successful connection.
-
-### Security notes
-
-- Use an **app password** (Nextcloud → Settings → Security → App passwords), not your main account password. App passwords can be revoked individually if the Pi is lost or stolen.
-- Set file permissions on the config so only your user can read it: `chmod 600 ~/.config/picogallery/config.toml`.
-- For an internal NAS with a self-signed certificate, set `skip_tls_verify = true`. Do not use this option for servers reachable over the internet.
-
----
-
-## Display scheduling
-
-Keep the screen off at night without touching the Pi. Both fields are required; omitting them (the default) keeps the display on at all times.
+## Display + scheduling
 
 ```toml
 [display]
 slide_duration_secs = 10
-transition          = "fade"
+transition          = "fade"     # cut | fade | slide_left | slide_right
+transition_ms       = 800        # 0 = instant
+fill_screen         = false      # true = crop-to-fill; false = letterbox
+fps                 = 15         # cap; lower = less CPU on Pi Zero
+# width  = 1920                  # 0 = auto-detect
+# height = 1080
+order               = "shuffle"  # shuffle | chronological | newest_first
+show_osd            = true       # metadata pill (album / date / filename) + nav arrows
 
-# Optional: automatic HDMI on/off schedule (local time, 24-hour HH:MM)
-# Both fields must be set to activate scheduling.
-on_time  = "07:00"   # display turns on at 7 am
-off_time = "22:00"   # display turns off at 10 pm
+# Optional HDMI on/off schedule (local time HH:MM, both required to activate)
+# on_time  = "07:00"
+# off_time = "22:00"             # overnight windows supported (e.g. 20:00 → 08:00)
+
+# Memory safety — photos exceeding these are skipped with WARN, no crash
+# max_image_mb   = 20            # raw file cap (0 = built-in 50 MB default)
+# max_megapixels = 16            # decoded pixel cap (0 = unlimited)
+
+[cache]
+max_mb         = 256
+prefetch_count = 3               # ≤3 on Pi Zero
+# dir = "/tmp/picogallery-cache"
 ```
 
-**What happens when the schedule fires:**
+Schedule fires `vcgencmd display_power 0/1` on Pi to cut HDMI power. On non-Pi Linux/macOS the call is a no-op; the black frame is the only effect.
 
-1. At `off_time` the renderer blanks the screen to solid black.
-2. On Raspberry Pi, `vcgencmd display_power 0` is called — the HDMI signal is cut so the monitor enters standby and draws near-zero power.
-3. At `on_time` the HDMI signal is restored (`vcgencmd display_power 1`) and the slideshow resumes immediately with the next photo.
+**Navigation:** `→`/`Space` next, `←` prev, `P` pause, `Q`/`Esc` quit. Left mouse click goes back, right click goes forward. When `show_osd = true`, ◄ and ► arrow pills are rendered on the left and right screen edges as a visual hint. Set `show_osd = false` to hide all overlays (metadata pill + arrows).
 
-On non-Pi Linux and macOS the HDMI call is a silent no-op and the black screen is the sole power-saving mechanism (useful for development/testing).
-
-**Overnight windows** (display on at night, off during the day) are also supported:
-
-```toml
-on_time  = "20:00"
-off_time = "08:00"   # active 20:00–08:00, off 08:00–20:00
-```
-
-Times are interpreted in the system's **local time zone**.
+See `config.example.toml` for every key with inline comments.
 
 ---
 
-## Features
-
-- **No X11 / no desktop** — renders directly to the KMS/DRM framebuffer via SDL2.
-- **Plugin architecture** — Google Drive, Amazon Photos, local directory/filesystem, WebDAV/Nextcloud; add your own with one Rust trait.
-- **EXIF auto-rotation** — portrait photos from phones display upright automatically. Orientation is corrected before the scaler runs so aspect ratio is always right.
-- **Metadata overlay (OSD)** — album, capture date, and filename in the bottom-left corner. Toggle with `show_osd = true/false`. Uses a built-in bitmap font — no system fonts needed.
-- **Photo ordering** — `shuffle` (default), `chronological` (oldest first), or `newest_first`. Set via `order` in `[display]`.
-- **WebDAV / Nextcloud plugin** — sync from Nextcloud, Synology, ownCloud, or any WebDAV server. Pure Rust. Works offline after first sync.
-- **Display scheduling** — configure `on_time`/`off_time` to cut HDMI power automatically. Opt-in; off by default.
-- **Google Drive via rclone** — `drive.readonly` scope, no Google Cloud project or API key needed.
-- **One-time sign-in** — browser opens automatically on first run; token is saved and reused forever.
-- **Disk cache with LRU eviction** — photos survive reboots and WiFi outages.
-- **Background prefetch** — next N photos are fetched while the current one displays.
-- **Cross-fade / slide / cut transitions** — configurable in `config.toml`.
-- **Keyboard control** — `→`/`Space` next, `←` prev, `P` pause, `Q`/`Esc` quit.
-
----
-
-## Hardware requirements
+## Hardware
 
 | Device | Notes |
 |---|---|
-| Raspberry Pi Zero W / 2W | Tested; use `--jobs 1` when cross-compiling |
-| Raspberry Pi 2 / 3 / 4 | Full speed |
+| Pi Zero W / 2W | Tested; `--jobs 1` when cross-compiling |
+| Pi 2/3/4/5 | Full speed |
 
-**Required**: display connected before boot (HDMI or DSI).
-**Not required**: keyboard, mouse, X server, desktop environment.
+**Required:** display connected before boot (HDMI or DSI). **Not required:** keyboard, mouse, X, desktop.
 
----
-
-## System dependencies
-
-```
-libsdl2-2.0-0     SDL2 with KMS/DRM backend
-libdrm2           DRM display probing (finds correct /dev/dri/cardN on Pi 4/5)
-rclone            Google Drive sync only (not needed for WebDAV or local plugins)
-ca-certificates   HTTPS root certs (needed for WebDAV and Google Drive)
-```
+System deps: `libsdl2-2.0-0`, `libdrm2`, `ca-certificates` (HTTPS), `rclone` (Google Drive only).
 
 ---
 
-## Quick start
+## Pi Zero memory tips
 
-### Local photos (simplest)
+Photos are decoded → scaled → EXIF-rotated → displayed. Peak RAM ≈ `MP × 4 MB + ~8 MB display copy`.
 
-```bash
-# 1. Create the photo folder
-mkdir -p ~/Pictures/PicoGallery
-
-# 2. Copy photos in (from a PC over SSH, or from a USB drive)
-scp /path/to/photos/*.jpg pi@raspberrypi.local:~/Pictures/PicoGallery/
-
-# 3. Config is already set up by the installer — just start
-sudo systemctl start picogallery
-```
-
-### Nextcloud / WebDAV (recommended for families)
-
-```bash
-# 1. Create or edit config
-nano ~/.config/picogallery/config.toml
-```
-
-Minimal config:
-
-```toml
-[display]
-slide_duration_secs = 10
-transition          = "fade"
-
-[cache]
-max_mb = 256
-
-[[plugins]]
-name        = "webdav"
-enabled     = true
-url         = "https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME"
-username    = "your-username"
-password    = "your-app-password"
-remote_path = "/Photos"
-```
-
-```bash
-# 2. Restart and watch the initial sync
-sudo systemctl restart picogallery
-sudo journalctl -u picogallery -f
-```
-
-### Google Drive
-
-```toml
-[display]
-slide_duration_secs = 10
-transition          = "fade"
-
-[cache]
-max_mb = 256
-
-[[plugins]]
-name            = "google-photos"
-enabled         = true
-sync_dir        = "/tmp/picogallery-gdrive"
-drive_folder_id = ""   # paste a Drive folder ID, or leave blank for root
-```
-
-First run opens a browser for a one-time sign-in. Token saved at `~/.config/picogallery/rclone-gdrive.conf`.
-
-### Enable on boot (Pi)
-
-```bash
-sudo systemctl enable --now picogallery
-```
-
----
-
-## Configuration reference
-
-```toml
-# ─────────────────────────────────────────────────────────────────────────────
-# Display
-# ─────────────────────────────────────────────────────────────────────────────
-[display]
-slide_duration_secs = 10      # seconds per photo
-transition          = "fade"  # "cut" | "fade" | "slide_left" | "slide_right"
-transition_ms       = 800     # transition duration in ms (0 = instant)
-fill_screen         = false   # true=crop-to-fill, false=letterbox
-fps                 = 15      # max FPS (lower = less CPU on Pi Zero)
-# width  = 1920               # force resolution (0 = auto-detect)
-# height = 1080
-
-# Optional display schedule — both required to activate (default: always on)
-# on_time  = "07:00"          # display on  at 07:00 local time
-# off_time = "22:00"          # display off at 22:00 local time
-
-# Photo order: "shuffle" (default) | "chronological" | "newest_first"
-# order = "shuffle"
-
-# Metadata pill in bottom-left: album, date, filename (default: true)
-# show_osd = true
-
-# Memory-safety limits — skip photos that exceed these thresholds (WARN log, no crash)
-# max_image_mb   = 20   # raw file size cap in MB  (0 = built-in 50 MB default)
-# max_megapixels = 16   # decoded pixel cap in MP  (0 = no limit)
-#                       # peak RAM ≈ (MP × 4 MB) + 8 MB display copy
-#                       # 12 MP → ~56 MB peak; 24 MP → ~104 MB peak
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache
-# ─────────────────────────────────────────────────────────────────────────────
-[cache]
-max_mb         = 256   # disk cache ceiling in MB
-prefetch_count = 3     # photos to prefetch ahead (keep ≤ 3 on Pi Zero)
-# dir = "/tmp/picogallery-cache"   # override cache location
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Directory plugin  ★ DEFAULT — enabled out of the box
-# ─────────────────────────────────────────────────────────────────────────────
-[[plugins]]
-name      = "directory"
-enabled   = true
-
-path      = "~/Pictures/PicoGallery"   # root folder; ~ expands to $HOME
-order     = "shuffle"                  # "shuffle" | "alphabetical" | "date_modified"
-recursive = true                       # include sub-folders as albums
-
-# Limit to specific sub-folders (album names). Empty = show all albums.
-# allowed_albums = ["Vacation 2024", "Family"]
-
-# Re-scan every N seconds; 0 = startup only (default)
-# rescan_interval_secs = 3600
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WebDAV / Nextcloud plugin
-# ─────────────────────────────────────────────────────────────────────────────
-# [[plugins]]
-# name     = "webdav"
-# enabled  = true
-# url      = "https://cloud.example.com/remote.php/dav/files/USERNAME"
-# username = "alice"
-# password = "your-app-password"
-# remote_path      = "/Photos"               # default "/"
-# sync_dir         = "/tmp/picogallery-webdav"
-# sync_interval_secs = 3600                  # 0 = startup only
-# skip_tls_verify  = false                   # true for self-signed certs
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Google Drive plugin (requires rclone)
-# ─────────────────────────────────────────────────────────────────────────────
-# [[plugins]]
-# name            = "google-photos"
-# enabled         = true
-# sync_dir        = "/tmp/picogallery-gdrive"
-# drive_folder_id = ""          # Drive folder ID, or "" for root
-# max_transfer    = "500"       # MB cap per sync run
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Amazon Photos plugin
-# ─────────────────────────────────────────────────────────────────────────────
-# [[plugins]]
-# name          = "amazon-photos"
-# enabled       = true
-# client_id     = "YOUR_LWA_CLIENT_ID"
-# client_secret = "YOUR_LWA_CLIENT_SECRET"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Local filesystem plugin (multiple root paths)
-# ─────────────────────────────────────────────────────────────────────────────
-# [[plugins]]
-# name      = "local"
-# enabled   = true
-# paths     = ["/mnt/usb/photos", "~/Pictures"]
-# recursive = true
-```
-
----
-
-## Google Photos — API status (March 2025)
-
-> **Google removed `photoslibrary.readonly` on March 31, 2025.**
-> All read access to existing photo libraries via the Google Photos API is permanently blocked.
-> This affects the Photos Library API, rclone's Google Photos backend, and all third-party tools.
-
-### Recommended: Use Google Drive
-
-PicoGallery's `google-photos` plugin now uses **Google Drive** (`drive.readonly`) as its backend, which is fully accessible and unrestricted.
-
-**If your photos are backed up to Google Drive** (via Google Drive for Desktop / Backup & Sync):
-
-1. Open [drive.google.com](https://drive.google.com) and navigate to the folder containing your photos
-2. Copy the folder ID from the URL: `drive.google.com/drive/folders/<FOLDER_ID>`
-3. Set `drive_folder_id` in `config.toml`
-
-```toml
-[[plugins]]
-name             = "google-photos"
-enabled          = true
-sync_dir         = "/tmp/picogallery-gdrive"
-drive_folder_id  = "1REc7j3GtIIzF25ARuhqnAZsayu3fRogb"   # your folder ID
-```
-
-**If your photos are only in Google Photos** (not in Drive):
-
-Use Google Takeout to export them once, then use the local plugin:
-
-1. Go to **[takeout.google.com](https://takeout.google.com)**
-2. Deselect all → select only **Google Photos** → Next step → Create export
-3. Download and extract the zip — you get a folder of JPEGs organised by date
-4. Copy to your Pi and configure:
-
-```toml
-[[plugins]]
-name    = "local"
-enabled = true
-paths   = ["/mnt/photos/Google Photos"]
-```
-
-### API status table
-
-| Approach | Status (2026) |
-|---|---|
-| Google Photos Library API | Blocked since March 2025 |
-| rclone Google Photos backend | Blocked (uses same API) |
-| **Google Drive plugin (this app)** | **Works — `drive.readonly`, unrestricted** |
-| **Google Takeout + local plugin** | **Works — recommended if photos not in Drive** |
-| **WebDAV/Nextcloud plugin** | **Works — best for self-hosted photo sharing** |
-
----
-
-## Running locally for development
-
-The app runs on macOS and Linux without a Pi. SDL2 uses its native backend (Cocoa/Metal on macOS). KMS/DRM is compiled out on non-Linux platforms.
-
-### Prerequisites
-
-**macOS**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-brew install rclone cmake
-```
-
-**Linux**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential rclone
-```
-
-### Build
-
-```bash
-# Full build (all plugins)
-cargo build
-
-# Minimal build — directory plugin only (no rclone or network needed)
-cargo build --no-default-features --features plugin-directory
-
-# WebDAV only (no rclone needed)
-cargo build --no-default-features --features plugin-webdav,plugin-directory
-```
-
-### Test with local photos
-
-```bash
-mkdir -p /tmp/picogallery-test-photos
-
-python3 - << 'EOF'
-from PIL import Image, ImageDraw
-photos = [
-    ("photo1.jpg", (220, 60,  60),  "Photo 1 — Red"),
-    ("photo2.jpg", (60,  140, 220), "Photo 2 — Blue"),
-    ("photo3.jpg", (60,  180, 80),  "Photo 3 — Green"),
-    ("photo4.jpg", (200, 160, 40),  "Photo 4 — Yellow"),
-    ("photo5.jpg", (140, 60,  200), "Photo 5 — Purple"),
-]
-for filename, colour, label in photos:
-    img = Image.new("RGB", (1280, 720), colour)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([340, 260, 940, 460], fill=(255, 255, 255))
-    draw.text((640, 360), label, fill=(30, 30, 30), anchor="mm")
-    img.save(f"/tmp/picogallery-test-photos/{filename}", "JPEG", quality=90)
-    print(f"Created {filename}")
-EOF
-```
-
-Write a local-only config:
-
-```bash
-cat > ~/.config/picogallery/config.toml << 'EOF'
-[display]
-slide_duration_secs = 4
-transition = "fade"
-fps = 30
-
-[cache]
-max_mb = 64
-prefetch_count = 2
-
-[[plugins]]
-name    = "directory"
-enabled = true
-path    = "/tmp/picogallery-test-photos"
-order   = "alphabetical"
-EOF
-```
-
-### Run (macOS)
-
-```bash
-SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" | head -1 | xargs dirname)
-DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery --config ~/.config/picogallery/config.toml
-```
-
-### Test display scheduling locally
-
-Add schedule fields to the config and check the log output:
-
-```toml
-[display]
-on_time  = "00:00"   # always on during testing
-off_time = "00:01"   # flip this to the next minute to watch the off-edge fire
-```
-
----
-
-## Project structure
-
-```
-picogallery/
-├── Cargo.toml                    # workspace root + main crate (lib + bin)
-├── Cargo.lock
-├── install.sh                    # one-shot Pi installer
-├── config.example.toml           # fully annotated config template
-├── core/                         # picogallery-core: shared plugin trait
-│   ├── Cargo.toml
-│   └── src/lib.rs                # PhotoPlugin trait, PhotoMeta, PluginConfig
-├── src/
-│   ├── lib.rs                    # re-exports core + all modules
-│   ├── main.rs                   # binary entry point + plugin registry
-│   ├── config.rs                 # TOML config structs + display schedule logic
-│   ├── cache.rs                  # LRU disk image cache
-│   ├── exif_util.rs              # EXIF orientation reading + auto-rotation
-│   ├── osd.rs                    # metadata overlay (album / date / filename)
-│   ├── renderer.rs               # SDL2 / KMS-DRM renderer + transitions
-│   ├── display_power.rs          # vcgencmd HDMI power control (Linux/Pi)
-│   └── slideshow.rs              # async slideshow engine + schedule enforcement
-└── plugins/
-    ├── webdav/                   # WebDAV/Nextcloud plugin (NEW)
-    ├── google-photos/            # Google Drive plugin (drive.readonly via rclone)
-    ├── amazon-photos/            # Amazon Photos via LWA
-    ├── directory/                # Directory plugin (default; album support)
-    └── local/                    # Local filesystem scanner (multiple paths)
-```
-
----
-
-## Why Rust? Why not Python?
-
-| | **Rust (chosen)** | Python |
+| Source | Decoded RGBA | Peak |
 |---|---|---|
-| RSS on Pi Zero | ~8 MB | ~60–120 MB |
-| Binary size | ~4 MB stripped | N/A (interpreter) |
-| CPU during decode | ~40% one core | ~90% one core |
-| Startup time | < 0.5 s | 2–5 s |
-| Packages installed | `libsdl2` + `rclone` | python3, pip, 15+ wheels |
-| GC pauses during fade | None | Yes |
+| 12 MP | 48 MB | ~56 MB |
+| 24 MP | 96 MB | ~104 MB |
+| 48 MP | 192 MB | ~200 MB |
+
+Pi Zero W has 512 MB shared with the GPU. With `gpu_mem=64` (installer default) ~448 MB is free. Recommended lean config:
+
+```toml
+[display]
+transition     = "cut"
+transition_ms  = 0
+fps            = 10
+show_osd       = false
+max_image_mb   = 20
+max_megapixels = 16
+
+[cache]
+prefetch_count = 2
+max_mb         = 128
+```
+
+For PhotoPrism, set `max_thumb = "fit_1920"`. For WebDAV, raise `sync_interval_secs` to 7200 so syncs do not fight the renderer.
 
 ---
 
-## Architecture overview
+## Run locally (macOS / Linux dev box)
 
-```
-config.toml
-    │
-    ├─ [display] slide_duration, transition, schedule (on_time/off_time)
-    └─ [[plugins]] ...
-              │
-              ▼
-Plugin registry
-    ├── DirectoryPlugin   (local folder + album support)        ← default
-    ├── WebDavPlugin      (Nextcloud/Synology/ownCloud → disk)  ← new
-    ├── GooglePhotosPlugin(Google Drive via rclone → disk)
-    ├── AmazonPhotosPlugin(Amazon Photos API)
-    └── LocalPlugin       (multi-path filesystem scan)
-              │  dyn PhotoPlugin
-              ▼
-Slideshow engine
-    ├─ build_queue(): list photos from all enabled plugins, apply order (shuffle / chrono / newest)
-    ├─ display_loop():
-    │   ├─ poll SDL2 events (Quit / Next / Prev / Pause)
-    │   ├─ check display schedule → if off: black frame + vcgencmd display_power 0
-    │   ├─ prefetch loop: fetch → disk cache → decode → EXIF-rotate → scale → RgbaImage
-    │   ├─ OSD: stamp album / date / filename pill onto RgbaImage (if show_osd = true)
-    │   └─ transition: Cut / Fade / SlideLeft / SlideRight
-    └─ cache flush on exit
-              │
-              ▼
-display_power module (Linux/Pi only)
-    └─ vcgencmd display_power 0/1  →  HDMI on/off at schedule edges
-              │
-              ▼
-Renderer (SDL2, SDL_VIDEODRIVER=kmsdrm on Linux)
-    ├─ DRM probe (Linux only, startup once)
-    │   └─ scans /dev/dri/card0..3 via drm crate → finds connected display
-    └─ SDL2 canvas → present → /dev/dri/cardN → HDMI out
+Runs on macOS and Linux without a Pi. SDL2 uses Cocoa/Metal on macOS; KMS/DRM is compiled out on non-Linux.
+
+```bash
+# macOS
+brew install sdl2 pkg-config rclone cmake
+# Linux
+sudo apt-get install -y libsdl2-dev pkg-config cmake clang build-essential rclone
+
+cargo build                                                          # all plugins
+cargo build --no-default-features --features plugin-directory        # minimal
+cargo test --workspace
 ```
 
-### SDL2 + DRM probe vs raw DRM
+### Option 1 — one-shot directory runner (`./run.sh`)
 
-The Pi's VC4 GPU does not support DRM dumb buffers (`DRM_CAP_DUMB_BUFFER=0`).
-Raw DRM would require GBM+EGL. SDL2's KMS backend already uses GBM+EGL internally
-and is well-tested on Pi. The `drm` crate is used only to probe which card is active.
+Builds, runs unit tests, generates 350 test photos under `/tmp/picogallery-e2e/`, writes a config pointing at them, and launches the binary. Flags: `--no-launch`, `--photos /path/to/your/library`.
 
-| Approach | Runtime deps | Works on VC4 | Complexity |
-|---|---|---|---|
-| Raw DRM dumb buffers | libdrm2 | No | High |
-| Raw DRM + GBM + EGL | libdrm2 libgbm libEGL | Yes | Very high |
-| **SDL2 + DRM probe (chosen)** | **libsdl2 libdrm2** | **Yes** | **Low** |
+```bash
+./run.sh                       # test fixtures
+./run.sh --photos ~/Pictures   # your own library
+```
+
+### Option 2 — local PhotoPrism stack (`dev/run-photoprism-local.sh`)
+
+Boots a PhotoPrism container on `http://localhost:2342` (admin / insecure), seeds a few test JPEGs, runs plugin tests, writes a config that uses the `photoprism` plugin, and launches picogallery.
+
+```bash
+dev/run-photoprism-local.sh                       # bring up Docker + run
+dev/run-photoprism-local.sh --no-launch           # stack + config + build only
+dev/run-photoprism-local.sh --down                # stop the stack
+dev/run-photoprism-local.sh --url http://pi.local:2342 --user admin --pass secret
+                                                  # point at an existing server
+```
+
+Requires Docker + `docker compose` for the default mode. The compose file lives in `dev/photoprism/`; photo originals persist in `dev/photoprism/originals/`, PhotoPrism DB/cache in `dev/photoprism/storage/` (both gitignored).
+
+### Option 3 — hand-rolled
+
+```bash
+mkdir -p /tmp/test-photos          # drop a few JPEGs here
+cargo run -- --generate-config     # writes ~/.config/picogallery/config.toml
+$EDITOR ~/.config/picogallery/config.toml
+cargo run -- --config ~/.config/picogallery/config.toml --log-level debug
+```
 
 ---
 
 ## Writing a new plugin
 
-1. Create `plugins/my-source/Cargo.toml`:
+1. `plugins/my-source/Cargo.toml` — depend on `picogallery-core`, `anyhow`, `async-trait`, `tokio`.
+2. Implement `PhotoPlugin` (see `core/src/lib.rs` for the trait).
+3. Root `Cargo.toml`: add to `[workspace] members`, add optional dep, add `plugin-my-source` feature.
+4. `src/main.rs::build_plugins()`: register behind `#[cfg(feature = "plugin-my-source")]`.
 
-```toml
-[package]
-name    = "picogallery-my-source"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-picogallery-core = { workspace = true }
-anyhow           = { workspace = true }
-async-trait      = { workspace = true }
-log              = { workspace = true }
-tokio            = { workspace = true }
-```
-
-2. Implement `PhotoPlugin` in `plugins/my-source/src/lib.rs`:
-
-```rust
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
-use async_trait::async_trait;
-
-pub struct MyPlugin;
-
-#[async_trait]
-impl PhotoPlugin for MyPlugin {
-    fn name(&self) -> &str { "my-source" }
-
-    async fn init(&mut self, _cfg: &PluginConfig) -> anyhow::Result<()> { Ok(()) }
-    async fn auth_status(&self) -> AuthStatus { AuthStatus::Authenticated }
-    async fn authenticate(&mut self) -> anyhow::Result<AuthStatus> {
-        Ok(AuthStatus::Authenticated)
-    }
-    async fn refresh_auth(&mut self) -> anyhow::Result<()> { Ok(()) }
-
-    async fn list_photos(&self, limit: usize, offset: usize) -> anyhow::Result<Vec<PhotoMeta>> {
-        Ok(vec![])
-    }
-
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> anyhow::Result<Vec<u8>> {
-        Ok(vec![])
-    }
-}
-```
-
-3. Add to root `Cargo.toml`:
-
-```toml
-# [workspace] members:
-"plugins/my-source"
-
-# [dependencies]:
-picogallery-my-source = { path = "plugins/my-source", optional = true }
-
-# [features]:
-plugin-my-source = ["dep:picogallery-my-source"]
-```
-
-4. Register in `src/main.rs` `build_plugins()`:
-
-```rust
-#[cfg(feature = "plugin-my-source")]
-if let Some(pcfg) = cfg.plugin_config("my-source") {
-    plugins.push(Box::new(picogallery_my_source::MyPlugin::new(pcfg.clone())));
-}
-```
+Existing plugins under `plugins/` are the reference implementations — `directory` is the simplest, `photoprism` shows REST + session auth, `webdav` shows background sync.
 
 ---
 
-## Memory management
-
-### How photos are processed
-
-Every photo goes through this pipeline once per display interval:
+## Project layout
 
 ```
-raw bytes (JPEG/PNG)
-  → decode to RGBA             peak = raw bytes + decoded RGBA
-  → scale to display size      peak = decoded RGBA + display copy (~8 MB)
-  → EXIF-rotate display copy   peak = display copy × 2 (~16 MB)
-  → OSD overlay (if enabled)   in-place, no extra allocation
-  → transition / display
+picogallery/
+├── core/          picogallery-core: PhotoPlugin trait, PhotoMeta, PluginConfig
+├── src/           binary: config, cache, renderer, slideshow, osd, exif_util,
+│                  display_power, main (plugin registry)
+└── plugins/
+    ├── directory/    default; album support
+    ├── local/        multi-path filesystem
+    ├── webdav/       Nextcloud/Synology/ownCloud → local sync
+    ├── photoprism/   PhotoPrism REST client (streaming, thumbnail-aware)
+    ├── google-photos/  Google Drive via rclone
+    └── amazon-photos/  Amazon Photos via LWA
 ```
 
-The dominant cost is the decode step. Peak RAM for the whole pipeline:
-
-| Source resolution | Decoded RGBA | Peak RAM |
-|-------------------|-------------|---------|
-| 8 MP  (4000×2000) | 32 MB       | ~40 MB  |
-| 12 MP (4032×3024) | 48 MB       | ~56 MB  |
-| 24 MP (6000×4000) | 96 MB       | ~104 MB |
-| 48 MP (8000×6000) | 192 MB      | ~200 MB |
-
-> **Note:** PicoGallery scales first, then rotates the small display-sized
-> image (~8 MB).  Pre-scale rotation was removed in favour of this approach
-> because it doubled peak RAM (full-res + full-res-copy before scaling).
-
-### Configurable safety limits
-
-Both limits are checked before decoding. Photos that exceed a limit are **skipped with a WARN log** — the slideshow continues with the next photo, no crash.
-
-```toml
-[display]
-# Maximum raw file size before decode is attempted.
-# 0 = use built-in default of 50 MB.
-max_image_mb = 20
-
-# Maximum decoded pixel count (width × height / 1 000 000).
-# 0 = no limit.
-max_megapixels = 16
-```
-
-### Pi Zero recommendations
-
-Pi Zero W has 512 MB RAM; with `gpu_mem=64` set by the installer, about 448 MB is available to the OS + process. The display copy (~8 MB at 1080p) and prefetch queue add on top of each photo's decode peak.
-
-```toml
-[display]
-transition     = "cut"    # no fade animation — saves CPU
-transition_ms  = 0
-fps            = 10
-fill_screen    = false    # letterbox is cheaper than crop+scale
-show_osd       = false    # skip per-photo pixel iteration (~1 ms)
-max_image_mb   = 20       # reject oversized files before decode
-max_megapixels = 16       # 16 MP → ~72 MB peak; safe headroom
-
-[cache]
-prefetch_count = 2        # each prefetched photo holds ~8 MB decoded + raw bytes
-max_mb         = 128
-```
-
-Set `gpu_mem=64` in `/boot/config.txt` (the installer does this).
-
-For the WebDAV plugin on Pi Zero, space out syncs to avoid competing with the renderer:
-
-```toml
-[[plugins]]
-name               = "webdav"
-sync_interval_secs = 7200   # sync every 2 hours instead of 1
-```
+Engine talks only to `dyn PhotoPlugin`. The Pi's VC4 GPU lacks DRM dumb-buffer support, so SDL2's KMS backend (GBM+EGL internally) is used; the `drm` crate only probes which `/dev/dri/cardN` is active.
 
 ---
 
-## CI/CD Pipeline
+## Releases
 
-PicoGallery uses GitHub Actions to cross-compile for Raspberry Pi and publish pre-built binaries to GitHub Releases automatically.
-
-### Pipeline file
-
-`.github/workflows/release.yml`
-
-### Triggers
-
-| Event | Result |
-|-------|--------|
-| Push to `main` | Builds both targets; uploads as workflow artifacts (30-day retention) |
-| Push a tag `v*` (e.g. `v0.2.0`) | Builds both targets; creates a GitHub Release with downloadable archives |
-| Manual dispatch | Builds both targets; optionally creates a GitHub Release |
-
-### To publish a new release
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-The pipeline runs automatically. Within a few minutes, the release appears at:
-`https://github.com/kethanva/pico-gallery/releases`
-
-### Build matrix
-
-| Target triple | Arch label | Devices |
-|---------------|------------|---------|
-| `aarch64-unknown-linux-gnu` | `linux-aarch64` | Pi Zero 2 W, Pi 3/4/5 (64-bit OS) |
-| `armv7-unknown-linux-gnueabihf` | `linux-armv7` | Pi 2/3/4 (32-bit OS) |
-
-### How the cross-compilation works
-
-The pipeline runs on `ubuntu-24.04` and cross-compiles without QEMU:
-
-1. Adds the target ARM architecture to apt (`dpkg --add-architecture arm64` / `armhf`)
-2. Installs the GNU cross-toolchain (`gcc-aarch64-linux-gnu` or `gcc-arm-linux-gnueabihf`)
-3. Installs cross-architecture sysroot packages: `libdrm-dev`, `libgbm-dev`, `libudev-dev`
-4. SDL2 is built from source via the `bundled` cargo feature (cmake + cross-compiler) — no ARM SDL2 package required
-5. Sets `CARGO_TARGET_*_LINKER`, `CC`, `PKG_CONFIG_PATH`, and `PKG_CONFIG_ALLOW_CROSS` for the build
-6. Runs `cargo build --release --target <triple>`
-7. The `profile.release` section in `Cargo.toml` already strips the binary (`strip = true`)
-
-### Artifact contents
-
-Each `.tar.gz` release archive contains:
-
-```
-picogallery-<version>-linux-<arch>/
-├── picogallery          # stripped release binary
-├── picogallery.service  # systemd unit file
-├── config.example.toml  # annotated config template
-├── LICENSE
-└── README.md
-```
-
-Each archive has a matching `.sha256` checksum file. The installer verifies this automatically.
-
----
-
-## Display without keyboard (GPIO button)
-
-Use `triggerhappy` — reads `/dev/input/event*` directly, no X server needed.
-
-```bash
-sudo apt-get install -y triggerhappy
-```
-
-`/etc/triggerhappy/triggers.d/picogallery.conf`:
-```
-KEY_NEXT     1    kill -USR1 $(pidof picogallery)
-KEY_PREVIOUS 1    kill -USR2 $(pidof picogallery)
-```
-
-> Do not use `xdotool` — it requires X11.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which cross-compiles `aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` on `ubuntu-24.04` and publishes `.tar.gz` + `.sha256` archives to GitHub Releases.
 
 ---
 

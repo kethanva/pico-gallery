@@ -1,0 +1,44 @@
+# Minimal PhotoPrism stack for local plugin development.
+#
+# Brings up PhotoPrism on http://localhost:2342 backed by SQLite (no MariaDB).
+# Originals folder is mounted from ./originals — drop test JPEGs there before
+# `docker compose up -d`, or import via the UI after first start.
+#
+#   Username: admin
+#   Password: insecure
+#
+# Resource notes for laptops: PhotoPrism uses ~600 MB RAM + Tensorflow when
+# indexing; you can stop the container with `docker compose down` once a few
+# photos are indexed and re-use the same DB next time.
+
+services:
+  photoprism:
+    image: photoprism/photoprism:latest
+    container_name: picogallery-photoprism-dev
+    restart: unless-stopped
+    stop_grace_period: 10s
+    depends_on: []
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    ports:
+      - "2342:2342"
+    environment:
+      PHOTOPRISM_ADMIN_USER: "admin"
+      PHOTOPRISM_ADMIN_PASSWORD: "insecure"
+      PHOTOPRISM_AUTH_MODE: "password"
+      PHOTOPRISM_SITE_URL: "http://localhost:2342/"
+      PHOTOPRISM_ORIGINALS_LIMIT: "1000"
+      PHOTOPRISM_DATABASE_DRIVER: "sqlite"
+      PHOTOPRISM_HTTP_HOST: "0.0.0.0"
+      PHOTOPRISM_HTTP_PORT: "2342"
+      PHOTOPRISM_DISABLE_TLS: "true"
+      PHOTOPRISM_DEFAULT_LOCALE: "en"
+      PHOTOPRISM_LOG_LEVEL: "info"
+      # Skip the heavy CNN models on first run — speeds up indexing on a laptop.
+      PHOTOPRISM_DISABLE_TENSORFLOW: "true"
+      PHOTOPRISM_DISABLE_FACES: "true"
+      PHOTOPRISM_DISABLE_CLASSIFICATION: "true"
+    volumes:
+      - "./originals:/photoprism/originals"
+      - "./storage:/photoprism/storage"

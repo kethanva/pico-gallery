@@ -25,6 +25,11 @@ const PAD: u32 = 8;             // inset of text inside the dark background
 const EDGE: u32 = 12;           // distance of the pill from the screen edge
 const MAX_LINE_CHARS: usize = 48;
 
+// Nav arrow dimensions
+const ARROW_W: i32 = 14;  // triangle width in pixels
+const ARROW_H: i32 = 22;  // triangle height in pixels
+const ARROW_PAD: u32 = 7; // padding inside the pill
+
 const FG:     [u8; 4] = [255, 255, 255, 255]; // foreground (white)
 const SHADOW: [u8; 4] = [0,   0,   0,   255]; // 1-px drop shadow (black)
 
@@ -167,6 +172,54 @@ fn draw_text(img: &mut RgbaImage, text: &str, x: i32, y: i32) {
 #[allow(dead_code)]
 const _BG_HINT: Rgba<u8> = Rgba([0, 0, 0, 120]);
 
+// ── Nav arrow helpers ─────────────────────────────────────────────────────────
+
+/// Fill a left-pointing triangle (tip at left, base on right) at `(ox, oy)`.
+/// Uses `ARROW_W × ARROW_H` dimensions.  Shadow/foreground drawn by callers.
+fn fill_triangle_left(img: &mut RgbaImage, ox: i32, oy: i32, color: [u8; 4]) {
+    let (iw, ih) = img.dimensions();
+    let stride = iw as usize * 4;
+    let buf = img.as_mut();
+    let [cr, cg, cb, _] = color;
+    let half = (ARROW_H - 1) as f32 / 2.0;
+    for dy in 0..ARROW_H {
+        // dist ∈ [0, 1]: 0 at the middle row (tip), 1 at top/bottom (base edge).
+        let dist = ((dy as f32 - half) / half).abs();
+        // xl: left edge of filled span; moves right as dist grows.
+        let xl = (dist * (ARROW_W - 1) as f32 + 0.5) as i32;
+        let py = oy + dy;
+        if py < 0 || py >= ih as i32 { continue; }
+        for dx in xl..ARROW_W {
+            let px = ox + dx;
+            if px < 0 || px >= iw as i32 { continue; }
+            let i = py as usize * stride + px as usize * 4;
+            buf[i] = cr; buf[i + 1] = cg; buf[i + 2] = cb; buf[i + 3] = 255;
+        }
+    }
+}
+
+/// Fill a right-pointing triangle (tip at right, base on left) at `(ox, oy)`.
+fn fill_triangle_right(img: &mut RgbaImage, ox: i32, oy: i32, color: [u8; 4]) {
+    let (iw, ih) = img.dimensions();
+    let stride = iw as usize * 4;
+    let buf = img.as_mut();
+    let [cr, cg, cb, _] = color;
+    let half = (ARROW_H - 1) as f32 / 2.0;
+    for dy in 0..ARROW_H {
+        let dist = ((dy as f32 - half) / half).abs();
+        // xr: right edge of filled span (exclusive); shrinks as dist grows.
+        let xr = ((1.0 - dist) * (ARROW_W - 1) as f32 + 0.5) as i32 + 1;
+        let py = oy + dy;
+        if py < 0 || py >= ih as i32 { continue; }
+        for dx in 0..xr {
+            let px = ox + dx;
+            if px < 0 || px >= iw as i32 { continue; }
+            let i = py as usize * stride + px as usize * 4;
+            buf[i] = cr; buf[i + 1] = cg; buf[i + 2] = cb; buf[i + 3] = 255;
+        }
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Stamp a photo-info pill in the bottom-left corner of `img`.
@@ -215,5 +268,90 @@ pub fn draw_photo_info(img: &mut RgbaImage, meta: &PhotoMeta, exif_date: Option<
         let tx = (bx + PAD) as i32;
         let ty = (by + PAD + i as u32 * (GLYPH_H + LINE_GAP)) as i32;
         draw_text(img, line.as_ref(), tx, ty);
+    }
+}
+
+/// Draw left (◄) and right (►) navigation arrow pills on the vertical
+/// centre of the left and right screen edges.
+///
+/// Each arrow is a filled triangle inside a darkened pill, matching the
+/// OSD style (white glyph + 1-px black drop-shadow).  The arrows hint to
+/// users that left/right clicks and arrow keys advance or reverse the slideshow.
+pub fn draw_nav_arrows(img: &mut RgbaImage) {
+    let (iw, ih) = img.dimensions();
+    let pill_w = ARROW_W as u32 + ARROW_PAD * 2;
+    let pill_h = ARROW_H as u32 + ARROW_PAD * 2;
+    let by = ih.saturating_sub(pill_h + EDGE);
+
+    // ── Left arrow (◄) ───────────────────────────────────────────────────────
+    let lx = EDGE;
+    darken_rect(img, lx, by, pill_w, pill_h);
+    let ax = lx as i32 + ARROW_PAD as i32;
+    let ay = by as i32 + ARROW_PAD as i32;
+    fill_triangle_left(img, ax + 1, ay + 1, SHADOW);
+    fill_triangle_left(img, ax,     ay,     FG);
+
+    // ── Right arrow (►) ──────────────────────────────────────────────────────
+    let rx = iw.saturating_sub(pill_w + EDGE);
+    darken_rect(img, rx, by, pill_w, pill_h);
+    let bx = rx as i32 + ARROW_PAD as i32;
+    fill_triangle_right(img, bx + 1, ay + 1, SHADOW);
+    fill_triangle_right(img, bx,     ay,     FG);
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn white_img(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]))
+    }
+
+    #[test]
+    fn draw_nav_arrows_does_not_panic_on_typical_resolution() {
+        let mut img = white_img(1920, 1080);
+        draw_nav_arrows(&mut img); // must not panic
+    }
+
+    #[test]
+    fn draw_nav_arrows_does_not_panic_on_small_image() {
+        let mut img = white_img(80, 80);
+        draw_nav_arrows(&mut img);
+    }
+
+    #[test]
+    fn draw_nav_arrows_does_not_panic_on_tiny_image() {
+        let mut img = white_img(1, 1);
+        draw_nav_arrows(&mut img);
+    }
+
+    #[test]
+    fn left_arrow_pixels_darkened() {
+        let (w, h) = (320u32, 240u32);
+        let mut img = white_img(w, h);
+        draw_nav_arrows(&mut img);
+        // Pill at bottom-left: x starts at EDGE, y near ih - pill_h - EDGE.
+        let pill_h = ARROW_H as u32 + ARROW_PAD * 2;
+        let pill_center_x = EDGE + ARROW_PAD / 2;
+        let pill_center_y = h.saturating_sub(pill_h / 2 + EDGE);
+        let px = img.get_pixel(pill_center_x, pill_center_y);
+        // darken_rect multiplies by 7/16 ≈ 0.44 — white (255) → ≤ 112
+        assert!(px[0] < 200, "expected darkened pill at left arrow, got {:?}", px);
+    }
+
+    #[test]
+    fn right_arrow_pixels_darkened() {
+        let (w, h) = (320u32, 240u32);
+        let mut img = white_img(w, h);
+        draw_nav_arrows(&mut img);
+        let pill_w = ARROW_W as u32 + ARROW_PAD * 2;
+        let pill_h = ARROW_H as u32 + ARROW_PAD * 2;
+        let rx = w.saturating_sub(pill_w + EDGE);
+        let pill_center_x = rx + ARROW_PAD / 2;
+        let pill_center_y = h.saturating_sub(pill_h / 2 + EDGE);
+        let px = img.get_pixel(pill_center_x, pill_center_y);
+        assert!(px[0] < 200, "expected darkened pill at right arrow, got {:?}", px);
     }
 }

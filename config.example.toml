@@ -196,3 +196,51 @@ sync_interval_secs = 3600
 
 # Set to true to accept self-signed TLS certificates (e.g. a local NAS).
 # skip_tls_verify = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] photoprism  ★ another Raspberry Pi running PhotoPrism as a server
+#
+# Streams photos on demand from a PhotoPrism instance (https://photoprism.app)
+# via its REST API. No local sync — the engine fetches the smallest pre-built
+# thumbnail that fits the display, so this is light enough for a Pi Zero 2
+# client talking to a Pi 4 / Pi 5 server.
+#
+# SETUP
+# 1. Run PhotoPrism on the server Pi (Docker is easiest).
+# 2. Note the URL (default http://<pi>.local:2342) and your admin password.
+# 3. Optionally create an app password in PhotoPrism: Settings → Account →
+#    App passwords. Use it instead of your real password.
+# 4. Set enabled = true and restart picogallery.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "photoprism"
+enabled = false
+
+url      = "http://photoprism.local:2342"   # base URL of the PhotoPrism server
+username = "admin"
+password = "insecure"                       # or use app_password below
+# app_password = "abcd-efgh-ijkl-mnop"      # PhotoPrism v0.10+ app password
+
+# ── Filtering (all optional) ────────────────────────────────────────────────
+# album       = "january-2024"     # album UID or slug
+# favorites   = true               # only favourites
+# quality     = 3                  # 1=low … 5=excellent (drops anything lower)
+# country     = "fr"               # ISO country code
+# year        = 2024
+# media_type  = "image"            # image | raw | live | animated | video
+# query       = "label:beach keyword:sunset"   # raw PhotoPrism Q-language
+
+# ── Ordering / paging ───────────────────────────────────────────────────────
+# order    = "newest"   # newest | oldest | added | name | random | similar
+# per_page = 100
+
+# ── Thumbnail selection (saves Pi Zero RAM) ─────────────────────────────────
+# Cap the largest thumbnail size requested. fit_1920 is plenty for 1080p panels.
+# Sizes (longest edge px): tile_500, fit_720, fit_1280, fit_1920, fit_2048,
+#                          fit_2560, fit_3840, fit_4096, fit_7680
+# max_thumb      = "fit_1920"
+# allow_original = true            # fall back to /dl/<hash> if no thumb fits
+
+# ── Transport ───────────────────────────────────────────────────────────────
+# skip_tls_verify       = false    # true for self-signed LAN certs
+# request_timeout_secs  = 30
