@@ -614,8 +614,15 @@ impl Renderer {
                 | Event::KeyDown { keycode: Some(Keycode::Space), .. } => return Some(SlideshowCmd::Next),
                 Event::KeyDown { keycode: Some(Keycode::Left), .. }    => return Some(SlideshowCmd::Prev),
                 Event::KeyDown { keycode: Some(Keycode::P), .. }       => return Some(SlideshowCmd::TogglePause),
-                Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Left, .. } => return Some(SlideshowCmd::Prev),
-                Event::MouseButtonDown { mouse_btn: sdl2::mouse::MouseButton::Right, .. } => return Some(SlideshowCmd::Next),
+                // Position-based: click left half → Prev, right half → Next.
+                // Any button works — matches the on-screen ◄ / ► arrow positions.
+                Event::MouseButtonDown { x, .. } => {
+                    return Some(if x < self.width as i32 / 2 {
+                        SlideshowCmd::Prev
+                    } else {
+                        SlideshowCmd::Next
+                    });
+                }
                 _ => {}
             }
         }

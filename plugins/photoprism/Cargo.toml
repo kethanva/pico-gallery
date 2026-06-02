@@ -1,8 +1,8 @@
 [package]
-name        = "picogallery-immich"
+name        = "picogallery-photoprism"
 version     = "0.1.0"
 edition     = "2021"
-description = "Immich plugin for PicoGallery — streams photos from a self-hosted Immich server"
+description = "PhotoPrism plugin for PicoGallery — streams photos from a PhotoPrism server (e.g. another Raspberry Pi)"
 license     = "MIT"
 
 [dependencies]

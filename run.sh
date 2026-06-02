@@ -57,7 +57,17 @@ echo "  ╚═══════════════════════
 echo -e "${RESET}"
 
 IS_MAC=false
-[[ "$(uname)" == "Darwin" ]] && IS_MAC=true
+TARGET_DIR="target/debug"
+if [[ "$(uname)" == "Darwin" ]]; then
+    IS_MAC=true
+    # If the shell is x86_64, or if we are on an M1 but only have Intel Homebrew installed
+    if [[ "$(uname -m)" == "x86_64" ]] || [[ -f "/usr/local/bin/brew" && ! -d "/opt/homebrew" ]]; then
+        export CARGO_BUILD_TARGET="x86_64-apple-darwin"
+        export PKG_CONFIG_ALLOW_CROSS=1
+        TARGET_DIR="target/x86_64-apple-darwin/debug"
+        info "Running under Rosetta / Intel Homebrew: forcing target to x86_64-apple-darwin"
+    fi
+fi
 
 # ── Step 1: Dependencies ──────────────────────────────────────────────────────
 step "1/6  Checking dependencies"
@@ -102,7 +112,7 @@ info "Build complete."
 # Export DYLD_LIBRARY_PATH now so every subsequent binary call in this script
 # (smoke tests, the final launch, etc.) can load it without extra wrappers.
 if $IS_MAC; then
-    SDL_LIB=$(find target/debug/build -name "libSDL2-*.dylib" 2>/dev/null | head -1 \
+    SDL_LIB=$(find $TARGET_DIR/build -name "libSDL2-*.dylib" 2>/dev/null | head -1 \
               | xargs -I{} dirname {} 2>/dev/null || true)
     if [[ -n "$SDL_LIB" ]]; then
         export DYLD_LIBRARY_PATH="${SDL_LIB}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
@@ -278,6 +288,7 @@ transition          = "fade"
 transition_ms       = 600
 fill_screen         = ${FILL_SCREEN}
 fps                 = 30
+show_osd            = true   # metadata pill (album/date/filename) + ◄ ► nav arrows
 
 [cache]
 max_mb         = ${CACHE_MB}
@@ -307,6 +318,16 @@ name    = "amazon-photos"
 enabled = false
 client_id     = "PLACEHOLDER"
 client_secret = "PLACEHOLDER"
+
+# ── PhotoPrism plugin ───────────────────────────────────────────────────────
+# Streams photos from a PhotoPrism server (e.g. another Raspberry Pi).
+# See dev/run-photoprism-local.sh to spin up a local server for testing.
+[[plugins]]
+name     = "photoprism"
+enabled  = false
+url      = "http://photoprism.local:2342"
+username = "admin"
+password = "PLACEHOLDER"
 TOML
 
 info "Config written to $CONFIG_FILE"
@@ -314,13 +335,13 @@ info "Active plugin: local → $ACTIVE_ROOT"
 
 # ── Step 5b: Smoke-test --generate-config ─────────────────────────────────
 TMPDIR_GEN=$(mktemp -d)
-target/debug/picogallery --generate-config --config "$TMPDIR_GEN/config.toml" 2>&1 | \
+$TARGET_DIR/picogallery --generate-config --config "$TMPDIR_GEN/config.toml" 2>&1 | \
     grep -v "^warning:" || true
 [[ -f "$TMPDIR_GEN/config.toml" ]] || die "--generate-config did not create the file"
 info "--generate-config: OK"
 
 # Verify --print-default-config emits valid TOML (parse it).
-target/debug/picogallery --print-default-config 2>/dev/null | \
+$TARGET_DIR/picogallery --print-default-config 2>/dev/null | \
     python3 -c "
 import sys
 try:
@@ -358,11 +379,12 @@ echo "  Photos : $ACTIVE_ROOT ($PHOTO_COUNT images)"
 echo "  Config : $CONFIG_FILE"
 echo "  Plugin : local (shuffle, prefetch=${PREFETCH}, cache=${CACHE_MB}MB)"
 echo ""
-echo "  Controls:  Q = quit   Space = pause/resume   → = next   ← = prev"
+echo "  Controls:  →/Space/right-click = next   ←/left-click = prev   P = pause   Q/Esc = quit"
+echo "  OSD:       ◄ ► nav arrows + metadata pill shown on screen (show_osd = true)"
 echo ""
 
 # DYLD_LIBRARY_PATH was already exported in the build step on macOS.
-target/debug/picogallery \
+$TARGET_DIR/picogallery \
     --config "$CONFIG_FILE" \
     --log-level info \
     "${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}"

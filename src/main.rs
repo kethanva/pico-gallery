@@ -95,12 +95,12 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
         }
     }
 
-    #[cfg(feature = "plugin-immich")]
+    #[cfg(feature = "plugin-photoprism")]
     {
-        if let Some(pcfg) = cfg.plugin_config("immich") {
-            info!("Registering plugin: immich");
+        if let Some(pcfg) = cfg.plugin_config("photoprism") {
+            info!("Registering plugin: photoprism");
             plugins.push(Box::new(
-                picogallery_immich::ImmichPlugin::new(pcfg.clone()),
+                picogallery_photoprism::PhotoPrismPlugin::new(pcfg.clone()),
             ));
         }
     }
@@ -356,41 +356,52 @@ client_id     = "YOUR_LWA_CLIENT_ID"
 client_secret = "YOUR_LWA_CLIENT_SECRET"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Immich plugin  (self-hosted photo server — LAN or remote)
-# Streams photos from an Immich server over HTTP/HTTPS — no local sync needed.
-# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] photoprism  ★ another Raspberry Pi running PhotoPrism as a server
+#
+# Streams photos on demand from a PhotoPrism instance (https://photoprism.app)
+# via its REST API. No local sync — the engine fetches the smallest pre-built
+# thumbnail that fits the display, so this is light enough for a Pi Zero 2
+# client talking to a Pi 4 / Pi 5 server.
+#
 # SETUP
-# 1. In the Immich web UI → Account Settings → API Keys → New API Key.
-# 2. Paste the key below and set `url` to your Immich base URL.
-# 3. Optional: restrict to one album by setting `album_id`.
+# 1. Run PhotoPrism on the server Pi (Docker is easiest).
+# 2. Note the URL (default http://<pi>.local:2342) and your admin password.
+# 3. Optionally create an app password in PhotoPrism: Settings → Account →
+#    App passwords. Use it instead of your real password.
+# 4. Set enabled = true and restart picogallery.
 # ─────────────────────────────────────────────────────────────────────────────
 [[plugins]]
-name    = "immich"
+name    = "photoprism"
 enabled = false
 
-# Base URL of the Immich server, including scheme and port. No trailing slash.
-url     = "http://immich.lan:2283"
+url      = "http://photoprism.local:2342"   # base URL of the PhotoPrism server
+username = "admin"
+password = "insecure"                       # or use app_password below
+# app_password = "abcd-efgh-ijkl-mnop"      # PhotoPrism v0.10+ app password
 
-# Immich API key (x-api-key header).
-api_key = "YOUR_IMMICH_API_KEY"
+# ── Filtering (all optional) ────────────────────────────────────────────────
+# album       = "january-2024"     # album UID or slug
+# favorites   = true               # only favourites
+# quality     = 3                  # 1=low … 5=excellent (drops anything lower)
+# country     = "fr"               # ISO country code
+# year        = 2024
+# media_type  = "image"            # image | raw | live | animated | video
+# query       = "label:beach keyword:sunset"   # raw PhotoPrism Q-language
 
-# Asset variant served to the slideshow:
-#   "preview"   — large preview JPEG (recommended for Pi Zero, low bandwidth)
-#   "thumbnail" — small thumbnail (fastest, lowest quality)
-#   "original"  — original file (may be heavy; use on fast LAN only)
-image_size = "preview"
+# ── Ordering / paging ───────────────────────────────────────────────────────
+# order    = "newest"   # newest | oldest | added | name | random | similar
+# per_page = 100
 
-# Optional: only show photos from this album (Immich album UUID).
-# album_id = ""
+# ── Thumbnail selection (saves Pi Zero RAM) ─────────────────────────────────
+# Cap the largest thumbnail size requested. fit_1920 is plenty for 1080p panels.
+# Sizes (longest edge px): tile_500, fit_720, fit_1280, fit_1920, fit_2048,
+#                          fit_2560, fit_3840, fit_4096, fit_7680
+# max_thumb      = "fit_1920"
+# allow_original = true            # fall back to /dl/<hash> if no thumb fits
 
-# Only display assets marked as favourite.
-# favorites_only = false
-
-# Pagination size per metadata request. Lower = less peak RAM on Pi Zero.
-# page_size = 250
-
-# Accept self-signed TLS certificates (only enable if you understand the risk).
-# skip_tls_verify = false
+# ── Transport ───────────────────────────────────────────────────────────────
+# skip_tls_verify       = false    # true for self-signed LAN certs
+# request_timeout_secs  = 30
 "#,
         photo_dir = photo_dir_str,
     )

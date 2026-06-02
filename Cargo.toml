@@ -7,7 +7,7 @@ members = [
     "plugins/local",
     "plugins/directory",
     "plugins/webdav",
-    "plugins/immich",
+    "plugins/photoprism",
 ]
 resolver = "2"
 
@@ -59,7 +59,7 @@ picogallery-core    = { workspace = true }
 env_logger          = "0.11"
 image               = { version = "0.24", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 fast_image_resize   = "2.7"
-sdl2                = { version = "0.36", default-features = false }
+sdl2                = { version = "0.36", default-features = false, features = ["use-pkgconfig"] }
 clap                = { version = "4", features = ["derive", "env"] }
 
 # Plugins (compiled in via feature flags — no cycle: plugins depend on core, not on this crate)
@@ -68,7 +68,7 @@ picogallery-amazon-photos = { path = "plugins/amazon-photos", optional = true }
 picogallery-local         = { path = "plugins/local",         optional = true }
 picogallery-directory     = { path = "plugins/directory",     optional = true }
 picogallery-webdav        = { path = "plugins/webdav",        optional = true }
-picogallery-immich        = { path = "plugins/immich",        optional = true }
+picogallery-photoprism    = { path = "plugins/photoprism",    optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
@@ -77,13 +77,13 @@ drm = "0.15"
 cc = "1"
 
 [features]
-default              = ["plugin-google-photos", "plugin-local", "plugin-directory", "plugin-webdav", "plugin-immich"]
+default              = ["plugin-google-photos", "plugin-local", "plugin-directory", "plugin-webdav", "plugin-photoprism"]
 plugin-google-photos = ["dep:picogallery-google-photos"]
 plugin-amazon-photos = ["dep:picogallery-amazon-photos"]
 plugin-local         = ["dep:picogallery-local"]
 plugin-directory     = ["dep:picogallery-directory"]
 plugin-webdav        = ["dep:picogallery-webdav"]
-plugin-immich        = ["dep:picogallery-immich"]
+plugin-photoprism    = ["dep:picogallery-photoprism"]
 
 [profile.release]
 opt-level     = "z"
