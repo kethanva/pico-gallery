@@ -60,8 +60,12 @@ IS_MAC=false
 TARGET_DIR="target/debug"
 if [[ "$(uname)" == "Darwin" ]]; then
     IS_MAC=true
-    # If the shell is x86_64, or if we are on an M1 but only have Intel Homebrew installed
-    if [[ "$(uname -m)" == "x86_64" ]] || [[ -f "/usr/local/bin/brew" && ! -d "/opt/homebrew" ]]; then
+    # If the shell is x86_64, or if we are on an M1 but only have Intel Homebrew
+    # installed. Check for the actual brew *binary* under /opt/homebrew, not
+    # just the directory — Homebrew (and other tools) can leave a stale, empty
+    # /opt/homebrew skeleton behind with no brew inside it, which would
+    # otherwise look like "arm64 Homebrew is installed" and skip this fallback.
+    if [[ "$(uname -m)" == "x86_64" ]] || [[ -f "/usr/local/bin/brew" && ! -x "/opt/homebrew/bin/brew" ]]; then
         export CARGO_BUILD_TARGET="x86_64-apple-darwin"
         export PKG_CONFIG_ALLOW_CROSS=1
         TARGET_DIR="target/x86_64-apple-darwin/debug"
@@ -108,17 +112,17 @@ step "2/6  Building PicoGallery"
 cargo build 2>&1 | grep -E "^(error|warning: unused|   Compiling|    Finished)" || true
 info "Build complete."
 
-# On macOS the bundled SDL2 dylib lives inside the build output tree.
-# Export DYLD_LIBRARY_PATH now so every subsequent binary call in this script
-# (smoke tests, the final launch, etc.) can load it without extra wrappers.
+# SDL2 is linked via pkg-config against the Homebrew-installed dylib, which
+# already lives on the default dyld search path (/usr/local/lib or
+# /opt/homebrew/lib) — no DYLD_LIBRARY_PATH needed in the normal case. Some
+# environments still vendor a bundled SDL2 dylib inside the build tree, so
+# pick that up if present, but don't warn when it's absent — that's expected.
 if $IS_MAC; then
     SDL_LIB=$(find $TARGET_DIR/build -name "libSDL2-*.dylib" 2>/dev/null | head -1 \
               | xargs -I{} dirname {} 2>/dev/null || true)
     if [[ -n "$SDL_LIB" ]]; then
         export DYLD_LIBRARY_PATH="${SDL_LIB}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
         info "SDL2 lib path: $SDL_LIB (exported to DYLD_LIBRARY_PATH)"
-    else
-        warn "Could not locate bundled libSDL2-*.dylib — binary may fail to start."
     fi
 fi
 
