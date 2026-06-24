@@ -13,7 +13,7 @@ use sdl2::{
     rect::Rect,
     render::{Canvas, Texture, TextureCreator},
     video::{Window, WindowContext},
-    Sdl,
+    EventPump, Sdl,
 };
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,11 @@ mod drm_probe {
     use std::os::unix::io::{AsFd, BorrowedFd, RawFd};
 
     pub struct DrmCard(pub std::fs::File);
-    impl AsFd for DrmCard { fn as_fd(&self) -> BorrowedFd<'_> { self.0.as_fd() } }
+    impl AsFd for DrmCard {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
     impl Device for DrmCard {}
     impl ControlDevice for DrmCard {}
 
@@ -61,7 +65,10 @@ mod drm_probe {
                 info!("DRM probe: /dev/dri contains: [{}]", names.join(", "));
             }
             Err(e) => {
-                warn!("DRM probe: cannot read /dev/dri — {} (is the kernel module loaded?)", e);
+                warn!(
+                    "DRM probe: cannot read /dev/dri — {} (is the kernel module loaded?)",
+                    e
+                );
                 return None;
             }
         }
@@ -73,8 +80,13 @@ mod drm_probe {
                 continue;
             }
 
-            // Read-only is enough for enumeration; requires only `video` group.
-            let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            // Open read+write: some DRM drivers refuse resource enumeration on
+            // read-only fds. Requires the `video` group either way.
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
                 Ok(f) => f,
                 Err(e) => {
                     warn!(
@@ -142,11 +154,14 @@ mod drm_probe {
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    sdl_ctx: Sdl,
-    canvas:  Canvas<Window>,
-    width:   u32,
-    height:  u32,
-    config:  DisplayConfig,
+    // Kept alive for the renderer's lifetime; never read directly —
+    // events come from `event_pump`.
+    _sdl_ctx: Sdl,
+    event_pump: EventPump,
+    canvas: Canvas<Window>,
+    width: u32,
+    height: u32,
+    config: DisplayConfig,
 }
 
 impl Renderer {
@@ -207,7 +222,7 @@ impl Renderer {
         #[cfg(target_os = "linux")]
         {
             let env_driver = std::env::var("SDL_VIDEODRIVER").ok();
-            let has_x11    = std::env::var("DISPLAY").is_ok();
+            let has_x11 = std::env::var("DISPLAY").is_ok();
             let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
 
             // Use kmsdrm if:
@@ -259,7 +274,10 @@ impl Renderer {
                     "SDL video init failed with SDL_VIDEODRIVER={:?}: {}",
                     requested, e
                 );
-                warn!("SDL was compiled with these video drivers: [{}]", drivers.join(", "));
+                warn!(
+                    "SDL was compiled with these video drivers: [{}]",
+                    drivers.join(", ")
+                );
 
                 // Retry only if kmsdrm was the problem and SDL has *some* other driver.
                 #[cfg(target_os = "linux")]
@@ -310,7 +328,8 @@ impl Renderer {
             };
             return Err(anyhow::anyhow!(
                 "SDL fell back to the '{}' driver — no real display backend is available.\n{}",
-                active_driver, hint
+                active_driver,
+                hint
             ));
         }
 
@@ -320,7 +339,8 @@ impl Renderer {
         } else if probed_w > 0 {
             (probed_w, probed_h)
         } else {
-            let dm = video.desktop_display_mode(0)
+            let dm = video
+                .desktop_display_mode(0)
                 .map_err(|e| anyhow::anyhow!("display mode: {}", e))?;
             (dm.w as u32, dm.h as u32)
         };
@@ -344,11 +364,28 @@ impl Renderer {
         canvas.clear();
         canvas.present();
 
-        Ok(Self { sdl_ctx, canvas, width: w, height: h, config })
+        // Create the event pump once — recreating it on every 50 ms poll tick
+        // costs a lock + alloc inside SDL for no benefit.
+        let event_pump = sdl_ctx
+            .event_pump()
+            .map_err(|e| anyhow::anyhow!("SDL event pump: {}", e))?;
+
+        Ok(Self {
+            _sdl_ctx: sdl_ctx,
+            event_pump,
+            canvas,
+            width: w,
+            height: h,
+            config,
+        })
     }
 
-    pub fn width(&self)  -> u32 { self.width  }
-    pub fn height(&self) -> u32 { self.height }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
 
     // ── Image decode & scale ─────────────────────────────────────────────────
 
@@ -398,7 +435,8 @@ impl Renderer {
         if img.width() > 16_000 || img.height() > 16_000 {
             return Err(anyhow::anyhow!(
                 "image {}×{} px exceeds the 16 000-px dimension safety limit",
-                img.width(), img.height()
+                img.width(),
+                img.height()
             ));
         }
 
@@ -411,7 +449,7 @@ impl Renderer {
         // Comparison uses multiplied pixel counts (no division on the hot path)
         // — ARM11 has no hardware integer divider, so this matters per photo.
         if self.config.max_megapixels > 0 {
-            let max_pixels    = self.config.max_megapixels as u64 * 1_000_000;
+            let max_pixels = self.config.max_megapixels as u64 * 1_000_000;
             let actual_pixels = img.width() as u64 * img.height() as u64;
             if actual_pixels > max_pixels {
                 // Divide only on the error path (rare).
@@ -419,7 +457,10 @@ impl Renderer {
                 return Err(anyhow::anyhow!(
                     "image {}×{} ({} MP) exceeds max_megapixels={} — skipping \
                      (set a higher limit or resize photos before uploading)",
-                    img.width(), img.height(), mp, self.config.max_megapixels,
+                    img.width(),
+                    img.height(),
+                    mp,
+                    self.config.max_megapixels,
                 ));
             }
         }
@@ -429,30 +470,49 @@ impl Renderer {
         // pass — halves heap allocations vs two separate parses.
         let exif = crate::exif_util::read_exif(bytes);
         let orientation = exif.orientation;
-        let exif_date   = exif.date;
+        let exif_date = exif.date;
 
         // ── Scale, then rotate the small image ────────────────────────────────
         // Swap target dimensions for 90°/270° so the scaler sees the correct
         // target aspect ratio; the rotation brings it back to display orientation.
-        let (target_w, target_h) = if matches!(orientation, 5 | 6 | 7 | 8) {
+        let (target_w, target_h) = if matches!(orientation, 5..=8) {
             (self.height, self.width)
         } else {
             (self.width, self.height)
         };
 
-        let scaled  = self.scale_image_to(img, target_w, target_h);
+        let scaled = self.scale_image_to(img, target_w, target_h)?;
         let oriented = crate::exif_util::apply_orientation_rgba(scaled, orientation);
 
-        Ok((oriented, exif_date))
+        // ── Blurred letterbox fill ─────────────────────────────────────────────
+        // When letterboxing (no crop) and the photo doesn't cover the screen,
+        // composite it onto a full-screen blurred copy of itself instead of
+        // black bars. One-shot cost of a few ms per slide: blur happens on a
+        // 32-px-wide thumbnail; the GPU-friendly bilinear upscale and a
+        // row-memcpy composite do the rest.
+        let final_img = if self.config.letterbox_blur
+            && !self.config.fill_screen
+            && (oriented.width() < self.width || oriented.height() < self.height)
+        {
+            compose_letterbox_blur(&oriented, self.width, self.height)
+        } else {
+            oriented
+        };
+
+        Ok((final_img, exif_date))
     }
 
     // scale_image is kept for any future callers that don't need orientation.
     #[allow(dead_code)]
-    fn scale_image(&self, img: DynamicImage) -> RgbaImage {
+    fn scale_image(&self, img: DynamicImage) -> Result<RgbaImage> {
         self.scale_image_to(img, self.width, self.height)
     }
 
-    fn scale_image_to(&self, img: DynamicImage, dw: u32, dh: u32) -> RgbaImage {
+    /// Scale `img` to fit (letterbox) or cover (fill_screen) a `dw×dh` target.
+    ///
+    /// Failures propagate as errors so the caller skips the photo — same
+    /// handling as a decode error — instead of displaying a black frame.
+    fn scale_image_to(&self, img: DynamicImage, dw: u32, dh: u32) -> Result<RgbaImage> {
         let (sw, sh) = (img.width(), img.height());
 
         // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
@@ -464,15 +524,23 @@ impl Renderer {
         let (nw, nh) = ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32);
 
         use fast_image_resize as fir;
-        let src = match (std::num::NonZeroU32::new(sw), std::num::NonZeroU32::new(sh)) {
-            (Some(sw_nz), Some(sh_nz)) => {
-                match fir::Image::from_vec_u8(sw_nz, sh_nz, img.into_rgba8().into_raw(), fir::PixelType::U8x4) {
-                    Ok(i) => i,
-                    Err(_) => return RgbaImage::new(dw, dh),
-                }
+        let (sw_nz, sh_nz) = match (std::num::NonZeroU32::new(sw), std::num::NonZeroU32::new(sh)) {
+            (Some(w), Some(h)) => (w, h),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "cannot scale zero-sized image {}×{}",
+                    sw,
+                    sh
+                ))
             }
-            _ => return RgbaImage::new(dw, dh),
         };
+        let src = fir::Image::from_vec_u8(
+            sw_nz,
+            sh_nz,
+            img.into_rgba8().into_raw(),
+            fir::PixelType::U8x4,
+        )
+        .map_err(|e| anyhow::anyhow!("building resize source image: {}", e))?;
 
         let (dst_w, dst_h) = (nw.max(1), nh.max(1));
         let mut dst = fir::Image::new(
@@ -482,39 +550,51 @@ impl Renderer {
         );
 
         let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
-        if let Err(e) = resizer.resize(&src.view(), &mut dst.view_mut()) {
-            warn!("Image resize error: {}", e);
-            return RgbaImage::new(dw, dh);
-        }
+        resizer
+            .resize(&src.view(), &mut dst.view_mut())
+            .map_err(|e| anyhow::anyhow!("image resize: {}", e))?;
 
         RgbaImage::from_raw(dst_w, dst_h, dst.into_vec())
-            .unwrap_or_else(|| RgbaImage::new(dw, dh))
+            .context("resized pixel buffer has unexpected size")
     }
 
     // ── Display methods ──────────────────────────────────────────────────────
 
     pub fn show_cut(&mut self, rgba: &RgbaImage) -> Result<()> {
-        let tc  = self.canvas.texture_creator();
+        let tc = self.canvas.texture_creator();
         let tex = rgba_to_texture(&tc, rgba)?;
         self.canvas.clear();
-        blit_centered(&mut self.canvas, &tex, rgba.width(), rgba.height(), self.width, self.height)?;
+        blit_centered(
+            &mut self.canvas,
+            &tex,
+            rgba.width(),
+            rgba.height(),
+            self.width,
+            self.height,
+        )?;
         self.canvas.present();
         Ok(())
     }
 
-    pub fn show_fade(
+    /// Async so the frame-budget sleep yields to the runtime: on the
+    /// current_thread executor a `std::thread::sleep` here would starve every
+    /// other task (HTTP remote, prefetch) for the whole transition. SDL stays
+    /// on the main thread — the executor never migrates this future.
+    pub async fn show_fade(
         &mut self,
         current_rgba: Option<&RgbaImage>,
         next_rgba: &RgbaImage,
         duration: Duration,
     ) -> Result<()> {
-        if duration.is_zero() { return self.show_cut(next_rgba); }
+        if duration.is_zero() {
+            return self.show_cut(next_rgba);
+        }
 
         let tc = self.canvas.texture_creator();
         // Pre-bake current frame texture (outside the loop — avoids re-allocating every frame).
         let cur_tex = match current_rgba {
             Some(cur) => Some(rgba_to_texture(&tc, cur)?),
-            None      => None,
+            None => None,
         };
         let mut next_tex = rgba_to_texture(&tc, next_rgba)?;
         // SDL_RenderCopy only respects set_alpha_mod when the texture blend mode is
@@ -522,15 +602,18 @@ impl Renderer {
         // to the Metal framebuffer and macOS shows the white desktop behind the window.
         next_tex.set_blend_mode(sdl2::render::BlendMode::Blend);
 
-        let cur_dims   = current_rgba.map(|r| (r.width(), r.height()));
-        let (nw, nh)   = (next_rgba.width(), next_rgba.height());
-        let budget     = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
-        let inv_dur    = 1.0 / duration.as_secs_f32();
-        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
-        let start      = Instant::now();
+        let cur_dims = current_rgba.map(|r| (r.width(), r.height()));
+        let (nw, nh) = (next_rgba.width(), next_rgba.height());
+        let budget = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let inv_dur = 1.0 / duration.as_secs_f32();
+        self.canvas
+            .set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        let start = Instant::now();
         loop {
             let elapsed = start.elapsed();
-            if elapsed >= duration { break; }
+            if elapsed >= duration {
+                break;
+            }
 
             let alpha = (elapsed.as_secs_f32() * inv_dur * 255.0) as u8;
             self.canvas.clear();
@@ -543,7 +626,9 @@ impl Renderer {
             self.canvas.present();
 
             let frame_time = start.elapsed() - elapsed;
-            if frame_time < budget { std::thread::sleep(budget - frame_time); }
+            if frame_time < budget {
+                tokio::time::sleep(budget - frame_time).await;
+            }
         }
 
         // Final frame: reuse the pre-baked texture instead of re-uploading via show_cut.
@@ -554,66 +639,192 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn show_slide_left(
+    pub async fn show_slide_left(
         &mut self,
         current_rgba: Option<&RgbaImage>,
         next_rgba: &RgbaImage,
         duration: Duration,
     ) -> Result<()> {
-        if duration.is_zero() { return self.show_cut(next_rgba); }
+        self.show_slide(current_rgba, next_rgba, duration, true)
+            .await
+    }
 
-        let tc      = self.canvas.texture_creator();
-        let w       = self.width as i32;
+    pub async fn show_slide_right(
+        &mut self,
+        current_rgba: Option<&RgbaImage>,
+        next_rgba: &RgbaImage,
+        duration: Duration,
+    ) -> Result<()> {
+        self.show_slide(current_rgba, next_rgba, duration, false)
+            .await
+    }
+
+    /// Slide transition. `leftward = true`: current exits left, next enters
+    /// from the right. `leftward = false`: mirrored.
+    ///
+    /// Async for the same reason as `show_fade`: the frame-budget sleep must
+    /// yield instead of blocking the single-threaded executor.
+    async fn show_slide(
+        &mut self,
+        current_rgba: Option<&RgbaImage>,
+        next_rgba: &RgbaImage,
+        duration: Duration,
+        leftward: bool,
+    ) -> Result<()> {
+        if duration.is_zero() {
+            return self.show_cut(next_rgba);
+        }
+
+        let tc = self.canvas.texture_creator();
+        let w = self.width as i32;
 
         // Pre-bake textures once before the animation loop.
-        let cur_tex  = current_rgba.map(|cur| rgba_to_texture(&tc, cur)).transpose()?;
+        let cur_tex = current_rgba
+            .map(|cur| rgba_to_texture(&tc, cur))
+            .transpose()?;
         let next_tex = rgba_to_texture(&tc, next_rgba)?;
-        let budget   = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
-        let inv_dur  = 1.0 / duration.as_secs_f32();
-        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
-        let start    = Instant::now();
+        let budget = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
+        let inv_dur = 1.0 / duration.as_secs_f32();
+        self.canvas
+            .set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        let start = Instant::now();
 
         loop {
             let elapsed = start.elapsed();
-            if elapsed >= duration { break; }
+            if elapsed >= duration {
+                break;
+            }
 
             let t = elapsed.as_secs_f32() * inv_dur;
             // ease-in-out cubic
-            let t = if t < 0.5 { 4.0*t*t*t } else { 1.0 - (-2.0*t + 2.0_f32).powi(3) / 2.0 };
+            let t = if t < 0.5 {
+                4.0 * t * t * t
+            } else {
+                1.0 - (-2.0 * t + 2.0_f32).powi(3) / 2.0
+            };
             let offset = (w as f32 * t) as i32;
+            let (cur_x, next_x) = if leftward {
+                (-offset, w - offset)
+            } else {
+                (offset, offset - w)
+            };
 
             self.canvas.clear();
 
             if let Some(ref cur) = cur_tex {
-                self.canvas.copy(cur, None, Rect::new(-offset, 0, self.width, self.height)).ok();
+                self.canvas
+                    .copy(cur, None, Rect::new(cur_x, 0, self.width, self.height))
+                    .ok();
             }
-            self.canvas.copy(&next_tex, None, Rect::new(w - offset, 0, self.width, self.height)).ok();
+            self.canvas
+                .copy(
+                    &next_tex,
+                    None,
+                    Rect::new(next_x, 0, self.width, self.height),
+                )
+                .ok();
             self.canvas.present();
 
             let frame_time = start.elapsed() - elapsed;
-            if frame_time < budget { std::thread::sleep(budget - frame_time); }
+            if frame_time < budget {
+                tokio::time::sleep(budget - frame_time).await;
+            }
         }
 
         // Final frame: reuse the pre-baked texture instead of re-allocating.
         self.canvas.clear();
-        blit_centered(&mut self.canvas, &next_tex, next_rgba.width(), next_rgba.height(), self.width, self.height)?;
+        blit_centered(
+            &mut self.canvas,
+            &next_tex,
+            next_rgba.width(),
+            next_rgba.height(),
+            self.width,
+            self.height,
+        )?;
+        self.canvas.present();
+        Ok(())
+    }
+
+    // ── Ken Burns ─────────────────────────────────────────────────────────────
+
+    /// Render one Ken Burns frame: the image slowly zooms in (1.0 → 1.12)
+    /// while drifting toward a corner chosen by `variant` (0–3).
+    ///
+    /// `t` is slide progress in [0, 1]. At t=0 the frame matches a plain
+    /// `show_cut`, so the hand-off from any transition is seamless.
+    ///
+    /// Cost model: the texture is re-uploaded every call (~8 MB memcpy at
+    /// 1080p). At 10–15 fps that is a few percent of one Zero 2 core — the
+    /// price of not caching SDL textures across frames (their lifetimes are
+    /// tied to the canvas). Feature is opt-in for exactly this reason.
+    pub fn kb_frame(&mut self, rgba: &RgbaImage, t: f32, variant: u8) -> Result<()> {
+        const MAX_ZOOM: f32 = 0.12;
+
+        let t = t.clamp(0.0, 1.0);
+        let zoom = 1.0 + MAX_ZOOM * t;
+
+        let (iw, ih) = (rgba.width() as f32, rgba.height() as f32);
+        let dw = (iw * zoom) as u32;
+        let dh = (ih * zoom) as u32;
+
+        // Centre position, then drift toward a corner by half the slack.
+        let slack_x = (dw as i32 - self.width as i32).max(0) as f32;
+        let slack_y = (dh as i32 - self.height as i32).max(0) as f32;
+        let (dir_x, dir_y) = match variant % 4 {
+            0 => (-0.5, -0.5),
+            1 => (0.5, -0.5),
+            2 => (-0.5, 0.5),
+            _ => (0.5, 0.5),
+        };
+        let x = (self.width as i32 - dw as i32) / 2 + (dir_x * slack_x * t) as i32;
+        let y = (self.height as i32 - dh as i32) / 2 + (dir_y * slack_y * t) as i32;
+
+        let tc = self.canvas.texture_creator();
+        let tex = rgba_to_texture(&tc, rgba)?;
+        self.canvas
+            .set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        self.canvas.clear();
+        self.canvas
+            .copy(&tex, None, Rect::new(x, y, dw, dh))
+            .map_err(|e| anyhow::anyhow!("canvas copy (ken burns): {}", e))?;
         self.canvas.present();
         Ok(())
     }
 
     // ── Event loop ────────────────────────────────────────────────────────────
 
-    pub fn poll_events(&self) -> Option<SlideshowCmd> {
-        let mut ep = self.sdl_ctx.event_pump().ok()?;
-        for event in ep.poll_iter() {
+    pub fn poll_events(&mut self) -> Option<SlideshowCmd> {
+        for event in self.event_pump.poll_iter() {
             match event {
                 Event::Quit { .. }
-                | Event::KeyDown { keycode: Some(Keycode::Escape), .. }
-                | Event::KeyDown { keycode: Some(Keycode::Q), .. } => return Some(SlideshowCmd::Quit),
-                Event::KeyDown { keycode: Some(Keycode::Right), .. }
-                | Event::KeyDown { keycode: Some(Keycode::Space), .. } => return Some(SlideshowCmd::Next),
-                Event::KeyDown { keycode: Some(Keycode::Left), .. }    => return Some(SlideshowCmd::Prev),
-                Event::KeyDown { keycode: Some(Keycode::P), .. }       => return Some(SlideshowCmd::TogglePause),
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Q),
+                    ..
+                } => return Some(SlideshowCmd::Quit),
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    ..
+                }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Space),
+                    ..
+                } => return Some(SlideshowCmd::Next),
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    ..
+                } => return Some(SlideshowCmd::Prev),
+                Event::KeyDown {
+                    keycode: Some(Keycode::P),
+                    ..
+                } => return Some(SlideshowCmd::TogglePause),
+                Event::KeyDown {
+                    keycode: Some(Keycode::F),
+                    ..
+                } => return Some(SlideshowCmd::ToggleFavorite),
                 // Position-based: click left half → Prev, right half → Next.
                 // Any button works — matches the on-screen ◄ / ► arrow positions.
                 Event::MouseButtonDown { x, .. } => {
@@ -630,24 +841,153 @@ impl Renderer {
     }
 
     pub fn show_osd(&mut self, lines: &[String]) {
-        for l in lines { info!("OSD: {}", l); }
-        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        for l in lines {
+            info!("OSD: {}", l);
+        }
+        self.canvas
+            .set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         self.canvas.clear();
         self.canvas.present();
+    }
+}
+
+// ── Letterbox blur ────────────────────────────────────────────────────────────
+
+/// Resize `src` to exactly `dw×dh` (stretch, no aspect preservation).
+///
+/// Cost note: clones the entire source pixel buffer (fir wants an owned
+/// Vec). Only the letterbox-blur path calls this — once per slide on the
+/// display-sized photo and once on a ~32-px thumbnail — so the copy is
+/// cheap relative to the decode. Do NOT put this on a per-frame hot path
+/// without switching to fir's borrowed-view API.
+fn resize_rgba(
+    src: &RgbaImage,
+    dw: u32,
+    dh: u32,
+    alg: fast_image_resize::ResizeAlg,
+) -> Option<RgbaImage> {
+    use fast_image_resize as fir;
+    let sw = std::num::NonZeroU32::new(src.width())?;
+    let sh = std::num::NonZeroU32::new(src.height())?;
+    let dw_nz = std::num::NonZeroU32::new(dw)?;
+    let dh_nz = std::num::NonZeroU32::new(dh)?;
+
+    let fir_src =
+        fir::Image::from_vec_u8(sw, sh, src.as_raw().clone(), fir::PixelType::U8x4).ok()?;
+    let mut dst = fir::Image::new(dw_nz, dh_nz, fir::PixelType::U8x4);
+    let mut resizer = fir::Resizer::new(alg);
+    resizer.resize(&fir_src.view(), &mut dst.view_mut()).ok()?;
+    RgbaImage::from_raw(dw, dh, dst.into_vec())
+}
+
+/// In-place 3×3 box blur (one pass). Only ever runs on a ~32-px thumbnail,
+/// so the cost is microseconds.
+fn box_blur_3x3(img: &mut RgbaImage) {
+    let (w, h) = img.dimensions();
+    if w < 3 || h < 3 {
+        return;
+    }
+    let src = img.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let mut acc = [0u32; 3];
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let p = src.get_pixel(x + dx - 1, y + dy - 1);
+                    acc[0] += p[0] as u32;
+                    acc[1] += p[1] as u32;
+                    acc[2] += p[2] as u32;
+                }
+            }
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (acc[0] / 9) as u8,
+                    (acc[1] / 9) as u8,
+                    (acc[2] / 9) as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+}
+
+/// Build a full-screen frame: heavily blurred, darkened, stretched copy of
+/// `photo` as background, with the photo itself composited centred on top.
+fn compose_letterbox_blur(photo: &RgbaImage, sw: u32, sh: u32) -> RgbaImage {
+    use fast_image_resize::{FilterType, ResizeAlg};
+
+    // 1. Thumbnail at screen aspect (stretch — invisible after the blur).
+    let tiny_w = 32u32;
+    let tiny_h = ((tiny_w as u64 * sh as u64 / sw.max(1) as u64) as u32).max(2);
+    let Some(mut tiny) = resize_rgba(
+        photo,
+        tiny_w,
+        tiny_h,
+        ResizeAlg::Convolution(FilterType::Bilinear),
+    ) else {
+        return center_on_black(photo, sw, sh);
+    };
+
+    // 2. Blur twice (≈ wider gaussian), darken so the photo pops.
+    box_blur_3x3(&mut tiny);
+    box_blur_3x3(&mut tiny);
+    for px in tiny.as_mut().chunks_exact_mut(4) {
+        px[0] = ((px[0] as u32 * 11) >> 4) as u8; // × ~0.69
+        px[1] = ((px[1] as u32 * 11) >> 4) as u8;
+        px[2] = ((px[2] as u32 * 11) >> 4) as u8;
+    }
+
+    // 3. Upscale to full screen (bilinear — cheap, mush is the goal).
+    let Some(mut canvas) = resize_rgba(&tiny, sw, sh, ResizeAlg::Convolution(FilterType::Bilinear))
+    else {
+        return center_on_black(photo, sw, sh);
+    };
+
+    // 4. Composite the photo centred, row by row (straight memcpy).
+    blit_into(&mut canvas, photo);
+    canvas
+}
+
+/// Fallback compositor: photo centred on black.
+fn center_on_black(photo: &RgbaImage, sw: u32, sh: u32) -> RgbaImage {
+    let mut canvas = RgbaImage::from_pixel(sw, sh, image::Rgba([0, 0, 0, 255]));
+    blit_into(&mut canvas, photo);
+    canvas
+}
+
+/// Copy `photo` into the centre of `canvas` (clipped if larger).
+fn blit_into(canvas: &mut RgbaImage, photo: &RgbaImage) {
+    let (cw, ch) = canvas.dimensions();
+    let (pw, ph) = photo.dimensions();
+    let copy_w = pw.min(cw) as usize;
+    let copy_h = ph.min(ch);
+    let ox = (cw.saturating_sub(pw) / 2) as usize;
+    let oy = ch.saturating_sub(ph) / 2;
+
+    let canvas_stride = cw as usize * 4;
+    let photo_stride = pw as usize * 4;
+    let dst = canvas.as_mut();
+    let src = photo.as_raw();
+    for y in 0..copy_h as usize {
+        let d = (oy as usize + y) * canvas_stride + ox * 4;
+        let s = y * photo_stride;
+        dst[d..d + copy_w * 4].copy_from_slice(&src[s..s + copy_w * 4]);
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn rgba_to_texture<'tc>(
-    tc:   &'tc TextureCreator<WindowContext>,
+    tc: &'tc TextureCreator<WindowContext>,
     rgba: &RgbaImage,
 ) -> Result<Texture<'tc>> {
     let (w, h) = (rgba.width(), rgba.height());
     let mut tex = tc
         .create_texture_streaming(PixelFormatEnum::RGBA32, w, h)
         .context("creating texture")?;
-    let raw      = rgba.as_raw();
+    let raw = rgba.as_raw();
     let row_bytes = w as usize * 4;
     tex.with_lock(None, |buf: &mut [u8], pitch: usize| {
         if pitch == row_bytes {
@@ -659,25 +999,33 @@ fn rgba_to_texture<'tc>(
                 buf[dst..dst + row_bytes].copy_from_slice(&raw[src..src + row_bytes]);
             }
         }
-    }).map_err(|e| anyhow::anyhow!("texture lock: {}", e))?;
+    })
+    .map_err(|e| anyhow::anyhow!("texture lock: {}", e))?;
     Ok(tex)
 }
 
 fn blit_centered(
-    canvas:   &mut Canvas<Window>,
-    tex:      &Texture,
-    img_w:    u32,
-    img_h:    u32,
+    canvas: &mut Canvas<Window>,
+    tex: &Texture,
+    img_w: u32,
+    img_h: u32,
     screen_w: u32,
     screen_h: u32,
 ) -> Result<()> {
     let x = ((screen_w as i32) - (img_w as i32)) / 2;
     let y = ((screen_h as i32) - (img_h as i32)) / 2;
-    canvas.copy(tex, None, Rect::new(x, y, img_w, img_h))
+    canvas
+        .copy(tex, None, Rect::new(x, y, img_w, img_h))
         .map_err(|e| anyhow::anyhow!("canvas copy: {}", e))
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlideshowCmd { Next, Prev, TogglePause, Quit }
+pub enum SlideshowCmd {
+    Next,
+    Prev,
+    TogglePause,
+    ToggleFavorite,
+    Quit,
+}
