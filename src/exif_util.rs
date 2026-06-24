@@ -28,7 +28,10 @@ pub struct ExifInfo {
 
 impl Default for ExifInfo {
     fn default() -> Self {
-        Self { orientation: 1, date: None }
+        Self {
+            orientation: 1,
+            date: None,
+        }
     }
 }
 
@@ -52,7 +55,9 @@ pub fn read_exif(bytes: &[u8]) -> ExifInfo {
     let date = exif
         .get_field(Tag::DateTimeOriginal, In::PRIMARY)
         .and_then(|f| {
-            let Value::Ascii(ref v) = f.value else { return None; };
+            let Value::Ascii(ref v) = f.value else {
+                return None;
+            };
             let raw = v.first()?;
             let s = std::str::from_utf8(raw).ok()?.trim_end_matches('\0');
             // EXIF Ascii date: "2023:06:15 14:32:00" → "2023-06-15"
@@ -86,9 +91,15 @@ pub fn apply_orientation_rgba(img: RgbaImage, orientation: u32) -> RgbaImage {
         2 => imageops::flip_horizontal(&img),
         3 => imageops::rotate180(&img),
         4 => imageops::flip_vertical(&img),
-        5 => { let r = imageops::rotate90(&img); imageops::flip_horizontal(&r) }
+        5 => {
+            let r = imageops::rotate90(&img);
+            imageops::flip_horizontal(&r)
+        }
         6 => imageops::rotate90(&img),
-        7 => { let r = imageops::rotate270(&img); imageops::flip_horizontal(&r) }
+        7 => {
+            let r = imageops::rotate270(&img);
+            imageops::flip_horizontal(&r)
+        }
         8 => imageops::rotate270(&img),
         _ => img, // 1 or any unknown value — no transform
     }

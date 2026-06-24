@@ -51,9 +51,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     {
         if let Some(pcfg) = cfg.plugin_config("directory") {
             info!("Registering plugin: directory");
-            plugins.push(Box::new(
-                picogallery_directory::DirectoryPlugin::new(pcfg.clone()),
-            ));
+            plugins.push(Box::new(picogallery_directory::DirectoryPlugin::new(
+                pcfg.clone(),
+            )));
         }
     }
 
@@ -89,9 +89,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     {
         if let Some(pcfg) = cfg.plugin_config("webdav") {
             info!("Registering plugin: webdav");
-            plugins.push(Box::new(
-                picogallery_webdav::WebDavPlugin::new(pcfg.clone()),
-            ));
+            plugins.push(Box::new(picogallery_webdav::WebDavPlugin::new(
+                pcfg.clone(),
+            )));
         }
     }
 
@@ -99,9 +99,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     {
         if let Some(pcfg) = cfg.plugin_config("photoprism") {
             info!("Registering plugin: photoprism");
-            plugins.push(Box::new(
-                picogallery_photoprism::PhotoPrismPlugin::new(pcfg.clone()),
-            ));
+            plugins.push(Box::new(picogallery_photoprism::PhotoPrismPlugin::new(
+                pcfg.clone(),
+            )));
         }
     }
 
@@ -114,9 +114,14 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Logging.
-    std::env::set_var("RUST_LOG", &args.log_level);
-    env_logger::init();
+    // Logging. clap has already resolved precedence (--log-level flag beats
+    // the RUST_LOG env var beats the "info" default — see the `env` attr on
+    // Args), so feed the resolved value straight to env_logger instead of
+    // round-tripping through std::env::set_var, which is racy and unsafe as
+    // of Rust 2024.
+    env_logger::Builder::new()
+        .parse_filters(&args.log_level)
+        .init();
 
     // ── --print-default-config ───────────────────────────────────────────────
     if args.print_default_config {
@@ -144,6 +149,8 @@ async fn main() -> Result<()> {
             config_path.display()
         );
         generate_config(&config_path, false)?;
+        // exit(1) skips destructors, but nothing needing cleanup exists yet
+        // (no cache, no SDL, no plugin state) — a plain exit is fine here.
         std::process::exit(1);
     };
 
@@ -156,6 +163,21 @@ async fn main() -> Result<()> {
 
     // ── Plugins ───────────────────────────────────────────────────────────────
     let mut plugins = build_plugins(&config);
+
+    // Warn about plugins enabled in config that never registered — otherwise a
+    // compiled-out Cargo feature (e.g. amazon-photos is not in the default
+    // build) or a misspelled `name` silently drops the source with no clue why.
+    let registered: std::collections::HashSet<&str> = plugins.iter().map(|p| p.name()).collect();
+    for entry in &config.plugins {
+        if entry.enabled && !registered.contains(entry.name.as_str()) {
+            eprintln!(
+                "Warning: plugin '{}' is enabled in config but not available in this build \
+                 — unknown name, or its Cargo feature was not compiled in. Skipping.",
+                entry.name
+            );
+        }
+    }
+
     if plugins.is_empty() {
         eprintln!(
             "No plugins enabled.\n\
@@ -177,9 +199,20 @@ async fn main() -> Result<()> {
             .with_context(|| format!("initialising plugin '{}'", plugin.name()))?;
     }
 
+    // ── HTTP remote (optional) ────────────────────────────────────────────────
+    // Started before the slideshow so a bad bind (port in use, bad address)
+    // fails fast at startup instead of surfacing mid-show.
+    let (remote_rx, remote_status) = if config.remote.enabled {
+        let status = picogallery::remote::SharedStatus::default();
+        let rx = picogallery::remote::start(&config.remote, status.clone()).await?;
+        (Some(rx), Some(status))
+    } else {
+        (None, None)
+    };
+
     // Run the slideshow.
     let slideshow = Slideshow::new(config, plugins).await?;
-    slideshow.run().await
+    slideshow.run(remote_rx, remote_status).await
 }
 
 // ── Config generation ─────────────────────────────────────────────────────────
@@ -257,6 +290,30 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 # width  = 1920               # uncomment to force a specific resolution
 # height = 1080
 
+# Photo order: "shuffle" (default) | "chronological" | "newest_first"
+#              | "date_cluster" (small same-day/album runs, runs shuffled)
+order             = "shuffle"
+show_osd          = true   # show the album/date/filename pill + nav arrows
+letterbox_blur    = true   # fill letterbox bars with a blurred copy, not black
+ken_burns         = false  # slow zoom/pan per photo (more CPU; off on Pi Zero)
+on_this_day_boost = true   # surface photos taken on today's date in past years
+
+# ── Memory-safety limits (skip oversized photos instead of OOM) ──────────────
+# max_image_mb   = 20    # raw file-size gate (0 = built-in 50 MB default)
+# max_megapixels = 12    # decoded-pixel gate (0 = no limit); 12 MP ≈ 56 MB peak
+
+# ── Optional display schedule (HH:MM, local time; both required) ─────────────
+# Turn the HDMI output off overnight. Omit both = always on.
+# on_time  = "07:00"
+# off_time = "22:00"
+
+# ── Optional night mode (HH:MM, local time; both required) ───────────────────
+# Dim + warm-shift photos in a dark room. One cheap pixel pass per slide.
+# night_start       = "21:00"
+# night_end         = "07:00"
+# night_dim_percent = 25     # brightness reduction (0–90)
+# night_warmth      = 30     # warm tint strength (0–100)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache settings
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +321,18 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 max_mb         = 256  # maximum on-disk cache size in megabytes
 prefetch_count = 3    # how many photos to pre-fetch ahead (keep low on Pi Zero)
 # dir = "/tmp/picogallery-cache"   # override cache location (default: ~/.cache/picogallery)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP remote control (optional)
+# Phone-friendly next/prev/pause/favourite page + JSON status API. No
+# authentication — only enable on a trusted LAN. Visit http://<pi-ip>:8188/
+# once enabled. The ♥ button favourites the current photo (sources that
+# support it, e.g. photoprism).
+# ─────────────────────────────────────────────────────────────────────────────
+[remote]
+enabled = false
+port    = 8188
+bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PLUGINS
@@ -343,6 +412,8 @@ sync_dir = "/tmp/picogallery-gdrive"
 # ─────────────────────────────────────────────────────────────────────────────
 # Amazon Photos plugin
 # ─────────────────────────────────────────────────────────────────────────────
+# NOTE: not in the default build — rebuild with
+#       `cargo build --release --features plugin-amazon-photos` to include it.
 # SETUP
 # 1. Create a Login with Amazon (LWA) app at developer.amazon.com
 # 2. Add  http://localhost  as an allowed redirect URL
@@ -381,12 +452,34 @@ password = "insecure"                       # or use app_password below
 
 # ── Filtering (all optional) ────────────────────────────────────────────────
 # album       = "january-2024"     # album UID or slug
+# albums      = ["trip", "family"] # OR several albums (album:trip|family)
 # favorites   = true               # only favourites
 # quality     = 3                  # 1=low … 5=excellent (drops anything lower)
 # country     = "fr"               # ISO country code
+# state       = "California"       # province / state name
+# city        = "Paris"           # city name
 # year        = 2024
+# after       = "2020-06-01"       # only photos on/after this date (YYYY-MM-DD)
+# before      = "2020-06-30"       # only photos on/before this date
 # media_type  = "image"            # image | raw | live | animated | video
+# color       = "blue"             # red|orange|gold|green|teal|blue|purple|pink|brown|white|grey|black
+# mono        = true               # only black & white / monochrome photos
+# panorama    = true               # only panoramas
+# orientation = "portrait"         # portrait | landscape | square (good for a rotated frame)
+# people      = ["Alice", "Bob"]   # only photos containing these subjects (faces)
+# labels      = ["beach", "dog"]   # any of these labels (label:beach|dog)
+# keywords    = ["sunset"]         # any of these keywords
+# memories    = true               # only photos taken on today's date in any year
 # query       = "label:beach keyword:sunset"   # raw PhotoPrism Q-language
+#
+# ── Privacy (a wall display should not surface these) ────────────────────────
+# Private and archived photos are EXCLUDED by default. Opt back in:
+# include_private  = false
+# include_archived = false
+#
+# The configured album's real title is shown in the OSD pill, and PhotoPrism
+# photo titles + "City, Country" location are added to the overlay automatically.
+# Press F (or the ♥ button in the web remote) to favourite the on-screen photo.
 
 # ── Ordering / paging ───────────────────────────────────────────────────────
 # order    = "newest"   # newest | oldest | added | name | random | similar
@@ -405,4 +498,26 @@ password = "insecure"                       # or use app_password below
 "#,
         photo_dir = photo_dir_str,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_template_parses_as_valid_config() {
+        // The generated template is the first thing users edit — a typo in it
+        // would make a fresh install fail to parse its own default config.
+        let cfg: Config = toml::from_str(&default_config())
+            .expect("generated default config must parse as valid Config");
+        // Directory plugin ships enabled so a fresh install has photos to show.
+        assert!(
+            cfg.plugins
+                .iter()
+                .any(|p| p.name == "directory" && p.enabled),
+            "directory plugin should be enabled by default"
+        );
+        // Remote section parses and is disabled out of the box (no-auth server).
+        assert!(!cfg.remote.enabled);
+    }
 }

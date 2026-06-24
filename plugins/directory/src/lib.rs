@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use log::{debug, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -41,9 +41,9 @@ enum Order {
 impl Order {
     fn from_cfg(cfg: &PluginConfig) -> Self {
         match cfg.get_str("order").unwrap_or("shuffle") {
-            "alphabetical"  => Self::Alphabetical,
+            "alphabetical" => Self::Alphabetical,
             "date_modified" => Self::DateModified,
-            _               => Self::Shuffle,
+            _ => Self::Shuffle,
         }
     }
 }
@@ -61,8 +61,9 @@ struct ScannedPhoto {
 }
 
 impl ScannedPhoto {
-    fn into_meta(self, idx: usize) -> PhotoMeta {
-        let filename = self.path
+    fn into_meta(self) -> PhotoMeta {
+        let filename = self
+            .path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
@@ -74,11 +75,15 @@ impl ScannedPhoto {
         }
 
         PhotoMeta {
-            id:           idx.to_string(),
+            // Use the absolute path as the id: stable across restarts and
+            // re-shuffles, so cache entries always map back to the same photo.
+            // (A positional index would remap to a different photo whenever
+            // the shuffle order changes.)
+            id: self.path.to_string_lossy().to_string(),
             filename,
-            width:        0,
-            height:       0,
-            taken_at:     None,
+            width: 0,
+            height: 0,
+            taken_at: None,
             // Store local path in download_url so get_photo_bytes can read it.
             download_url: Some(self.path.to_string_lossy().to_string()),
             extra,
@@ -89,9 +94,9 @@ impl ScannedPhoto {
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct DirectoryPlugin {
-    cfg:    PluginConfig,
+    cfg: PluginConfig,
     /// Canonicalized root directory; set by `init`.
-    root:   Option<PathBuf>,
+    root: Option<PathBuf>,
     /// Sorted/shuffled list of photos, refreshed by `init` (and future rescans).
     photos: RwLock<Vec<ScannedPhoto>>,
 }
@@ -100,7 +105,7 @@ impl DirectoryPlugin {
     pub fn new(cfg: PluginConfig) -> Self {
         Self {
             cfg,
-            root:   None,
+            root: None,
             photos: RwLock::new(Vec::new()),
         }
     }
@@ -108,20 +113,25 @@ impl DirectoryPlugin {
     // ── Config helpers ────────────────────────────────────────────────────────
 
     fn recursive(&self) -> bool {
-        self.cfg.values.get("recursive")
+        self.cfg
+            .values
+            .get("recursive")
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
     }
 
     fn rescan_interval_secs(&self) -> u64 {
-        self.cfg.values.get("rescan_interval_secs")
+        self.cfg
+            .values
+            .get("rescan_interval_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     }
 
     /// Returns the album allowlist, or an empty vec meaning "all albums".
     fn allowed_albums(&self) -> Vec<String> {
-        self.cfg.values
+        self.cfg
+            .values
             .get("allowed_albums")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -140,14 +150,26 @@ impl DirectoryPlugin {
     /// becomes the "album" label for every photo beneath it.
     async fn scan_dir(
         &self,
-        root:    &Path,
-        dir:     &Path,
-        album:   Option<&str>,
+        root: &Path,
+        dir: &Path,
+        album: Option<&str>,
         allowed: &[String],
-        out:     &mut Vec<ScannedPhoto>,
+        visited: &mut HashSet<PathBuf>,
+        out: &mut Vec<ScannedPhoto>,
     ) {
+        // Symlink cycles inside the root (e.g. Photos/loop -> Photos/) pass
+        // the escape check below but would recurse forever — skip any
+        // canonical dir we've already walked.
+        if !visited.insert(dir.to_path_buf()) {
+            warn!(
+                "Directory plugin: symlink cycle detected at {} — skipping",
+                dir.display()
+            );
+            return;
+        }
+
         let mut rd = match fs::read_dir(dir).await {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => {
                 warn!("Directory plugin: cannot read {}: {}", dir.display(), e);
                 return;
@@ -158,8 +180,9 @@ impl DirectoryPlugin {
             let path = entry.path();
 
             // Resolve symlinks; reject anything that escapes the root.
-            let canonical = match path.canonicalize() {
-                Ok(c)  => c,
+            // (Async: a blocking canonicalize would stall the whole runtime.)
+            let canonical = match fs::canonicalize(&path).await {
+                Ok(c) => c,
                 Err(_) => continue,
             };
             if !canonical.starts_with(root) {
@@ -170,7 +193,11 @@ impl DirectoryPlugin {
                 continue;
             }
 
-            if canonical.is_dir() {
+            let is_dir = fs::metadata(&canonical)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
                 if !self.recursive() {
                     continue;
                 }
@@ -183,7 +210,10 @@ impl DirectoryPlugin {
 
                 // Apply allowlist only at the top level (album = first sub-dir).
                 if album.is_none() && !allowed.is_empty() && !allowed.contains(&dir_name) {
-                    debug!("Directory plugin: skipping album '{}' (not in allowed_albums)", dir_name);
+                    debug!(
+                        "Directory plugin: skipping album '{}' (not in allowed_albums)",
+                        dir_name
+                    );
                     continue;
                 }
 
@@ -194,7 +224,7 @@ impl DirectoryPlugin {
                     album
                 };
 
-                Box::pin(self.scan_dir(root, &canonical, new_album, allowed, out)).await;
+                Box::pin(self.scan_dir(root, &canonical, new_album, allowed, visited, out)).await;
             } else if is_image(&canonical) {
                 let modified_secs = fs::metadata(&canonical)
                     .await
@@ -216,12 +246,14 @@ impl DirectoryPlugin {
     async fn build_photo_list(&self) -> Vec<ScannedPhoto> {
         let root = match &self.root {
             Some(r) => r.clone(),
-            None    => return vec![],
+            None => return vec![],
         };
 
         let allowed = self.allowed_albums();
         let mut photos = Vec::new();
-        self.scan_dir(&root, &root, None, &allowed, &mut photos).await;
+        let mut visited = HashSet::new();
+        self.scan_dir(&root, &root, None, &allowed, &mut visited, &mut photos)
+            .await;
 
         let order = Order::from_cfg(&self.cfg);
         match order {
@@ -254,26 +286,38 @@ impl DirectoryPlugin {
 
 #[async_trait]
 impl PhotoPlugin for DirectoryPlugin {
-    fn name(&self)         -> &str { "directory"       }
-    fn display_name(&self) -> &str { "Local Directory" }
-    fn version(&self)      -> &str { "0.1.0"           }
+    fn name(&self) -> &str {
+        "directory"
+    }
+    fn display_name(&self) -> &str {
+        "Local Directory"
+    }
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
 
     async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
         // Resolve and validate the root path. Expand a leading `~` to $HOME
         // so that configs written on one user's system still work for another.
-        let path_str = self.cfg.require_str("path")
+        let path_str = self
+            .cfg
+            .require_str("path")
             .context("directory plugin requires a 'path' config key")?;
 
         let expanded = expand_home(path_str);
 
-        let canonical = expanded
-            .canonicalize()
-            .with_context(|| format!(
+        let canonical = fs::canonicalize(&expanded).await.with_context(|| {
+            format!(
                 "directory plugin: cannot resolve path '{}'",
                 expanded.display()
-            ))?;
+            )
+        })?;
 
-        if !canonical.is_dir() {
+        let root_is_dir = fs::metadata(&canonical)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !root_is_dir {
             return Err(anyhow::anyhow!(
                 "directory plugin: '{}' is not a directory",
                 canonical.display()
@@ -299,19 +343,24 @@ impl PhotoPlugin for DirectoryPlugin {
     }
 
     // No auth needed for local filesystem.
-    async fn auth_status(&self)         -> AuthStatus         { AuthStatus::Authenticated }
-    async fn authenticate(&mut self)    -> Result<AuthStatus> { Ok(AuthStatus::Authenticated) }
-    async fn refresh_auth(&mut self)    -> Result<()>         { Ok(()) }
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus::Authenticated
+    }
+    async fn authenticate(&mut self) -> Result<AuthStatus> {
+        Ok(AuthStatus::Authenticated)
+    }
+    async fn refresh_auth(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
         let photos = self.photos.read().await;
         let page = photos
             .iter()
-            .cloned()
-            .enumerate()
             .skip(offset)
             .take(limit)
-            .map(|(i, p)| p.into_meta(offset + i))
+            .cloned()
+            .map(ScannedPhoto::into_meta)
             .collect();
         Ok(page)
     }
@@ -319,19 +368,21 @@ impl PhotoPlugin for DirectoryPlugin {
     async fn get_photo_bytes(
         &self,
         meta: &PhotoMeta,
-        _display_width:  u32,
+        _display_width: u32,
         _display_height: u32,
     ) -> Result<Vec<u8>> {
-        let path_str = meta.download_url.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("directory plugin: no path stored for '{}'", meta.filename))?;
+        let path_str = meta.download_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("directory plugin: no path stored for '{}'", meta.filename)
+        })?;
 
         // Re-canonicalize at read time (guards against symlink swap attacks).
-        let canonical = PathBuf::from(path_str)
-            .canonicalize()
+        let canonical = fs::canonicalize(path_str)
+            .await
             .with_context(|| format!("resolving '{path_str}'"))?;
 
         // Must still be inside the configured root.
-        let inside_root = self.root
+        let inside_root = self
+            .root
             .as_ref()
             .map(|r| canonical.starts_with(r))
             .unwrap_or(false);
@@ -367,7 +418,11 @@ impl PhotoPlugin for DirectoryPlugin {
             ));
         }
 
-        debug!("Directory plugin: read {} bytes from {}", bytes.len(), canonical.display());
+        debug!(
+            "Directory plugin: read {} bytes from {}",
+            bytes.len(),
+            canonical.display()
+        );
         Ok(bytes)
     }
 }
@@ -392,25 +447,20 @@ fn expand_home(input: &str) -> PathBuf {
 // ── Image helpers ─────────────────────────────────────────────────────────────
 
 /// Extension pre-filter (cheap). Magic-byte check happens at read time.
+/// JPEG only — the slideshow decoder is built with JPEG support alone.
 fn is_image(p: &Path) -> bool {
     matches!(
         p.extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .as_deref(),
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+        Some("jpg" | "jpeg")
     )
 }
 
-/// First-bytes check against known image format signatures.
+/// First-bytes check — JPEG signature only.
 fn has_image_magic(bytes: &[u8]) -> bool {
-    match bytes {
-        [0xFF, 0xD8, 0xFF, ..]                              => true, // JPEG
-        [0x89, b'P', b'N', b'G', ..]                        => true, // PNG
-        [b'G', b'I', b'F', b'8', ..]                        => true, // GIF
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => true, // WebP
-        _                                                    => false,
-    }
+    matches!(bytes, [0xFF, 0xD8, 0xFF, ..])
 }
 
 // ── Fisher-Yates shuffle (no rand dep) ────────────────────────────────────────
@@ -441,31 +491,35 @@ mod tests {
     #[test]
     fn order_from_cfg_alphabetical() {
         let mut cfg = PluginConfig::default();
-        cfg.values.insert("order".to_string(), serde_json::json!("alphabetical"));
+        cfg.values
+            .insert("order".to_string(), serde_json::json!("alphabetical"));
         assert_eq!(Order::from_cfg(&cfg), Order::Alphabetical);
     }
 
     #[test]
     fn order_from_cfg_date_modified() {
         let mut cfg = PluginConfig::default();
-        cfg.values.insert("order".to_string(), serde_json::json!("date_modified"));
+        cfg.values
+            .insert("order".to_string(), serde_json::json!("date_modified"));
         assert_eq!(Order::from_cfg(&cfg), Order::DateModified);
     }
 
     #[test]
     fn order_from_cfg_unknown_falls_back_to_shuffle() {
         let mut cfg = PluginConfig::default();
-        cfg.values.insert("order".to_string(), serde_json::json!("random_walk"));
+        cfg.values
+            .insert("order".to_string(), serde_json::json!("random_walk"));
         assert_eq!(Order::from_cfg(&cfg), Order::Shuffle);
     }
 
     #[test]
-    fn is_image_recognises_common_extensions() {
+    fn is_image_accepts_only_jpeg_extensions() {
         assert!(is_image(Path::new("photo.jpg")));
         assert!(is_image(Path::new("photo.JPEG")));
-        assert!(is_image(Path::new("photo.png")));
-        assert!(is_image(Path::new("photo.gif")));
-        assert!(is_image(Path::new("photo.webp")));
+        // Non-JPEG formats are rejected — JPEG-only frame.
+        assert!(!is_image(Path::new("photo.png")));
+        assert!(!is_image(Path::new("photo.gif")));
+        assert!(!is_image(Path::new("photo.webp")));
         assert!(!is_image(Path::new("document.pdf")));
         assert!(!is_image(Path::new("video.mp4")));
         assert!(!is_image(Path::new("noext")));
@@ -478,9 +532,9 @@ mod tests {
     }
 
     #[test]
-    fn has_image_magic_png() {
+    fn has_image_magic_rejects_png() {
         let png_header = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        assert!(has_image_magic(&png_header));
+        assert!(!has_image_magic(&png_header));
     }
 
     #[test]
@@ -510,25 +564,31 @@ mod tests {
     #[test]
     fn scanned_photo_into_meta_carries_album() {
         let photo = ScannedPhoto {
-            path:          PathBuf::from("/photos/Vacation/img.jpg"),
-            album:         Some("Vacation".to_string()),
+            path: PathBuf::from("/photos/Vacation/img.jpg"),
+            album: Some("Vacation".to_string()),
             modified_secs: 0,
         };
-        let meta = photo.into_meta(3);
-        assert_eq!(meta.id, "3");
+        let meta = photo.into_meta();
+        assert_eq!(meta.id, "/photos/Vacation/img.jpg");
         assert_eq!(meta.filename, "img.jpg");
-        assert_eq!(meta.extra.get("album").map(String::as_str), Some("Vacation"));
-        assert_eq!(meta.download_url.as_deref(), Some("/photos/Vacation/img.jpg"));
+        assert_eq!(
+            meta.extra.get("album").map(String::as_str),
+            Some("Vacation")
+        );
+        assert_eq!(
+            meta.download_url.as_deref(),
+            Some("/photos/Vacation/img.jpg")
+        );
     }
 
     #[test]
     fn scanned_photo_into_meta_no_album() {
         let photo = ScannedPhoto {
-            path:          PathBuf::from("/photos/img.jpg"),
-            album:         None,
+            path: PathBuf::from("/photos/img.jpg"),
+            album: None,
             modified_secs: 0,
         };
-        let meta = photo.into_meta(0);
+        let meta = photo.into_meta();
         assert!(!meta.extra.contains_key("album"));
     }
 
@@ -544,7 +604,10 @@ mod tests {
     #[tokio::test]
     async fn init_fails_for_nonexistent_directory() {
         let mut cfg = PluginConfig::default();
-        cfg.values.insert("path".to_string(), serde_json::json!("/this/does/not/exist/ever"));
+        cfg.values.insert(
+            "path".to_string(),
+            serde_json::json!("/this/does/not/exist/ever"),
+        );
         let mut plugin = DirectoryPlugin::new(cfg.clone());
         let result = plugin.init(&cfg).await;
         assert!(result.is_err());

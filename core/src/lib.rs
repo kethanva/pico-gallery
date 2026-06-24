@@ -64,7 +64,10 @@ pub enum AuthStatus {
     /// Fully authenticated and ready.
     Authenticated,
     /// Need user interaction — show the message on screen and poll.
-    PendingUserAction { message: String, poll_interval_secs: u64 },
+    PendingUserAction {
+        message: String,
+        poll_interval_secs: u64,
+    },
     /// Not authenticated and cannot proceed without `authenticate()`.
     NotAuthenticated,
 }
@@ -85,10 +88,14 @@ pub trait PhotoPlugin: Send + Sync {
     fn name(&self) -> &str;
 
     /// Human-readable display name.
-    fn display_name(&self) -> &str { self.name() }
+    fn display_name(&self) -> &str {
+        self.name()
+    }
 
     /// Semantic version string.
-    fn version(&self) -> &str { "0.1.0" }
+    fn version(&self) -> &str {
+        "0.1.0"
+    }
 
     /// Initialise the plugin with its section from config.toml.
     /// Called once at startup before any other method.
@@ -108,6 +115,11 @@ pub trait PhotoPlugin: Send + Sync {
     ///
     /// Implementations should honour `offset` so the engine can page through
     /// large libraries without holding everything in memory.
+    ///
+    /// Backends that only expose token-based pagination may emulate offset
+    /// paging internally and cap the total number of photos they serve
+    /// (e.g. amazon-photos caps at 200). Engines must therefore treat a
+    /// short or empty page as a possible end-of-library, not as an error.
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>>;
 
     /// Fetch raw image bytes for a photo at a given display resolution.
@@ -122,11 +134,30 @@ pub trait PhotoPlugin: Send + Sync {
         display_height: u32,
     ) -> Result<Vec<u8>>;
 
+    /// Mark a photo as a favourite in the source (or clear the mark).
+    ///
+    /// Takes `&self` (not `&mut self`) so the engine can call it from the
+    /// display loop while holding only a shared borrow of the plugin list;
+    /// implementations use interior mutability for any session state.
+    ///
+    /// Default: unsupported. Backends without a favourites concept (plain
+    /// directories, WebDAV, …) inherit this and return an error, which the
+    /// engine logs without disrupting the slideshow.
+    async fn set_favorite(&self, _meta: &PhotoMeta, _favorite: bool) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "this photo source does not support favourites"
+        ))
+    }
+
     /// Called by the engine once per day to refresh tokens or do housekeeping.
-    async fn refresh_auth(&mut self) -> Result<()> { Ok(()) }
+    async fn refresh_auth(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Called when the engine is shutting down gracefully.
-    async fn shutdown(&mut self) -> Result<()> { Ok(()) }
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Type-erased, heap-allocated plugin instance.

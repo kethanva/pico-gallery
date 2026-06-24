@@ -14,7 +14,9 @@ use tokio::sync::Mutex;
 use crate::cache::ImageCache;
 use crate::config::{Config, Transition};
 use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
+use crate::remote::SharedStatus;
 use crate::renderer::{Renderer, SlideshowCmd};
+use tokio::sync::mpsc::Receiver;
 
 const PAGE_SIZE: usize = 50; // photos fetched per API page
 
@@ -35,7 +37,14 @@ impl Slideshow {
     }
 
     /// Run the slideshow.  Blocks the calling thread until the user quits.
-    pub async fn run(mut self) -> Result<()> {
+    ///
+    /// `remote_rx` / `remote_status` come from `remote::start` when the HTTP
+    /// remote is enabled; both are `None` otherwise.
+    pub async fn run(
+        mut self,
+        remote_rx: Option<Receiver<SlideshowCmd>>,
+        remote_status: Option<SharedStatus>,
+    ) -> Result<()> {
         // 1. Authenticate all plugins.
         self.authenticate_all().await?;
 
@@ -51,7 +60,8 @@ impl Slideshow {
         let mut renderer = Renderer::init(self.config.display.clone())?;
 
         // 4. Main display loop.
-        self.display_loop(&mut renderer, queue).await
+        self.display_loop(&mut renderer, queue, remote_rx, remote_status)
+            .await
     }
 
     // ── Authentication ────────────────────────────────────────────────────
@@ -65,7 +75,10 @@ impl Slideshow {
                         info!("  {} authenticated.", plugin.display_name());
                         break;
                     }
-                    AuthStatus::PendingUserAction { message, poll_interval_secs } => {
+                    AuthStatus::PendingUserAction {
+                        message,
+                        poll_interval_secs,
+                    } => {
                         // Print instructions to the terminal; in a future release
                         // these would render on-screen via OSD.
                         println!("\n=== {} ===\n{}", plugin.display_name(), message);
@@ -73,7 +86,10 @@ impl Slideshow {
                         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
                     }
                     AuthStatus::NotAuthenticated => {
-                        warn!("  {} is not authenticated and cannot continue.", plugin.display_name());
+                        warn!(
+                            "  {} is not authenticated and cannot continue.",
+                            plugin.display_name()
+                        );
                         break;
                     }
                 }
@@ -93,24 +109,43 @@ impl Slideshow {
                 match plugin.list_photos(PAGE_SIZE, offset).await {
                     Ok(page) if page.is_empty() => break,
                     Ok(page) => {
-                        info!("  {} loaded {} photos (offset {})", plugin.name(), page.len(), offset);
+                        info!(
+                            "  {} loaded {} photos (offset {})",
+                            plugin.name(),
+                            page.len(),
+                            offset
+                        );
                         offset += page.len();
                         all.extend(page.into_iter().map(|m| (plugin_idx, m)));
-                        if offset >= 2000 { break; } // cap at 2 000 per plugin
+                        if offset >= 2000 {
+                            break;
+                        } // cap at 2 000 per plugin
                     }
-                    Err(e) => { warn!("  {} list_photos error: {}", plugin.name(), e); break; }
+                    Err(e) => {
+                        warn!("  {} list_photos error: {}", plugin.name(), e);
+                        break;
+                    }
                 }
             }
         }
 
         use crate::config::PhotoOrder;
+        // Nanosecond clock as shuffle seed. On an RTC-less Pi that cold-boots
+        // before NTP sync the clock (and therefore the seed) is roughly the
+        // same every boot — including the literal-42 fallback if the clock
+        // sits before the epoch — so the shuffle order repeats until time
+        // syncs. Cosmetic only; not worth an entropy source.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+
         match self.config.display.order {
             PhotoOrder::Shuffle => {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(42);
                 shuffle(&mut all, seed);
+                if self.config.display.on_this_day_boost {
+                    weave_on_this_day(&mut all);
+                }
                 info!("Photo order: shuffle ({} photos)", all.len());
             }
             PhotoOrder::Chronological => {
@@ -120,6 +155,10 @@ impl Slideshow {
             PhotoOrder::NewestFirst => {
                 all.sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
                 info!("Photo order: newest first ({} photos)", all.len());
+            }
+            PhotoOrder::DateCluster => {
+                all = date_cluster_order(all, seed);
+                info!("Photo order: date clusters ({} photos)", all.len());
             }
         }
 
@@ -132,34 +171,55 @@ impl Slideshow {
         &self,
         renderer: &mut Renderer,
         queue: Vec<(usize, PhotoMeta)>,
+        mut remote_rx: Option<Receiver<SlideshowCmd>>,
+        remote_status: Option<SharedStatus>,
     ) -> Result<()> {
-        // Prefetch ring: up to `prefetch_count` decoded images ready ahead.
-        let prefetch_n = self.config.cache.prefetch_count;
-        let mut prefetched: VecDeque<(usize, usize, PhotoMeta, Vec<u8>)> = VecDeque::new();
+        // Prefetch ring: up to `prefetch_count` photos fetched *and* fully
+        // decoded/scaled ahead of time, so showing a slide is just a texture
+        // upload + transition — the costly JPEG decode and Lanczos resize run
+        // during the idle window, off the transition-start critical path.
+        // Each entry: (queue index, metadata, display-ready RGBA, EXIF date).
+        // Clamp to ≥1: a ring capacity of 0 would make every prefetch a no-op,
+        // so nothing would ever be decoded or shown.
+        let prefetch_n = self.config.cache.prefetch_count.max(1);
+        let mut prefetched: VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)> =
+            VecDeque::new();
         let mut current_queue_idx = 0usize;
         let mut current_rgba: Option<RgbaImage> = None;
+        // The on-screen photo's plugin index + metadata, so the favourite
+        // toggle knows which plugin to call and can flip the local state.
+        let mut current_meta: Option<(usize, PhotoMeta)> = None;
         let mut paused = false;
         // Tracks whether the display is currently powered on so we emit
         // vcgencmd and the black frame only at the exact on→off / off→on edges.
         let mut display_was_on = true;
 
-        // Pre-warm the prefetch queue.
-        for i in 0..prefetch_n.min(queue.len()) {
-            if let Some(bytes) = self.fetch_photo(&queue[i].0, &queue[i].1, renderer).await {
-                prefetched.push_back((i, queue[i].0, queue[i].1.clone(), bytes));
-            }
+        // Pre-warm the prefetch ring (fetch + decode the first N photos).
+        let mut cursor = 0usize;
+        for _ in 0..prefetch_n {
+            self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
+                .await;
         }
-        let mut cursor = prefetch_n.min(queue.len());
 
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
         let trans_dur = Duration::from_millis(self.config.display.transition_ms as u64);
 
         // Initialize last_advance so that the first photo shows immediately
-        let mut last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now);
+        let mut last_advance = Instant::now()
+            .checked_sub(slide_dur)
+            .unwrap_or_else(Instant::now);
 
         loop {
             // ── Event handling ─────────────────────────────────────────────
-            if let Some(cmd) = renderer.poll_events() {
+            // Keyboard/mouse first, then everything the HTTP remote queued —
+            // both sources flow through the same match below.
+            let mut cmds: Vec<SlideshowCmd> = renderer.poll_events().into_iter().collect();
+            if let Some(rx) = remote_rx.as_mut() {
+                while let Ok(cmd) = rx.try_recv() {
+                    cmds.push(cmd);
+                }
+            }
+            for cmd in cmds {
                 match cmd {
                     SlideshowCmd::Quit => {
                         info!("Quit requested.");
@@ -170,9 +230,14 @@ impl Slideshow {
                         paused = !paused;
                         info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                         last_advance = Instant::now();
+                        if let Some(status) = &remote_status {
+                            status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
+                        }
                     }
                     SlideshowCmd::Next => {
-                        last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now); // force advance
+                        last_advance = Instant::now()
+                            .checked_sub(slide_dur)
+                            .unwrap_or_else(Instant::now); // force advance
                     }
                     SlideshowCmd::Prev => {
                         current_queue_idx = if current_queue_idx == 0 {
@@ -182,7 +247,13 @@ impl Slideshow {
                         };
                         prefetched.clear();
                         cursor = current_queue_idx;
-                        last_advance = Instant::now().checked_sub(slide_dur).unwrap_or_else(Instant::now);
+                        last_advance = Instant::now()
+                            .checked_sub(slide_dur)
+                            .unwrap_or_else(Instant::now);
+                    }
+                    SlideshowCmd::ToggleFavorite => {
+                        self.toggle_favorite(&mut current_meta, &remote_status)
+                            .await;
                     }
                 }
             }
@@ -229,54 +300,188 @@ impl Slideshow {
             }
 
             // ── Time to advance? ──────────────────────────────────────────
+            // Not yet — spend the idle window topping up the prefetch buffer.
+            // This is where read-ahead actually earns its keep: refilling here
+            // (instead of only right after an advance) keeps the next image
+            // decoded-and-ready in RAM through the whole on-screen period, and
+            // a failed fetch is retried within ~50 ms rather than one slot per
+            // slide. When the buffer is already full this is a cheap no-op.
             if last_advance.elapsed() < slide_dur {
+                self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
+                    .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
 
             // ── Display next photo ────────────────────────────────────────
-            if let Some((q_idx, _pidx, meta, bytes)) = prefetched.pop_front() {
+            // The image is already decoded and scaled (done in prefetch_one),
+            // so all that's left are the cheap per-slide pixel passes and the
+            // transition itself.
+            if let Some((q_idx, meta, mut rgba, exif_date)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
-                match renderer.decode_and_scale(&bytes) {
-                    Ok((mut rgba, exif_date)) => {
-                        // Stamp metadata overlay before handing to the transition.
-                        // exif_date comes from the same EXIF parse that corrected
-                        // orientation — no second parse needed.
-                        if self.config.display.show_osd {
-                            crate::osd::draw_photo_info(
-                                &mut rgba,
-                                &meta,
-                                exif_date.as_deref(),
-                            );
-                            crate::osd::draw_nav_arrows(&mut rgba);
-                        }
-                        let result = match self.config.display.transition {
-                            Transition::Cut => renderer.show_cut(&rgba),
-                            Transition::Fade => renderer.show_fade(current_rgba.as_ref(), &rgba, trans_dur),
-                            Transition::SlideLeft => renderer.show_slide_left(current_rgba.as_ref(), &rgba, trans_dur),
-                            Transition::SlideRight => renderer.show_slide_left(current_rgba.as_ref(), &rgba, trans_dur),
-                        };
-                        if let Err(e) = result { warn!("Render error: {}", e); }
-                        current_queue_idx = q_idx;
-                        current_rgba = Some(rgba);
-                        last_advance = Instant::now();
+                // Night window: dim + warm-shift the photo once per slide
+                // (single pixel pass — never per frame). Evaluated at *display*
+                // time, not prefetch time, so it tracks the wall clock. Applied
+                // before the OSD so the overlay stays readable.
+                if self.config.display.night_active_now() {
+                    crate::night::apply_night(
+                        &mut rgba,
+                        self.config.display.night_dim_percent,
+                        self.config.display.night_warmth,
+                    );
+                }
+                // Stamp metadata overlay before handing to the transition.
+                // exif_date comes from the same EXIF parse that corrected
+                // orientation during prefetch — no second parse needed.
+                if self.config.display.show_osd {
+                    crate::osd::draw_photo_info(&mut rgba, &meta, exif_date.as_deref());
+                    crate::osd::draw_nav_arrows(&mut rgba);
+                    // Mark already-favourited photos with a ♥ in the corner.
+                    if meta
+                        .extra
+                        .get("favorite")
+                        .map(|v| v == "true")
+                        .unwrap_or(false)
+                    {
+                        crate::osd::draw_favorite(&mut rgba);
                     }
-                    Err(e) => { warn!("Decode error ({}): {}", meta.filename, e); }
+                }
+                let result = match self.config.display.transition {
+                    Transition::Cut => renderer.show_cut(&rgba),
+                    Transition::Fade => {
+                        renderer
+                            .show_fade(current_rgba.as_ref(), &rgba, trans_dur)
+                            .await
+                    }
+                    Transition::SlideLeft => {
+                        renderer
+                            .show_slide_left(current_rgba.as_ref(), &rgba, trans_dur)
+                            .await
+                    }
+                    Transition::SlideRight => {
+                        renderer
+                            .show_slide_right(current_rgba.as_ref(), &rgba, trans_dur)
+                            .await
+                    }
+                };
+                if let Err(e) = result {
+                    warn!("Render error: {}", e);
+                }
+                current_queue_idx = q_idx;
+                current_rgba = Some(rgba);
+                // Remember the source plugin + metadata for the favourite toggle.
+                let plugin_idx = queue[q_idx].0;
+                let favorite = meta
+                    .extra
+                    .get("favorite")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                current_meta = Some((plugin_idx, meta.clone()));
+                last_advance = Instant::now();
+                // Reflect the newly displayed photo in the remote's status endpoint.
+                if let Some(status) = &remote_status {
+                    let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+                    s.index = q_idx;
+                    s.total = queue.len();
+                    s.filename = meta.filename.clone();
+                    s.album = meta.extra.get("album").cloned().unwrap_or_default();
+                    s.favorite = favorite;
                 }
             }
 
-            // ── Prefetch the next photo in background ─────────────────────
-            // Only fetch if the buffer isn't already full (strict size enforcement).
-            if cursor < queue.len() && prefetched.len() < prefetch_n {
-                let (pidx, meta) = &queue[cursor];
-                if let Some(bytes) = self.fetch_photo(pidx, meta, renderer).await {
-                    prefetched.push_back((cursor, *pidx, meta.clone(), bytes));
-                }
-                cursor += 1;
+            // Top up again straight after the advance so a zero/short slide
+            // duration (which never enters the idle branch above) still keeps
+            // the buffer fed.
+            self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
+                .await;
+        }
+    }
 
-                // Wrap around.
-                if cursor >= queue.len() { cursor = 0; }
+    /// Fetch *and decode* the next queued photo into the prefetch ring if
+    /// there's room.
+    ///
+    /// No-op when the buffer is already at `prefetch_n` (just the length
+    /// check — cheap to call every idle tick) or the queue is empty. `cursor`
+    /// is a read-ahead pointer that wraps around the queue, so the ring keeps
+    /// reading forward forever without ever exceeding `prefetch_n` entries.
+    ///
+    /// The cursor is advanced before the (slow) fetch+decode so a photo that
+    /// fails to download or decode is simply dropped — it never wedges the
+    /// ring, and the next tick moves on to the following photo.
+    async fn prefetch_one(
+        &self,
+        queue: &[(usize, PhotoMeta)],
+        cursor: &mut usize,
+        prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
+        prefetch_n: usize,
+        renderer: &Renderer,
+    ) {
+        if prefetched.len() >= prefetch_n || *cursor >= queue.len() {
+            return;
+        }
+        let idx = *cursor;
+        let (pidx, meta) = &queue[idx];
+        *cursor += 1;
+        if *cursor >= queue.len() {
+            *cursor = 0;
+        }
+
+        let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
+            return;
+        };
+        // Decode + scale here, during the idle window, so display is instant.
+        match renderer.decode_and_scale(&bytes) {
+            Ok((rgba, exif_date)) => prefetched.push_back((idx, meta.clone(), rgba, exif_date)),
+            Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+        }
+    }
+
+    // ── Favourites ──────────────────────────────────────────────────────────
+
+    /// Toggle the favourite state of the on-screen photo via its source plugin.
+    ///
+    /// On success the local metadata and the remote status are updated so the
+    /// next render shows the ♥ and the phone remote reflects the change. The
+    /// on-disk image already displayed is not re-rendered — the indicator
+    /// appears when the photo next comes around. Plugins that don't support
+    /// favourites return an error, which is logged and otherwise ignored.
+    async fn toggle_favorite(
+        &self,
+        current_meta: &mut Option<(usize, PhotoMeta)>,
+        remote_status: &Option<SharedStatus>,
+    ) {
+        let Some((plugin_idx, meta)) = current_meta.as_mut() else {
+            debug!("Favourite toggle ignored — no photo on screen yet");
+            return;
+        };
+        let currently = meta
+            .extra
+            .get("favorite")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let target = !currently;
+
+        match self.plugins[*plugin_idx].set_favorite(&*meta, target).await {
+            Ok(()) => {
+                if target {
+                    meta.extra.insert("favorite".into(), "true".into());
+                } else {
+                    meta.extra.remove("favorite");
+                }
+                info!(
+                    "{} photo: {}",
+                    if target {
+                        "Favourited"
+                    } else {
+                        "Un-favourited"
+                    },
+                    meta.filename
+                );
+                if let Some(status) = remote_status {
+                    status.lock().unwrap_or_else(|e| e.into_inner()).favorite = target;
+                }
             }
+            Err(e) => warn!("Favourite toggle failed: {e}"),
         }
     }
 
@@ -284,11 +489,11 @@ impl Slideshow {
 
     async fn fetch_photo(
         &self,
-        plugin_idx: &usize,
+        plugin_idx: usize,
         meta: &PhotoMeta,
         renderer: &Renderer,
     ) -> Option<Vec<u8>> {
-        let plugin = &self.plugins[*plugin_idx];
+        let plugin = &self.plugins[plugin_idx];
         let cache_key = meta.cache_key(plugin.name());
 
         // Check disk cache first.
@@ -317,7 +522,7 @@ impl Slideshow {
 
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
 
-fn shuffle<T>(v: &mut Vec<T>, seed: u64) {
+fn shuffle<T>(v: &mut [T], seed: u64) {
     let mut s = seed;
     for i in (1..v.len()).rev() {
         s ^= s << 13;
@@ -326,4 +531,97 @@ fn shuffle<T>(v: &mut Vec<T>, seed: u64) {
         let j = (s as usize) % (i + 1);
         v.swap(i, j);
     }
+}
+
+// ── Queue ordering helpers ────────────────────────────────────────────────────
+
+/// "On this day": photos taken on today's calendar date (any year) get woven
+/// near the front of the shuffled queue, one every `SPACING` slides, so
+/// anniversaries surface early without taking over the rotation.
+fn weave_on_this_day(v: &mut Vec<(usize, PhotoMeta)>) {
+    use chrono::Datelike;
+    const SPACING: usize = 8;
+
+    let today = chrono::Local::now();
+    let (month, day) = (today.month(), today.day());
+
+    let mut on_this_day = Vec::new();
+    let mut rest = Vec::with_capacity(v.len());
+    for item in v.drain(..) {
+        let matches_today = item
+            .1
+            .taken_at
+            .map(|t| {
+                let local = t.with_timezone(&chrono::Local);
+                local.month() == month && local.day() == day
+            })
+            .unwrap_or(false);
+        if matches_today {
+            on_this_day.push(item)
+        } else {
+            rest.push(item)
+        }
+    }
+
+    if on_this_day.is_empty() {
+        *v = rest;
+        return;
+    }
+    info!(
+        "On this day: boosting {} photo(s) taken on this date",
+        on_this_day.len()
+    );
+
+    let boosted_count = on_this_day.len();
+    let mut boosted = on_this_day.into_iter();
+    let mut out = Vec::with_capacity(rest.len() + boosted_count);
+    for (i, item) in rest.into_iter().enumerate() {
+        if i % SPACING == 0 {
+            if let Some(b) = boosted.next() {
+                out.push(b);
+            }
+        }
+        out.push(item);
+    }
+    out.extend(boosted); // more boosted photos than slots — append the rest
+    *v = out;
+}
+
+/// Date-cluster ordering: group photos by capture date (falling back to
+/// album), keep each group chronological, split groups into runs of at most
+/// `MAX_CLUSTER`, then shuffle the runs. The slideshow tells small "stories"
+/// instead of jumping randomly between decades.
+fn date_cluster_order(all: Vec<(usize, PhotoMeta)>, seed: u64) -> Vec<(usize, PhotoMeta)> {
+    use std::collections::HashMap;
+    const MAX_CLUSTER: usize = 5;
+
+    let mut groups: HashMap<String, Vec<(usize, PhotoMeta)>> = HashMap::new();
+    for item in all {
+        let key = item
+            .1
+            .taken_at
+            .map(|t| t.format("%Y-%m-%d").to_string())
+            .or_else(|| item.1.extra.get("album").cloned())
+            .unwrap_or_default();
+        groups.entry(key).or_default().push(item);
+    }
+
+    // Deterministic group walk before the seeded shuffle.
+    let mut keys: Vec<String> = groups.keys().cloned().collect();
+    keys.sort();
+
+    let mut clusters: Vec<Vec<(usize, PhotoMeta)>> = Vec::new();
+    for key in keys {
+        // Keys came from `groups` itself, so remove always succeeds — but
+        // skip rather than panic if that invariant ever breaks.
+        if let Some(mut group) = groups.remove(&key) {
+            group.sort_by_key(|(_, m)| m.taken_at);
+            for chunk in group.chunks(MAX_CLUSTER) {
+                clusters.push(chunk.to_vec());
+            }
+        }
+    }
+
+    shuffle(&mut clusters, seed);
+    clusters.into_iter().flatten().collect()
 }

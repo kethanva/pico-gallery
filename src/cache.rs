@@ -1,6 +1,6 @@
 /// Simple disk-based image cache.
 ///
-/// Images are stored as `<cache_dir>/<plugin>/<photo_id>.jpg`.
+/// Images are stored as `<cache_dir>/<sanitised_key>-<fnv1a_hash>.jpg`.
 /// An LRU index is maintained in memory and serialised to `<cache_dir>/index.json`.
 /// On startup we scan the directory so the index survives restarts.
 use anyhow::{Context, Result};
@@ -44,7 +44,12 @@ impl ImageCache {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                warn!(
+                    "Could not restrict cache dir {} to 0700: {} — cached photos may be world-readable",
+                    dir.display(), e
+                );
+            }
         }
 
         let max_bytes = max_mb * 1024 * 1024;
@@ -57,7 +62,11 @@ impl ImageCache {
         };
 
         cache.load_index().await;
-        info!("Cache opened: {} MB used / {} MB limit", cache.used_bytes / 1_048_576, max_mb);
+        info!(
+            "Cache opened: {} MB used / {} MB limit",
+            cache.used_bytes / 1_048_576,
+            max_mb
+        );
         Ok(cache)
     }
 
@@ -69,13 +78,16 @@ impl ImageCache {
         let entry = self.lru.remove(idx).unwrap();
         match fs::read(&entry.path).await {
             Ok(bytes) => {
-                self.lru.push_back(entry);   // refresh LRU position
+                self.lru.push_back(entry); // refresh LRU position
                 debug!("Cache HIT: {}", key);
                 Some(bytes)
             }
             Err(e) => {
                 warn!("Cache entry unreadable ({}): {}", key, e);
                 self.used_bytes = self.used_bytes.saturating_sub(entry.size_bytes);
+                // Persist the removal — otherwise a restart reloads the stale
+                // entry from index.json and trips over it again.
+                self.save_index().await;
                 None
             }
         }
@@ -88,7 +100,18 @@ impl ImageCache {
             return Ok(()); // don't cache oversized blobs
         }
 
-        // Evict until there's room.
+        // Replace any existing entry for this key — a duplicate would
+        // double-count used_bytes and let eviction of the old entry delete
+        // the file the new entry still points at.
+        if let Some(idx) = self.lru.iter().position(|e| e.key == key) {
+            let old = self.lru.remove(idx).unwrap();
+            self.used_bytes = self.used_bytes.saturating_sub(old.size_bytes);
+        }
+
+        // Evict until there's room. If eviction succeeds but the write below
+        // fails, the evicted entries are gone for good (re-downloaded on next
+        // showing) — acceptable on this single-user device; not worth the
+        // complexity of a two-phase evict.
         while self.used_bytes + size > self.max_bytes && !self.lru.is_empty() {
             self.evict_oldest().await;
         }
@@ -135,9 +158,22 @@ impl ImageCache {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     fn path_for(&self, key: &str) -> PathBuf {
-        // key is "plugin-name/photo-id" — sanitise for filesystem
-        let safe = key.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-        self.dir.join(format!("{}.jpg", safe))
+        // key is "plugin-name/photo-id" — sanitise for filesystem. The
+        // separator→`_` replacement is lossy (`local/foo/bar` and
+        // `local/foo_bar` collapse to the same name), so a stable FNV-1a
+        // hash of the ORIGINAL key is appended to keep the mapping
+        // injective. Truncation keeps long photo ids under filesystem
+        // name limits; the hash preserves uniqueness regardless.
+        // NOTE: adding the hash suffix changed cache filenames — existing
+        // caches re-download once and old files age out via the index scan.
+        const MAX_STEM_CHARS: usize = 100;
+        let safe: String = key
+            .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+            .chars()
+            .take(MAX_STEM_CHARS)
+            .collect();
+        self.dir
+            .join(format!("{}-{:016x}.jpg", safe, fnv1a_64(key)))
     }
 
     async fn evict_oldest(&mut self) {
@@ -151,8 +187,10 @@ impl ImageCache {
     async fn save_index(&self) {
         let index_path = self.dir.join(INDEX_FILE);
         match serde_json::to_vec(&self.lru) {
-            Ok(data) => { let _ = fs::write(&index_path, data).await; }
-            Err(e)   => warn!("Failed to save cache index: {}", e),
+            Ok(data) => {
+                let _ = fs::write(&index_path, data).await;
+            }
+            Err(e) => warn!("Failed to save cache index: {}", e),
         }
     }
 
@@ -160,20 +198,55 @@ impl ImageCache {
         let index_path = self.dir.join(INDEX_FILE);
         let data = match fs::read(&index_path).await {
             Ok(d) => d,
-            Err(_) => return,  // first run
+            Err(_) => return, // first run
         };
         let entries: VecDeque<CacheEntry> = match serde_json::from_slice(&data) {
             Ok(e) => e,
-            Err(e) => { warn!("Cache index corrupt, rebuilding: {}", e); return; }
+            Err(e) => {
+                warn!("Cache index corrupt, rebuilding: {}", e);
+                return;
+            }
         };
 
-        // Validate each entry still exists on disk.
-        let mut used = 0u64;
-        let valid: VecDeque<_> = entries.into_iter().filter(|e| {
-            if e.path.exists() { used += e.size_bytes; true } else { false }
-        }).collect();
+        // Validate each entry still exists on disk and re-measure its size —
+        // the persisted size_bytes is untrusted (files may have been
+        // truncated or swapped behind our back), so used_bytes accounting
+        // comes from fresh metadata, never from the JSON. N stat syscalls —
+        // run on a blocking thread so the current_thread executor isn't
+        // stalled at startup.
+        let result = tokio::task::spawn_blocking(move || {
+            let mut used = 0u64;
+            let valid: VecDeque<_> = entries
+                .into_iter()
+                .filter_map(|mut e| {
+                    let len = std::fs::metadata(&e.path).map(|m| m.len()).ok()?;
+                    e.size_bytes = len;
+                    used += len;
+                    Some(e)
+                })
+                .collect();
+            (valid, used)
+        })
+        .await;
 
-        self.used_bytes = used;
-        self.lru = valid;
+        match result {
+            Ok((valid, used)) => {
+                self.used_bytes = used;
+                self.lru = valid;
+            }
+            Err(e) => warn!("Cache index validation task failed: {}", e),
+        }
     }
+}
+
+/// Stable 64-bit FNV-1a hash. Hand-rolled (~6 lines) because std's
+/// `DefaultHasher` is not guaranteed stable across Rust releases and cache
+/// filenames must survive upgrades; not worth a dependency.
+fn fnv1a_64(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for &byte in s.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    hash
 }

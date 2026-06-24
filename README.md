@@ -9,6 +9,8 @@
 
 Renders straight to the KMS/DRM framebuffer via SDL2. Runs on a Pi Zero W with ~8 MB RSS.
 
+> **JPEG only.** The decoder is built with JPEG support alone — every source filters to `.jpg`/`.jpeg`, and videos are skipped. This keeps the binary and RAM footprint minimal on a Pi Zero. Non-JPEG files (PNG/WebP/GIF/HEIC) are ignored.
+
 ---
 
 ## Photo source plugins
@@ -64,7 +66,7 @@ rm -rf ~/.config/picogallery ~/Pictures/PicoGallery   # optional
 
 ## Plugin: `directory` (default)
 
-Default points at `~/Pictures/PicoGallery`. Drop JPEG/PNG/WebP/GIF there; sub-folders become albums.
+Default points at `~/Pictures/PicoGallery`. Drop JPEG photos (`.jpg`/`.jpeg`) there; sub-folders become albums.
 
 ```toml
 [[plugins]]
@@ -196,13 +198,32 @@ password = "CHANGE-ME"
                                          #   over the admin password on a wall display
 
 # ── Filters (all optional, combined with AND) ──────────────────────────────
-# album      = "january-2024"            # album UID or slug
-# favorites  = true                      # only favourites
-# quality    = 3                         # 1=low … 5=excellent (drops lower)
-# country    = "fr"                      # ISO country code
-# year       = 2024
-# media_type = "image"                   # image | raw | live | animated | video
-# query      = "label:beach keyword:sunset"  # raw PhotoPrism Q-language (appended)
+# Each is sent as a typed parameter bound to a real PhotoPrism search field.
+# album       = "january-2024"           # album UID or slug
+# albums      = ["trip", "family"]       # any of several albums (OR)
+# favorites   = true                     # only favourites
+# quality     = 3                        # 1=low … 5=excellent (drops lower)
+# country     = "fr"                     # ISO country code
+# state       = "California"             # state / province
+# city        = "Paris"                 # city
+# year        = 2024
+# after       = "2020-06-01"             # date range start (YYYY-MM-DD)
+# before      = "2020-06-30"             # date range end
+# color       = "blue"                   # red|orange|gold|green|teal|blue|purple|pink|brown|white|grey|black
+# mono        = true                     # only monochrome
+# panorama    = true                     # only panoramas
+# orientation = "portrait"               # portrait | landscape | square (good for a rotated frame)
+# people      = ["Alice", "Bob"]         # only photos containing these subjects (faces)
+# labels      = ["beach", "dog"]         # any of these labels (OR)
+# keywords    = ["sunset"]               # any of these keywords (OR)
+# memories    = true                     # only photos taken on today's date in any year
+# media_type  = "image"                  # image | raw | live | animated
+# query       = "label:beach keyword:sunset"  # raw PhotoPrism Q-language (appended as q=)
+
+# ── Privacy guard (a wall display should not surface these) ─────────────────
+# Private and archived photos are EXCLUDED by default. Opt back in:
+# include_private  = false
+# include_archived = false
 
 # ── Ordering / paging ──────────────────────────────────────────────────────
 # order    = "newest"                    # newest | oldest | added | name | random | similar
@@ -230,8 +251,10 @@ sudo journalctl -u picogallery -f
 ### How auth + fetching works
 
 - **Login:** `POST /api/v1/session` with the username/password (or app password). The returned session ID plus preview/download tokens are cached and reused; the plugin auto-re-logs in on an HTTP 401 and sends `DELETE /api/v1/session/{id}` on shutdown.
-- **Listing:** `GET /api/v1/photos?count=&offset=&order=&merged=true&q=<filters>` — typed filters above are translated to PhotoPrism's `key:value` Q-syntax and merged with any raw `query`.
-- **Image bytes:** thumbnail via `GET /api/v1/t/{hash}/{preview_token}/{size}`, or the original via `GET /api/v1/dl/{hash}?t={download_token}` when `allow_original = true` and no thumbnail is large enough. Video-only items are skipped.
+- **Listing:** `GET /api/v1/photos?count=&offset=&order=&merged=true&…` — each typed filter above is sent as its own query parameter bound to the matching PhotoPrism `SearchPhotos` field (more robust than a hand-built `q=` string); the raw `query` rides along as `q=`.
+- **Image bytes:** JPEG thumbnail via `GET /api/v1/t/{hash}/{preview_token}/{size}`, or the original via `GET /api/v1/dl/{hash}?t={download_token}` when `allow_original = true` and no thumbnail is large enough. Videos are skipped (photos only).
+- **Favourite:** pressing `F` (or the ♥ in the web remote) calls `POST /api/v1/photos/{uid}/like` (un-favourite = `DELETE`), so you can curate the library straight from the frame.
+- **On-screen info:** the configured album's real title is resolved via `GET /api/v1/albums`, and each photo's title + "City, Country" location are surfaced in the OSD pill.
 
 ### Pi Zero RAM profile
 
@@ -312,12 +335,21 @@ fill_screen         = false      # true = crop-to-fill; false = letterbox
 fps                 = 15         # cap; lower = less CPU on Pi Zero
 # width  = 1920                  # 0 = auto-detect
 # height = 1080
-order               = "shuffle"  # shuffle | chronological | newest_first
-show_osd            = true       # metadata pill (album / date / filename) + nav arrows
+order               = "shuffle"  # shuffle | chronological | newest_first | date_cluster
+show_osd            = true       # metadata pill (title / album / location / date / filename) + nav arrows
+letterbox_blur      = true       # fill letterbox bars with a blurred copy instead of black
+ken_burns           = false      # slow zoom/pan per photo (more CPU; off on the original Pi Zero)
+on_this_day_boost   = true       # weave photos taken on today's date (past years) near the front
 
 # Optional HDMI on/off schedule (local time HH:MM, both required to activate)
 # on_time  = "07:00"
 # off_time = "22:00"             # overnight windows supported (e.g. 20:00 → 08:00)
+
+# Optional night mode — dim + warm-shift photos in a dark room (one pixel pass/slide)
+# night_start       = "21:00"    # both required to activate; overnight windows OK
+# night_end         = "07:00"
+# night_dim_percent = 25         # brightness reduction (0–90)
+# night_warmth      = 30         # warm tint strength (0–100)
 
 # Memory safety — photos exceeding these are skipped with WARN, no crash
 # max_image_mb   = 20            # raw file cap (0 = built-in 50 MB default)
@@ -331,9 +363,24 @@ prefetch_count = 3               # ≤3 on Pi Zero
 
 Schedule fires `vcgencmd display_power 0/1` on Pi to cut HDMI power. On non-Pi Linux/macOS the call is a no-op; the black frame is the only effect.
 
-**Navigation:** `→`/`Space` next, `←` prev, `P` pause, `Q`/`Esc` quit. Left mouse click goes back, right click goes forward. When `show_osd = true`, ◄ and ► arrow pills are rendered on the left and right screen edges as a visual hint. Set `show_osd = false` to hide all overlays (metadata pill + arrows).
+**Navigation:** `→`/`Space` next, `←` prev, `P` pause, `F` favourite the current photo, `Q`/`Esc` quit. Left mouse click goes back, right click goes forward. When `show_osd = true`, ◄ and ► arrow pills hint at the left/right edges and a ♥ marks favourited photos. Set `show_osd = false` to hide all overlays.
 
 See `config.example.toml` for every key with inline comments.
+
+---
+
+## Remote control (optional)
+
+A built-in, dependency-free HTTP remote: a phone-friendly page with prev / pause / next / **favourite** buttons plus a JSON status endpoint. No authentication — only enable on a trusted LAN.
+
+```toml
+[remote]
+enabled = true
+port    = 8188
+bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
+```
+
+Open `http://<pi-ip>:8188/` from any phone on the LAN. The ♥ button favourites the current photo on sources that support it (e.g. `photoprism`). `GET /api/status` returns `{paused, index, total, filename, album, favorite}`.
 
 ---
 
