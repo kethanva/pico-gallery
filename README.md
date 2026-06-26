@@ -363,7 +363,9 @@ prefetch_count = 3               # ≤3 on Pi Zero
 
 Schedule fires `vcgencmd display_power 0/1` on Pi to cut HDMI power. On non-Pi Linux/macOS the call is a no-op; the black frame is the only effect.
 
-**Navigation:** `→`/`Space` next, `←` prev, `P` pause, `F` favourite the current photo, `Q`/`Esc` quit. Left mouse click goes back, right click goes forward. When `show_osd = true`, ◄ and ► arrow pills hint at the left/right edges and a ♥ marks favourited photos. Set `show_osd = false` to hide all overlays.
+**Navigation:** `→`/`Space` next, `←` prev, `P` pause, `F` favourite the current photo, `Q`/`Esc` quit. Left mouse click on the left/right screen half goes back/forward. When `show_osd = true`, ◄ and ► arrow pills hint at the left/right edges and a ♥ marks favourited photos. Set `show_osd = false` to hide all overlays.
+
+**Settings menu:** **right-click anywhere** (or press `M`) to open an on-screen menu over the current photo — works on any photo and with any source. It lets you change settings live (pause, transition, order, fit, letterbox blur, info overlay, slide time), **switch the photo source** to any configured `[[plugins]]` entry, **save settings** back to the config file, or **exit**. Drive it with the mouse (hover to highlight, left-click a row to apply, click outside or right-click to close) or the keyboard (`↑`/`↓` to move, `Enter` to apply, `Esc` to close). The menu renders only while open and only when something changes, so it adds no idle CPU/RAM cost on a Pi Zero. Switching source rebuilds, re-authenticates, and re-queues that source end to end; if it can't (missing credentials, not compiled in, no photos) the current source keeps running and the reason is logged.
 
 See `config.example.toml` for every key with inline comments.
 

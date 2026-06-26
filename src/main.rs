@@ -210,8 +210,10 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    // Run the slideshow.
-    let slideshow = Slideshow::new(config, plugins).await?;
+    // Run the slideshow. The plugin factory lets the engine rebuild its photo
+    // sources at runtime when the user switches source from the on-screen menu,
+    // without the slideshow needing to know which plugins were compiled in.
+    let slideshow = Slideshow::new(config, plugins, config_path, Box::new(build_plugins)).await?;
     slideshow.run(remote_rx, remote_status).await
 }
 

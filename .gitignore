@@ -1,4 +1,8 @@
 target/
+# Host-local Cargo config (e.g. forcing x86_64 target on Apple Silicon with
+# Intel-only Homebrew). Must NOT be committed — a fixed [build] target here
+# would break native Linux / Raspberry Pi / CI builds.
+.cargo/
 .DS_Store
 *.pdf
 BACKUPS/

@@ -12,6 +12,7 @@ pub mod cache;
 pub mod config;
 pub mod display_power;
 pub mod exif_util;
+pub mod menu;
 pub mod night;
 pub mod osd;
 pub mod remote;

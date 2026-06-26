@@ -92,6 +92,11 @@ pub struct DisplayConfig {
     #[serde(default = "default_true")]
     pub show_osd: bool,
 
+    /// Draw a small HH:MM clock (local time) at the top centre of each photo.
+    /// Updates once per slide — no per-frame cost. Off by default.
+    #[serde(default)]
+    pub show_clock: bool,
+
     // ── Memory-safety limits ─────────────────────────────────────────────────
     //
     // Both limits are checked before the expensive decode step and generate a
@@ -167,6 +172,7 @@ impl Default for DisplayConfig {
             off_time: None,
             order: PhotoOrder::Shuffle,
             show_osd: true,
+            show_clock: false,
             max_image_mb: 0,
             max_megapixels: 0,
             letterbox_blur: true,
