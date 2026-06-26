@@ -9,6 +9,7 @@ use log::{info, warn};
 use sdl2::{
     event::Event,
     keyboard::Keycode,
+    mouse::MouseButton,
     pixels::PixelFormatEnum,
     rect::Rect,
     render::{Canvas, Texture, TextureCreator},
@@ -385,6 +386,14 @@ impl Renderer {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Replace the live display config. Used when settings change at runtime
+    /// via the right-click menu — affects subsequent `decode_and_scale`
+    /// (fill/letterbox/limits) and transition timing (fps). The window itself
+    /// is not resized, so `width`/`height` overrides are ignored here.
+    pub fn set_display_config(&mut self, config: DisplayConfig) {
+        self.config = config;
     }
 
     // ── Image decode & scale ─────────────────────────────────────────────────
@@ -793,51 +802,88 @@ impl Renderer {
 
     // ── Event loop ────────────────────────────────────────────────────────────
 
-    pub fn poll_events(&mut self) -> Option<SlideshowCmd> {
+    /// Drain all pending SDL events into slideshow commands.
+    ///
+    /// Input is interpreted differently depending on whether the settings menu
+    /// is open, so the caller passes the current `menu_open` state:
+    ///
+    /// - **Menu closed**: left/middle click → Prev/Next by screen half (matches
+    ///   the on-screen ◄/► arrows); **right click → open the menu**; arrow keys
+    ///   / space / P / F as before; `M` also opens the menu.
+    /// - **Menu open**: right click or Esc → close; left click → activate the
+    ///   row under the cursor (`MenuClick` carries the y); mouse motion →
+    ///   `MenuPoint` (hover highlight); up/down → move; Enter/Space → activate.
+    ///
+    /// Returns every command in order (a `Vec`, not a single `Option`) so a
+    /// burst of events in one poll is never dropped. Mouse-motion events are
+    /// only emitted while the menu is open, so an idle slideshow produces none.
+    pub fn poll_events(&mut self, menu_open: bool) -> Vec<SlideshowCmd> {
+        let mut out = Vec::new();
+        let half_w = self.width as i32 / 2;
         for event in self.event_pump.poll_iter() {
             match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Q),
-                    ..
-                } => return Some(SlideshowCmd::Quit),
+                // Window close always quits, menu or not.
+                Event::Quit { .. } => out.push(SlideshowCmd::Quit),
+
                 Event::KeyDown {
-                    keycode: Some(Keycode::Right),
-                    ..
-                }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Space),
-                    ..
-                } => return Some(SlideshowCmd::Next),
-                Event::KeyDown {
-                    keycode: Some(Keycode::Left),
-                    ..
-                } => return Some(SlideshowCmd::Prev),
-                Event::KeyDown {
-                    keycode: Some(Keycode::P),
-                    ..
-                } => return Some(SlideshowCmd::TogglePause),
-                Event::KeyDown {
-                    keycode: Some(Keycode::F),
-                    ..
-                } => return Some(SlideshowCmd::ToggleFavorite),
-                // Position-based: click left half → Prev, right half → Next.
-                // Any button works — matches the on-screen ◄ / ► arrow positions.
-                Event::MouseButtonDown { x, .. } => {
-                    return Some(if x < self.width as i32 / 2 {
-                        SlideshowCmd::Prev
+                    keycode: Some(key), ..
+                } => {
+                    if menu_open {
+                        match key {
+                            Keycode::Escape => out.push(SlideshowCmd::CloseMenu),
+                            Keycode::Up => out.push(SlideshowCmd::MenuMove(-1)),
+                            Keycode::Down => out.push(SlideshowCmd::MenuMove(1)),
+                            Keycode::Return | Keycode::KpEnter | Keycode::Space => {
+                                out.push(SlideshowCmd::MenuActivate)
+                            }
+                            _ => {}
+                        }
                     } else {
-                        SlideshowCmd::Next
-                    });
+                        match key {
+                            Keycode::Escape | Keycode::Q => out.push(SlideshowCmd::Quit),
+                            Keycode::Right | Keycode::Space => out.push(SlideshowCmd::Next),
+                            Keycode::Left => out.push(SlideshowCmd::Prev),
+                            Keycode::P => out.push(SlideshowCmd::TogglePause),
+                            Keycode::F => out.push(SlideshowCmd::ToggleFavorite),
+                            Keycode::M => out.push(SlideshowCmd::OpenMenu),
+                            _ => {}
+                        }
+                    }
                 }
+
+                Event::MouseButtonDown {
+                    mouse_btn, x, y, ..
+                } => {
+                    if menu_open {
+                        match mouse_btn {
+                            MouseButton::Right => out.push(SlideshowCmd::CloseMenu),
+                            MouseButton::Left => out.push(SlideshowCmd::MenuClick { x, y }),
+                            _ => {}
+                        }
+                    } else {
+                        match mouse_btn {
+                            // Right-click anywhere opens the settings menu.
+                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+                            // Left/middle: position-based prev/next.
+                            _ => out.push(if x < half_w {
+                                SlideshowCmd::Prev
+                            } else {
+                                SlideshowCmd::Next
+                            }),
+                        }
+                    }
+                }
+
+                // Hover only matters while the menu is up; ignored otherwise so
+                // an idle slideshow never wakes on mouse movement.
+                Event::MouseMotion { x, y, .. } if menu_open => {
+                    out.push(SlideshowCmd::MenuPoint { x, y })
+                }
+
                 _ => {}
             }
         }
-        None
+        out
     }
 
     pub fn show_osd(&mut self, lines: &[String]) {
@@ -1028,4 +1074,16 @@ pub enum SlideshowCmd {
     TogglePause,
     ToggleFavorite,
     Quit,
+    /// Open the settings menu (right-click / `M`).
+    OpenMenu,
+    /// Close the settings menu without selecting (right-click / Esc / click-away).
+    CloseMenu,
+    /// Move the menu selection by a relative amount (keyboard up/down).
+    MenuMove(i32),
+    /// Hover the menu row at this screen position (mouse motion).
+    MenuPoint { x: i32, y: i32 },
+    /// Click the menu row at this screen position (left button).
+    MenuClick { x: i32, y: i32 },
+    /// Activate the currently-selected menu row (Enter/Space).
+    MenuActivate,
 }

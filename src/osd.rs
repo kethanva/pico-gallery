@@ -365,6 +365,145 @@ pub fn draw_favorite(img: &mut RgbaImage) {
     draw_glyph(img, HEART, gx, gy, FAV_RED);
 }
 
+// ── Clock ─────────────────────────────────────────────────────────────────────
+
+/// Stamp an `HH:MM` clock pill centred along the top edge. Same dark-pill +
+/// drop-shadow styling as the rest of the OSD; one cheap blit per slide, so it
+/// adds no per-frame cost on a Pi Zero. Caller supplies the formatted string.
+pub fn draw_clock(img: &mut RgbaImage, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let (iw, _ih) = img.dimensions();
+    let chars = text.chars().count() as u32;
+    let box_w = chars * GLYPH_W + PAD * 2;
+    let box_h = GLYPH_H + PAD * 2;
+    let bx = iw.saturating_sub(box_w) / 2;
+    let by = EDGE;
+
+    darken_rect(img, bx, by, box_w, box_h);
+    draw_text(img, text, (bx + PAD) as i32, (by + PAD) as i32);
+}
+
+// ── Settings menu ───────────────────────────────────────────────────────────────
+
+const MENU_ROW_H: u32 = GLYPH_H + 8; // row pitch (text + breathing room)
+const MENU_PAD: u32 = 16; // panel inner padding
+const MENU_BG: [u8; 4] = [20, 20, 28, 255]; // panel background
+const MENU_SEL: [u8; 4] = [54, 82, 140, 255]; // selected-row highlight
+
+/// Full panel geometry shared by `draw_menu` and `menu_hit_test` — the single
+/// source of truth so a click maps to exactly the row it lands on, in both
+/// axes. Returns `(panel_x, panel_top, panel_w, panel_h, rows_top, row_h)`.
+/// `panel_x`/`panel_top` may be negative only in degenerate cases (panel wider
+/// or taller than the screen); callers clamp before drawing.
+fn menu_geometry(img_w: u32, img_h: u32, title: &str, rows: &[String]) -> (i32, i32, u32, u32, i32, u32) {
+    // Width from the widest line (title or any row).
+    let longest = rows
+        .iter()
+        .map(|r| r.chars().count())
+        .chain(std::iter::once(title.chars().count()))
+        .max()
+        .unwrap_or(0) as u32;
+    let panel_w = (longest * GLYPH_W + MENU_PAD * 2).min(img_w);
+    let panel_x = (img_w.saturating_sub(panel_w) / 2) as i32;
+
+    // Height = padding + title row + N rows + padding.
+    let panel_h = MENU_PAD * 2 + MENU_ROW_H + MENU_ROW_H * rows.len() as u32;
+    let panel_top = (img_h.saturating_sub(panel_h) / 2) as i32;
+    let rows_top = panel_top + (MENU_PAD + MENU_ROW_H) as i32;
+
+    (panel_x, panel_top, panel_w, panel_h, rows_top, MENU_ROW_H)
+}
+
+/// Fill a solid opaque rectangle, clipped to the image.
+fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+    let (iw, ih) = img.dimensions();
+    let x_end = (x + w).min(iw);
+    let y_end = (y + h).min(ih);
+    if x >= x_end || y >= y_end {
+        return;
+    }
+    let stride = iw as usize * 4;
+    let buf = img.as_mut();
+    for py in y..y_end {
+        let row_off = py as usize * stride;
+        for px in x..x_end {
+            let i = row_off + px as usize * 4;
+            buf[i] = color[0];
+            buf[i + 1] = color[1];
+            buf[i + 2] = color[2];
+            buf[i + 3] = color[3];
+        }
+    }
+}
+
+/// Map a screen `(x, y)` to a menu row index, or `None` if the click lands
+/// outside the panel (used to dismiss the menu on click-away). Rejects clicks
+/// outside the panel horizontally too, so clicking the dimmed photo beside the
+/// panel dismisses rather than activating the row at that height. Mirrors
+/// `draw_menu`'s geometry exactly via the shared `menu_geometry`.
+pub fn menu_hit_test(img_w: u32, img_h: u32, title: &str, rows: &[String], x: i32, y: i32) -> Option<usize> {
+    let n_rows = rows.len();
+    if n_rows == 0 {
+        return None;
+    }
+    let (panel_x, _panel_top, panel_w, _panel_h, rows_top, row_h) =
+        menu_geometry(img_w, img_h, title, rows);
+    if x < panel_x || x >= panel_x + panel_w as i32 || y < rows_top {
+        return None;
+    }
+    let idx = ((y - rows_top) / row_h as i32) as usize;
+    (idx < n_rows).then_some(idx)
+}
+
+/// Draw the settings menu: a centred dark panel over a dimmed photo, a title,
+/// and one row per entry with the selected row highlighted. Uses the same
+/// built-in 8×8 bitmap font as the rest of the OSD — no system font needed.
+///
+/// Cost: two full-frame dim passes + an opaque panel fill + the glyphs. Only
+/// called while the menu is open *and* its state changed, so it never runs on
+/// the slideshow hot path.
+pub fn draw_menu(img: &mut RgbaImage, title: &str, rows: &[String], selected: usize) {
+    let (iw, ih) = img.dimensions();
+    let (panel_x_i, panel_top, panel_w, panel_h, rows_top, row_h) =
+        menu_geometry(iw, ih, title, rows);
+    let panel_x = panel_x_i.max(0) as u32;
+    let panel_top_u = panel_top.max(0) as u32;
+
+    // Dim the whole photo so the panel reads clearly (two cheap passes).
+    darken_rect(img, 0, 0, iw, ih);
+    darken_rect(img, 0, 0, iw, ih);
+
+    // Panel background.
+    fill_rect(img, panel_x, panel_top_u, panel_w, panel_h, MENU_BG);
+
+    // Title.
+    draw_text(
+        img,
+        title,
+        (panel_x + MENU_PAD) as i32,
+        (panel_top_u + MENU_PAD) as i32,
+    );
+
+    // Rows.
+    let text_inset = ((MENU_ROW_H - GLYPH_H) / 2) as i32;
+    for (i, row) in rows.iter().enumerate() {
+        let row_y = rows_top + i as i32 * row_h as i32;
+        if i == selected && row_y >= 0 {
+            fill_rect(
+                img,
+                panel_x + MENU_PAD / 2,
+                row_y as u32,
+                panel_w.saturating_sub(MENU_PAD),
+                MENU_ROW_H,
+                MENU_SEL,
+            );
+        }
+        draw_text(img, row, (panel_x + MENU_PAD) as i32, row_y + text_inset);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -431,6 +570,63 @@ mod tests {
     fn draw_favorite_does_not_panic_on_tiny_image() {
         let mut img = white_img(1, 1);
         draw_favorite(&mut img);
+    }
+
+    #[test]
+    fn menu_hit_test_maps_clicks_to_rows() {
+        let (img_w, img_h) = (1920u32, 1080u32);
+        let title = "Settings";
+        let rows: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        let (panel_x, _pt, panel_w, _ph, rows_top, row_h) =
+            menu_geometry(img_w, img_h, title, &rows);
+        let cx = panel_x + panel_w as i32 / 2; // inside the panel horizontally
+        // Middle of row 3 resolves to index 3.
+        let y = rows_top + 3 * row_h as i32 + row_h as i32 / 2;
+        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, y), Some(3));
+        // Above the first row → no hit (click-away dismiss).
+        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, rows_top - 5), None);
+        // Below the last row → no hit.
+        let below = rows_top + rows.len() as i32 * row_h as i32 + 5;
+        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, below), None);
+        // Outside the panel horizontally → no hit even at a valid row height.
+        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, panel_x - 5, y), None);
+        assert_eq!(
+            menu_hit_test(img_w, img_h, title, &rows, panel_x + panel_w as i32 + 5, y),
+            None
+        );
+    }
+
+    #[test]
+    fn draw_clock_darkens_top_centre_and_does_not_panic() {
+        let (w, h) = (320u32, 240u32);
+        let mut img = white_img(w, h);
+        draw_clock(&mut img, "12:34");
+        // Pill sits centred along the top edge; its centre is no longer white.
+        let px = img.get_pixel(w / 2, EDGE + (GLYPH_H + PAD * 2) / 2);
+        assert!(px[0] < 200, "expected darkened clock pill, got {px:?}");
+    }
+
+    #[test]
+    fn draw_clock_empty_is_noop() {
+        let mut img = white_img(64, 64);
+        draw_clock(&mut img, "");
+        assert_eq!(img.get_pixel(32, EDGE), &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn draw_menu_does_not_panic() {
+        let mut img = white_img(1920, 1080);
+        let rows: Vec<String> = (0..9).map(|i| format!("row {i}")).collect();
+        draw_menu(&mut img, "PicoGallery — Settings", &rows, 2);
+    }
+
+    #[test]
+    fn draw_menu_does_not_panic_on_small_image() {
+        let mut img = white_img(160, 120);
+        let rows: Vec<String> = (0..12)
+            .map(|i| format!("a rather long row label {i}"))
+            .collect();
+        draw_menu(&mut img, "Settings", &rows, 5);
     }
 
     #[test]

@@ -3,16 +3,18 @@
 /// Runs on the Tokio runtime. A background task pre-fetches the next N images
 /// while the current one is on screen, so transitions are instant on slow Pi
 /// Zero I/O.  All plugin calls are async and non-blocking.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::cache::ImageCache;
-use crate::config::{Config, Transition};
+use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
+use crate::menu::{Menu, MenuAction};
 use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
 use crate::remote::SharedStatus;
 use crate::renderer::{Renderer, SlideshowCmd};
@@ -20,19 +22,55 @@ use tokio::sync::mpsc::Receiver;
 
 const PAGE_SIZE: usize = 50; // photos fetched per API page
 
+/// Settings-menu title. Used both to render the panel and to compute its
+/// geometry for click/hover hit-testing, so the two must use the same string.
+const MENU_TITLE: &str = "PicoGallery - Settings";
+
+/// Builds fresh plugin instances from a config. Lets the engine rebuild its
+/// photo sources at runtime (e.g. when the user switches source from the
+/// menu) without the slideshow needing to know which plugins were compiled in
+/// — the menu therefore works for any package/extension.
+pub type PluginFactory = Box<dyn Fn(&Config) -> Vec<BoxedPlugin>>;
+
 pub struct Slideshow {
     config: Config,
     plugins: Vec<BoxedPlugin>,
     cache: Arc<Mutex<ImageCache>>,
+    /// Where to persist settings when the user picks "Save settings".
+    config_path: PathBuf,
+    /// Rebuilds the plugin set from a config — used to switch source at runtime.
+    factory: PluginFactory,
+}
+
+/// How the display loop must react to a menu action.
+enum MenuOutcome {
+    /// Nothing structural changed — just repaint the menu.
+    Stay,
+    /// User chose Exit.
+    Quit,
+    /// A decode-affecting setting changed; drop pre-decoded frames so the next
+    /// ones pick up the new setting.
+    ReloadFrames,
+    /// The play order changed; install the re-ordered queue.
+    NewQueue(Vec<(usize, PhotoMeta)>),
+    /// The photo source changed; install the new queue and close the menu.
+    Switched(Vec<(usize, PhotoMeta)>),
 }
 
 impl Slideshow {
-    pub async fn new(config: Config, plugins: Vec<BoxedPlugin>) -> Result<Self> {
+    pub async fn new(
+        config: Config,
+        plugins: Vec<BoxedPlugin>,
+        config_path: PathBuf,
+        factory: PluginFactory,
+    ) -> Result<Self> {
         let cache = ImageCache::open(&config.cache.resolved_dir(), config.cache.max_mb).await?;
         Ok(Self {
             config,
             plugins,
             cache: Arc::new(Mutex::new(cache)),
+            config_path,
+            factory,
         })
     }
 
@@ -101,9 +139,20 @@ impl Slideshow {
     // ── Queue building ────────────────────────────────────────────────────
 
     async fn build_queue(&self) -> Result<Vec<(usize, PhotoMeta)>> {
+        Self::build_queue_with(&self.plugins, &self.config.display).await
+    }
+
+    /// Build the shuffled/ordered play queue from an explicit plugin set and
+    /// display config. Used both at startup and when the source is switched at
+    /// runtime — keeping it free of `&self` lets the switch path build a queue
+    /// from a fresh, not-yet-installed plugin set before committing to it.
+    async fn build_queue_with(
+        plugins: &[BoxedPlugin],
+        display: &DisplayConfig,
+    ) -> Result<Vec<(usize, PhotoMeta)>> {
         let mut all: Vec<(usize, PhotoMeta)> = Vec::new();
 
-        for (plugin_idx, plugin) in self.plugins.iter().enumerate() {
+        for (plugin_idx, plugin) in plugins.iter().enumerate() {
             let mut offset = 0;
             loop {
                 match plugin.list_photos(PAGE_SIZE, offset).await {
@@ -129,7 +178,6 @@ impl Slideshow {
             }
         }
 
-        use crate::config::PhotoOrder;
         // Nanosecond clock as shuffle seed. On an RTC-less Pi that cold-boots
         // before NTP sync the clock (and therefore the seed) is roughly the
         // same every boot — including the literal-42 fallback if the clock
@@ -140,10 +188,10 @@ impl Slideshow {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(42);
 
-        match self.config.display.order {
+        match display.order {
             PhotoOrder::Shuffle => {
                 shuffle(&mut all, seed);
-                if self.config.display.on_this_day_boost {
+                if display.on_this_day_boost {
                     weave_on_this_day(&mut all);
                 }
                 info!("Photo order: shuffle ({} photos)", all.len());
@@ -168,9 +216,9 @@ impl Slideshow {
     // ── Display loop ──────────────────────────────────────────────────────
 
     async fn display_loop(
-        &self,
+        &mut self,
         renderer: &mut Renderer,
-        queue: Vec<(usize, PhotoMeta)>,
+        mut queue: Vec<(usize, PhotoMeta)>,
         mut remote_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
     ) -> Result<()> {
@@ -194,6 +242,12 @@ impl Slideshow {
         // vcgencmd and the black frame only at the exact on→off / off→on edges.
         let mut display_was_on = true;
 
+        // Right-click settings menu (config + source switch + exit). Closed by
+        // default; rendered only while open and only when its state changes, so
+        // it adds no steady-state CPU or memory cost on a Pi Zero.
+        let mut menu = Menu::default();
+        let mut menu_dirty = false;
+
         // Pre-warm the prefetch ring (fetch + decode the first N photos).
         let mut cursor = 0usize;
         for _ in 0..prefetch_n {
@@ -202,7 +256,6 @@ impl Slideshow {
         }
 
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
-        let trans_dur = Duration::from_millis(self.config.display.transition_ms as u64);
 
         // Initialize last_advance so that the first photo shows immediately
         let mut last_advance = Instant::now()
@@ -210,15 +263,40 @@ impl Slideshow {
             .unwrap_or_else(Instant::now);
 
         loop {
+            // Re-read timing each iteration so menu changes to slide duration /
+            // transition take effect immediately (both are trivially cheap).
+            let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
+            let trans_dur = Duration::from_millis(self.config.display.transition_ms as u64);
+
             // ── Event handling ─────────────────────────────────────────────
             // Keyboard/mouse first, then everything the HTTP remote queued —
-            // both sources flow through the same match below.
-            let mut cmds: Vec<SlideshowCmd> = renderer.poll_events().into_iter().collect();
+            // both sources flow through the same match below. poll_events
+            // interprets input differently while the menu is open, so it gets
+            // the current menu state.
+            let mut cmds: Vec<SlideshowCmd> = renderer.poll_events(menu.open);
             if let Some(rx) = remote_rx.as_mut() {
                 while let Ok(cmd) = rx.try_recv() {
                     cmds.push(cmd);
                 }
             }
+
+            // Menu rows + labels for *this* input batch, built once so clicks
+            // map to the exact layout poll_events hit-tested against. Only built
+            // when the menu is open *and* there is input to interpret — an
+            // idle-open menu allocates nothing each tick (Pi Zero stays cold).
+            let (action_rows, action_labels) = if menu.open && !cmds.is_empty() {
+                let sources = self.source_list();
+                let rows = crate::menu::build_rows(&self.config.display, paused, &sources);
+                let labels: Vec<String> = rows.iter().map(|r| r.label.clone()).collect();
+                (rows, labels)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            // At most one activation per batch — users don't double-click inside
+            // a 30 ms tick, and this keeps the borrow-heavy action handling out
+            // of the per-command match.
+            let mut pending_activate = false;
+
             for cmd in cmds {
                 match cmd {
                     SlideshowCmd::Quit => {
@@ -226,36 +304,205 @@ impl Slideshow {
                         self.cache.lock().await.flush().await;
                         return Ok(());
                     }
+                    SlideshowCmd::OpenMenu => {
+                        menu.open = true;
+                        menu.selected = 0;
+                        menu_dirty = true;
+                    }
+                    SlideshowCmd::CloseMenu => {
+                        if menu.open {
+                            menu.open = false;
+                            // Repaint the photo underneath so the menu vanishes.
+                            if let Some(img) = &current_rgba {
+                                let _ = renderer.show_cut(img);
+                            }
+                            if !paused {
+                                last_advance = Instant::now();
+                            }
+                        }
+                    }
+                    SlideshowCmd::MenuMove(d) => {
+                        if menu.open && !action_rows.is_empty() {
+                            let n = action_rows.len() as i32;
+                            menu.selected = (((menu.selected as i32 + d) % n + n) % n) as usize;
+                            menu_dirty = true;
+                        }
+                    }
+                    SlideshowCmd::MenuPoint { x, y } => {
+                        if menu.open {
+                            if let Some(idx) = crate::osd::menu_hit_test(
+                                renderer.width(),
+                                renderer.height(),
+                                MENU_TITLE,
+                                &action_labels,
+                                x,
+                                y,
+                            ) {
+                                if idx != menu.selected {
+                                    menu.selected = idx;
+                                    menu_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    SlideshowCmd::MenuClick { x, y } => {
+                        if menu.open {
+                            match crate::osd::menu_hit_test(
+                                renderer.width(),
+                                renderer.height(),
+                                MENU_TITLE,
+                                &action_labels,
+                                x,
+                                y,
+                            ) {
+                                Some(idx) => {
+                                    menu.selected = idx;
+                                    pending_activate = true;
+                                }
+                                // Click outside the panel dismisses the menu.
+                                None => {
+                                    menu.open = false;
+                                    if let Some(img) = &current_rgba {
+                                        let _ = renderer.show_cut(img);
+                                    }
+                                    if !paused {
+                                        last_advance = Instant::now();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SlideshowCmd::MenuActivate => {
+                        if menu.open {
+                            pending_activate = true;
+                        }
+                    }
+                    // Normal slideshow commands are ignored while the menu is
+                    // up (the photo behind it isn't advancing anyway).
                     SlideshowCmd::TogglePause => {
+                        if !menu.open {
+                            paused = !paused;
+                            info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
+                            last_advance = Instant::now();
+                            if let Some(status) = &remote_status {
+                                status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
+                            }
+                        }
+                    }
+                    SlideshowCmd::Next => {
+                        if !menu.open {
+                            last_advance = Instant::now()
+                                .checked_sub(slide_dur)
+                                .unwrap_or_else(Instant::now); // force advance
+                        }
+                    }
+                    SlideshowCmd::Prev => {
+                        if !menu.open {
+                            current_queue_idx = if current_queue_idx == 0 {
+                                queue.len().saturating_sub(1)
+                            } else {
+                                current_queue_idx - 1
+                            };
+                            prefetched.clear();
+                            cursor = current_queue_idx;
+                            last_advance = Instant::now()
+                                .checked_sub(slide_dur)
+                                .unwrap_or_else(Instant::now);
+                        }
+                    }
+                    SlideshowCmd::ToggleFavorite => {
+                        if !menu.open {
+                            self.toggle_favorite(&mut current_meta, &remote_status)
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            // ── Apply a menu activation (at most one per input batch) ───────
+            if pending_activate && menu.open && !action_rows.is_empty() {
+                let sel = menu.selected.min(action_rows.len() - 1);
+                match action_rows[sel].action {
+                    // Pause/Resume shares the slideshow's pause flag, a loop
+                    // local — handle it here rather than in the action helper.
+                    MenuAction::TogglePause => {
                         paused = !paused;
                         info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                         last_advance = Instant::now();
                         if let Some(status) = &remote_status {
                             status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
                         }
+                        menu_dirty = true;
                     }
-                    SlideshowCmd::Next => {
-                        last_advance = Instant::now()
-                            .checked_sub(slide_dur)
-                            .unwrap_or_else(Instant::now); // force advance
-                    }
-                    SlideshowCmd::Prev => {
-                        current_queue_idx = if current_queue_idx == 0 {
-                            queue.len().saturating_sub(1)
-                        } else {
-                            current_queue_idx - 1
-                        };
-                        prefetched.clear();
-                        cursor = current_queue_idx;
-                        last_advance = Instant::now()
-                            .checked_sub(slide_dur)
-                            .unwrap_or_else(Instant::now);
-                    }
-                    SlideshowCmd::ToggleFavorite => {
-                        self.toggle_favorite(&mut current_meta, &remote_status)
-                            .await;
-                    }
+                    other => match self.handle_menu_action(other, renderer).await {
+                        MenuOutcome::Stay => menu_dirty = true,
+                        MenuOutcome::Quit => {
+                            self.cache.lock().await.flush().await;
+                            return Ok(());
+                        }
+                        MenuOutcome::ReloadFrames => {
+                            prefetched.clear();
+                            if !queue.is_empty() {
+                                cursor = (current_queue_idx + 1) % queue.len();
+                            }
+                            menu_dirty = true;
+                        }
+                        MenuOutcome::NewQueue(q) => {
+                            queue = q;
+                            cursor = 0;
+                            current_queue_idx = 0;
+                            prefetched.clear();
+                            menu_dirty = true;
+                        }
+                        MenuOutcome::Switched(q) => {
+                            queue = q;
+                            cursor = 0;
+                            current_queue_idx = 0;
+                            prefetched.clear();
+                            current_meta = None;
+                            menu.open = false;
+                            // Show the new source promptly.
+                            last_advance = Instant::now()
+                                .checked_sub(slide_dur)
+                                .unwrap_or_else(Instant::now);
+                        }
+                    },
                 }
+            }
+
+            // ── Menu overlay ───────────────────────────────────────────────
+            // While the menu is open the slideshow does not advance and nothing
+            // is prefetched or decoded — the only work is repainting the panel,
+            // and only when something changed. A Pi Zero stays idle here.
+            if menu.open {
+                if menu_dirty {
+                    let sources = self.source_list();
+                    let labels: Vec<String> =
+                        crate::menu::build_rows(&self.config.display, paused, &sources)
+                            .into_iter()
+                            .map(|r| r.label)
+                            .collect();
+                    // Composite onto a full-screen base so the menu geometry is
+                    // in screen coordinates. Otherwise click/hover hit-testing
+                    // (which uses the screen height) would be vertically offset
+                    // whenever the photo doesn't fill the screen — e.g. plain
+                    // letterbox (`letterbox_blur = false`) or `fill_screen` crop.
+                    let mut frame = RgbaImage::from_pixel(
+                        renderer.width().max(1),
+                        renderer.height().max(1),
+                        Rgba([0, 0, 0, 255]),
+                    );
+                    if let Some(img) = &current_rgba {
+                        blit_center(&mut frame, img);
+                    }
+                    crate::osd::draw_menu(&mut frame, MENU_TITLE, &labels, menu.selected);
+                    if let Err(e) = renderer.show_cut(&frame) {
+                        warn!("menu render error: {e}");
+                    }
+                    menu_dirty = false;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                continue;
             }
 
             // ── Display schedule ───────────────────────────────────────────
@@ -345,6 +592,13 @@ impl Slideshow {
                     {
                         crate::osd::draw_favorite(&mut rgba);
                     }
+                }
+                // Clock is its own toggle (independent of show_osd). Formatted
+                // here from the wall clock at display time, so it reflects the
+                // current minute each slide.
+                if self.config.display.show_clock {
+                    let now = chrono::Local::now().format("%H:%M").to_string();
+                    crate::osd::draw_clock(&mut rgba, &now);
                 }
                 let result = match self.config.display.transition {
                     Transition::Cut => renderer.show_cut(&rgba),
@@ -485,6 +739,164 @@ impl Slideshow {
         }
     }
 
+    // ── Settings menu ─────────────────────────────────────────────────────
+
+    /// `(name, is_active)` for every configured `[[plugins]]` entry, in config
+    /// order. Source-agnostic: lists whatever sources the config declares, so
+    /// the menu works for any package/extension that is configured.
+    fn source_list(&self) -> Vec<(String, bool)> {
+        self.config
+            .plugins
+            .iter()
+            .map(|p| (p.name.clone(), p.enabled))
+            .collect()
+    }
+
+    /// Apply a menu action other than pause (pause is a loop local). Returns how
+    /// the display loop should react. Never fails the slideshow — problems are
+    /// logged and reported as `Stay`.
+    async fn handle_menu_action(
+        &mut self,
+        action: MenuAction,
+        renderer: &mut Renderer,
+    ) -> MenuOutcome {
+        match action {
+            MenuAction::TogglePause => MenuOutcome::Stay, // handled by caller
+            MenuAction::CycleTransition => {
+                self.config.display.transition = next_transition(&self.config.display.transition);
+                renderer.set_display_config(self.config.display.clone());
+                MenuOutcome::Stay
+            }
+            MenuAction::CycleSlideDuration => {
+                self.config.display.slide_duration_secs =
+                    next_slide_secs(self.config.display.slide_duration_secs);
+                MenuOutcome::Stay
+            }
+            MenuAction::ToggleFillScreen => {
+                self.config.display.fill_screen = !self.config.display.fill_screen;
+                renderer.set_display_config(self.config.display.clone());
+                MenuOutcome::ReloadFrames
+            }
+            MenuAction::ToggleLetterboxBlur => {
+                self.config.display.letterbox_blur = !self.config.display.letterbox_blur;
+                renderer.set_display_config(self.config.display.clone());
+                MenuOutcome::ReloadFrames
+            }
+            MenuAction::ToggleOsd => {
+                self.config.display.show_osd = !self.config.display.show_osd;
+                MenuOutcome::Stay
+            }
+            MenuAction::ToggleClock => {
+                self.config.display.show_clock = !self.config.display.show_clock;
+                MenuOutcome::Stay
+            }
+            MenuAction::CycleOrder => {
+                self.config.display.order = next_order(&self.config.display.order);
+                match Self::build_queue_with(&self.plugins, &self.config.display).await {
+                    Ok(q) => MenuOutcome::NewQueue(q),
+                    Err(e) => {
+                        warn!("Re-order failed: {e}");
+                        MenuOutcome::Stay
+                    }
+                }
+            }
+            MenuAction::SwitchSource(idx) => self.switch_source(idx, renderer).await,
+            MenuAction::SaveConfig => {
+                match self.save_config() {
+                    Ok(()) => info!("Settings saved to {}", self.config_path.display()),
+                    Err(e) => warn!("Could not save settings: {e}"),
+                }
+                MenuOutcome::Stay
+            }
+            MenuAction::Exit => MenuOutcome::Quit,
+        }
+    }
+
+    /// Switch the active photo source to `config.plugins[idx]`, end to end:
+    /// rebuild the plugin set with only that source enabled, initialise and
+    /// authenticate it, then build a fresh queue. On *any* failure the previous
+    /// source is left running untouched and the reason is logged — the
+    /// slideshow never breaks because a switch didn't pan out.
+    async fn switch_source(&mut self, idx: usize, renderer: &mut Renderer) -> MenuOutcome {
+        if idx >= self.config.plugins.len() {
+            return MenuOutcome::Stay;
+        }
+        // Trial config: enable only the chosen source (immutable update — the
+        // live config is untouched until the switch fully succeeds).
+        let mut trial = self.config.clone();
+        for (i, p) in trial.plugins.iter_mut().enumerate() {
+            p.enabled = i == idx;
+        }
+        let name = trial.plugins[idx].name.clone();
+
+        let mut new_plugins = (self.factory)(&trial);
+        if new_plugins.is_empty() {
+            warn!("Cannot switch to '{name}': not compiled into this build");
+            return MenuOutcome::Stay;
+        }
+
+        for plugin in &mut new_plugins {
+            let pcfg = trial
+                .plugin_config(plugin.name())
+                .cloned()
+                .unwrap_or_default();
+            if let Err(e) = plugin.init(&pcfg).await {
+                warn!("Cannot switch to '{name}': init failed: {e}");
+                return MenuOutcome::Stay;
+            }
+            match plugin.authenticate().await {
+                Ok(AuthStatus::Authenticated) => {}
+                Ok(AuthStatus::NotAuthenticated) => {
+                    warn!("Cannot switch to '{name}': not authenticated");
+                    return MenuOutcome::Stay;
+                }
+                Ok(AuthStatus::PendingUserAction { .. }) => {
+                    warn!(
+                        "Cannot switch to '{name}': needs interactive setup — \
+                         configure it and restart"
+                    );
+                    return MenuOutcome::Stay;
+                }
+                Err(e) => {
+                    warn!("Cannot switch to '{name}': auth error: {e}");
+                    return MenuOutcome::Stay;
+                }
+            }
+        }
+
+        match Self::build_queue_with(&new_plugins, &trial.display).await {
+            Ok(queue) if !queue.is_empty() => {
+                info!("Switched source to '{name}' ({} photos)", queue.len());
+                self.config = trial;
+                self.plugins = new_plugins;
+                renderer.set_display_config(self.config.display.clone());
+                MenuOutcome::Switched(queue)
+            }
+            Ok(_) => {
+                warn!("Cannot switch to '{name}': source returned no photos");
+                MenuOutcome::Stay
+            }
+            Err(e) => {
+                warn!("Cannot switch to '{name}': listing failed: {e}");
+                MenuOutcome::Stay
+            }
+        }
+    }
+
+    /// Persist the current in-memory config back to the config file. Writes are
+    /// explicit (this menu item only) — never on every toggle — to spare the
+    /// Pi's SD card. Note this rewrites the file without the template's
+    /// explanatory comments: the settings survive, the prose does not.
+    fn save_config(&self) -> Result<()> {
+        let text = toml::to_string_pretty(&self.config).context("serialising config to TOML")?;
+        if let Some(parent) = self.config_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&self.config_path, text)
+            .with_context(|| format!("writing config {}", self.config_path.display()))?;
+        Ok(())
+    }
+
     // ── Fetching ──────────────────────────────────────────────────────────
 
     async fn fetch_photo(
@@ -517,6 +929,64 @@ impl Slideshow {
                 None
             }
         }
+    }
+}
+
+/// Copy `src` into the centre of `dst`, clipped on every edge. Handles `src`
+/// both smaller than `dst` (letterbox — centred with a border) and larger
+/// (fill crop — centre region copied). Straight row memcpy, no blending.
+fn blit_center(dst: &mut RgbaImage, src: &RgbaImage) {
+    let (dw, dh) = dst.dimensions();
+    let (sw, sh) = src.dimensions();
+    let ox = (dw as i32 - sw as i32) / 2;
+    let oy = (dh as i32 - sh as i32) / 2;
+    let dstride = dw as usize * 4;
+    let sstride = sw as usize * 4;
+    let dbuf = dst.as_mut();
+    let sbuf = src.as_raw();
+    for sy in 0..sh as i32 {
+        let dy = oy + sy;
+        if dy < 0 || dy >= dh as i32 {
+            continue;
+        }
+        let dx0 = ox.max(0);
+        let sx0 = dx0 - ox; // ≥ 0 by construction
+        let copy_w = (sw as i32 - sx0).min(dw as i32 - dx0);
+        if copy_w <= 0 {
+            continue;
+        }
+        let d = dy as usize * dstride + dx0 as usize * 4;
+        let s = sy as usize * sstride + sx0 as usize * 4;
+        let n = copy_w as usize * 4;
+        dbuf[d..d + n].copy_from_slice(&sbuf[s..s + n]);
+    }
+}
+
+// ── Menu value cyclers ───────────────────────────────────────────────────────
+
+fn next_transition(t: &Transition) -> Transition {
+    match t {
+        Transition::Cut => Transition::Fade,
+        Transition::Fade => Transition::SlideLeft,
+        Transition::SlideLeft => Transition::SlideRight,
+        Transition::SlideRight => Transition::Cut,
+    }
+}
+
+fn next_order(o: &PhotoOrder) -> PhotoOrder {
+    match o {
+        PhotoOrder::Shuffle => PhotoOrder::Chronological,
+        PhotoOrder::Chronological => PhotoOrder::NewestFirst,
+        PhotoOrder::NewestFirst => PhotoOrder::DateCluster,
+        PhotoOrder::DateCluster => PhotoOrder::Shuffle,
+    }
+}
+
+fn next_slide_secs(current: u64) -> u64 {
+    const PRESETS: [u64; 6] = [3, 5, 10, 15, 30, 60];
+    match PRESETS.iter().position(|&s| s == current) {
+        Some(i) => PRESETS[(i + 1) % PRESETS.len()],
+        None => 10,
     }
 }
 
@@ -624,4 +1094,58 @@ fn date_cluster_order(all: Vec<(usize, PhotoMeta)>, seed: u64) -> Vec<(usize, Ph
 
     shuffle(&mut clusters, seed);
     clusters.into_iter().flatten().collect()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transition_cycles_through_all_four_and_wraps() {
+        let mut t = Transition::Cut;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(format!("{t:?}"));
+            t = next_transition(&t);
+        }
+        // Visited all four, and wrapped back to the start.
+        assert_eq!(seen.len(), 4);
+        assert!(matches!(t, Transition::Cut));
+    }
+
+    #[test]
+    fn order_cycles_and_wraps() {
+        let mut o = PhotoOrder::Shuffle;
+        for _ in 0..4 {
+            o = next_order(&o);
+        }
+        assert!(matches!(o, PhotoOrder::Shuffle));
+    }
+
+    #[test]
+    fn slide_secs_cycle_and_snap_unknown_to_ten() {
+        assert_eq!(next_slide_secs(3), 5);
+        assert_eq!(next_slide_secs(60), 3); // wraps
+        assert_eq!(next_slide_secs(7), 10); // not a preset → snaps to 10
+    }
+
+    #[test]
+    fn blit_center_centres_smaller_source_without_overflow() {
+        let mut dst = RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255]));
+        let src = RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255]));
+        blit_center(&mut dst, &src);
+        // Centre pixel comes from src (red); a corner stays black.
+        assert_eq!(dst.get_pixel(5, 5)[0], 255);
+        assert_eq!(dst.get_pixel(0, 0)[0], 0);
+    }
+
+    #[test]
+    fn blit_center_crops_larger_source_without_panicking() {
+        let mut dst = RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]));
+        let src = RgbaImage::from_pixel(10, 10, Rgba([0, 255, 0, 255]));
+        blit_center(&mut dst, &src); // must not panic; fills with src
+        assert_eq!(dst.get_pixel(2, 2)[1], 255);
+    }
 }
