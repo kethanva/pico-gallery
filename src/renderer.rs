@@ -406,11 +406,13 @@ impl Renderer {
     ///
     /// Photos are scaled to display resolution *first*, then the small
     /// display-sized image (~8 MB) is rotated.  This is cheaper than rotating
-    /// the full-resolution original (~48–96 MB) first:
+    /// the full-resolution original first. The scale step runs in RGB
+    /// (3 bytes/px), so the decode buffer is the *only* full-resolution
+    /// allocation — no full-res RGBA copy is ever made:
     ///
     /// ```text
-    ///   scale-then-rotate  peak ≈ full-res + display-size  (e.g. 48+8 = 56 MB)
-    ///   rotate-then-scale  peak ≈ full-res + full-res-copy (e.g. 48+48 = 96 MB)
+    ///   scale-then-rotate  peak ≈ full-res-RGB + display-size  (e.g. 36+8 = 44 MB)
+    ///   rotate-then-scale  peak ≈ full-res + full-res-copy     (e.g. 48+48 = 96 MB)
     /// ```
     ///
     /// For 90°/270° rotations the scale target dimensions are swapped
@@ -543,11 +545,19 @@ impl Renderer {
                 ))
             }
         };
+        // Resize in RGB (3 bytes/px), not RGBA. The resizer's *source* is the
+        // full-resolution decode, so dropping the alpha plane avoids ever
+        // allocating a full-res W×H×4 buffer purely as scaler input — the single
+        // largest allocation per photo. For a typical JPEG (already Rgb8)
+        // `into_rgb8()` is a move, not a copy. Alpha (always opaque for photos)
+        // is added back once at the small display size below.
+        //   12 MP example: peak ≈ 36 MB (RGB) vs the old ≈ 48 MB RGBA plus an
+        //   ~84 MB transient spike while the RGB and RGBA buffers coexisted.
         let src = fir::Image::from_vec_u8(
             sw_nz,
             sh_nz,
-            img.into_rgba8().into_raw(),
-            fir::PixelType::U8x4,
+            img.into_rgb8().into_raw(),
+            fir::PixelType::U8x3,
         )
         .map_err(|e| anyhow::anyhow!("building resize source image: {}", e))?;
 
@@ -555,7 +565,7 @@ impl Renderer {
         let mut dst = fir::Image::new(
             std::num::NonZeroU32::new(dst_w).unwrap(),
             std::num::NonZeroU32::new(dst_h).unwrap(),
-            fir::PixelType::U8x4,
+            fir::PixelType::U8x3,
         );
 
         let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
@@ -563,8 +573,11 @@ impl Renderer {
             .resize(&src.view(), &mut dst.view_mut())
             .map_err(|e| anyhow::anyhow!("image resize: {}", e))?;
 
-        RgbaImage::from_raw(dst_w, dst_h, dst.into_vec())
-            .context("resized pixel buffer has unexpected size")
+        // Expand the display-sized RGB result to the RGBA that SDL textures and
+        // the orientation imageops require — one small (display-sized) copy.
+        let rgb = image::RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
+            .context("resized pixel buffer has unexpected size")?;
+        Ok(DynamicImage::ImageRgb8(rgb).into_rgba8())
     }
 
     // ── Display methods ──────────────────────────────────────────────────────
@@ -926,6 +939,45 @@ fn resize_rgba(
     RgbaImage::from_raw(dw, dh, dst.into_vec())
 }
 
+/// Nearest-neighbour downsample of `src` into a fresh `dw×dh` RGBA thumbnail.
+///
+/// Reads sampled pixels directly from `src` with no full-buffer clone (unlike
+/// `resize_rgba`, which must hand `fir` an owned copy). Used only to build the
+/// tiny blur source for the letterbox background, where nearest-neighbour
+/// artefacts vanish under the box blur — so it touches ~`dw×dh` pixels
+/// (e.g. 32×18 ≈ 576) instead of scanning the whole ~2 MP photo each slide.
+fn downsample_nn(src: &RgbaImage, dw: u32, dh: u32) -> RgbaImage {
+    let (sw, sh) = src.dimensions();
+    let (dw, dh) = (dw.max(1), dh.max(1));
+    let mut out = RgbaImage::new(dw, dh);
+    if sw == 0 || sh == 0 {
+        return out;
+    }
+    let sbuf = src.as_raw();
+    let obuf = out.as_mut();
+    let sstride = sw as usize * 4;
+    let ostride = dw as usize * 4;
+
+    // Precompute the source byte-offset for each destination column once, so the
+    // per-pixel inner loop is just indexed copies — no divides (ARM11 has no
+    // hardware integer divider).
+    let sx_lut: Vec<usize> = (0..dw as usize)
+        .map(|ox| (ox as u64 * sw as u64 / dw as u64) as usize * 4)
+        .collect();
+
+    for oy in 0..dh as usize {
+        let sy = (oy as u64 * sh as u64 / dh as u64) as usize;
+        let srow = sy * sstride;
+        let orow = oy * ostride;
+        for (ox, &sxb) in sx_lut.iter().enumerate() {
+            let s = srow + sxb;
+            let o = orow + ox * 4;
+            obuf[o..o + 4].copy_from_slice(&sbuf[s..s + 4]);
+        }
+    }
+    out
+}
+
 /// In-place 3×3 box blur (one pass). Only ever runs on a ~32-px thumbnail,
 /// so the cost is microseconds.
 fn box_blur_3x3(img: &mut RgbaImage) {
@@ -965,16 +1017,12 @@ fn compose_letterbox_blur(photo: &RgbaImage, sw: u32, sh: u32) -> RgbaImage {
     use fast_image_resize::{FilterType, ResizeAlg};
 
     // 1. Thumbnail at screen aspect (stretch — invisible after the blur).
+    //    Nearest-neighbour sampled straight from `photo`: reads only ~32×tiny_h
+    //    pixels instead of cloning and scanning the whole display-sized buffer,
+    //    and the sampling noise is washed out by the two blur passes below.
     let tiny_w = 32u32;
     let tiny_h = ((tiny_w as u64 * sh as u64 / sw.max(1) as u64) as u32).max(2);
-    let Some(mut tiny) = resize_rgba(
-        photo,
-        tiny_w,
-        tiny_h,
-        ResizeAlg::Convolution(FilterType::Bilinear),
-    ) else {
-        return center_on_black(photo, sw, sh);
-    };
+    let mut tiny = downsample_nn(photo, tiny_w, tiny_h);
 
     // 2. Blur twice (≈ wider gaussian), darken so the photo pops.
     box_blur_3x3(&mut tiny);
@@ -1086,4 +1134,46 @@ pub enum SlideshowCmd {
     MenuClick { x: i32, y: i32 },
     /// Activate the currently-selected menu row (Enter/Space).
     MenuActivate,
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgba;
+
+    #[test]
+    fn downsample_nn_produces_requested_dimensions() {
+        let src = RgbaImage::from_pixel(100, 50, Rgba([10, 20, 30, 255]));
+        let out = downsample_nn(&src, 32, 16);
+        assert_eq!(out.dimensions(), (32, 16));
+        // Uniform source → every sampled pixel is the source colour.
+        assert_eq!(out.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(out.get_pixel(31, 15).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn downsample_nn_clamps_zero_dims_to_one() {
+        let src = RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 255]));
+        let out = downsample_nn(&src, 0, 0);
+        assert_eq!(out.dimensions(), (1, 1));
+    }
+
+    #[test]
+    fn downsample_nn_samples_correct_horizontal_region() {
+        // Left half red, right half blue; the downsample must keep the split.
+        let mut src = RgbaImage::new(100, 1);
+        for x in 0..100u32 {
+            let c = if x < 50 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 255])
+            };
+            src.put_pixel(x, 0, c);
+        }
+        let out = downsample_nn(&src, 10, 1);
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]); // left → red
+        assert_eq!(out.get_pixel(9, 0).0, [0, 0, 255, 255]); // right → blue
+    }
 }
