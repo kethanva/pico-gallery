@@ -30,6 +30,47 @@ pub async fn set_power(on: bool) {
                 debug!("vcgencmd not available — relying on black-frame fallback");
             }
         }
+
+        // Send standby / wake commands over HDMI CEC
+        let cec_cmd = if on { "on 0\n" } else { "standby 0\n" };
+        let cec_task = async {
+            match tokio::process::Command::new("cec-client")
+                .args(["-s", "-d", "1"])
+                // Ensure the child is killed if the timeout drops this future,
+                // otherwise a hung CEC bus would leak an orphaned cec-client.
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stdin.write_all(cec_cmd.as_bytes()).await;
+                        let _ = stdin.flush().await;
+                    }
+                    child.wait().await
+                }
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotFound, e)),
+            }
+        };
+
+        let cec_label = cec_cmd.trim();
+        match tokio::time::timeout(std::time::Duration::from_secs(3), cec_task).await {
+            Ok(Ok(status)) if status.success() => {
+                debug!("cec-client {cec_label}: ok");
+            }
+            Ok(Ok(status)) => {
+                debug!("cec-client {cec_label} failed: status {status}");
+            }
+            Ok(Err(e)) => {
+                debug!("cec-client {cec_label} failed to execute: {e}");
+            }
+            Err(_) => {
+                debug!("cec-client {cec_label} timed out after 3 seconds");
+            }
+        }
     }
 
     // On non-Linux platforms (macOS/dev), do nothing.

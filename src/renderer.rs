@@ -16,6 +16,7 @@ use sdl2::{
     video::{Window, WindowContext},
     EventPump, Sdl,
 };
+use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use crate::config::DisplayConfig;
@@ -163,6 +164,16 @@ pub struct Renderer {
     width: u32,
     height: u32,
     config: DisplayConfig,
+    /// SDL text-input handle. Enabled only while a settings-menu field is being
+    /// edited, so the rest of the time single-key shortcuts (q/p/f/m) still fire
+    /// as keys rather than being swallowed as typed text.
+    text_input: sdl2::keyboard::TextInputUtil,
+    text_input_active: bool,
+    /// Precached sRGB output profile for ICC colour correction. Built once
+    /// (the LUT precompute is the costly part) and reused for every photo —
+    /// only the per-image *input* profile is rebuilt. Saves rebuilding the
+    /// sRGB lookup tables on each slide, which matters on a Pi Zero.
+    srgb_profile: Box<qcms::Profile>,
 }
 
 impl Renderer {
@@ -371,6 +382,17 @@ impl Renderer {
             .event_pump()
             .map_err(|e| anyhow::anyhow!("SDL event pump: {}", e))?;
 
+        // Text input starts on for some SDL backends — turn it off until a menu
+        // field is actually being edited, so typed letters don't shadow the
+        // single-key shortcuts.
+        let text_input = video.text_input();
+        text_input.stop();
+
+        // Build the sRGB output profile once; precompute its LUTs up front so
+        // per-photo colour correction only builds the (per-image) input profile.
+        let mut srgb_profile = qcms::Profile::new_sRGB();
+        srgb_profile.precache_output_transform();
+
         Ok(Self {
             _sdl_ctx: sdl_ctx,
             event_pump,
@@ -378,6 +400,9 @@ impl Renderer {
             width: w,
             height: h,
             config,
+            text_input,
+            text_input_active: false,
+            srgb_profile,
         })
     }
 
@@ -423,7 +448,7 @@ impl Renderer {
     ///
     /// Both limits are checked before the expensive decode step:
     /// - `max_image_mb`   — raw file size gate (default 50 MB)
-    /// - `max_megapixels` — decoded pixel count gate (0 = no limit)
+    /// - `max_megapixels` — decoded pixel count gate (0 = built-in 24 MP backstop)
     pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<(RgbaImage, Option<String>)> {
         // ── Raw-size gate ──────────────────────────────────────────────────────
         let max_bytes = if self.config.max_image_mb > 0 {
@@ -440,41 +465,69 @@ impl Renderer {
             ));
         }
 
-        let img = image::load_from_memory(bytes).context("decoding image")?;
+        let is_jpeg = bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
 
-        // ── Hard dimension ceiling (OOM guard) ─────────────────────────────────
-        if img.width() > 16_000 || img.height() > 16_000 {
-            return Err(anyhow::anyhow!(
-                "image {}×{} px exceeds the 16 000-px dimension safety limit",
-                img.width(),
-                img.height()
-            ));
-        }
+        let mut icc_profile = None;
+        let mut decoded_img = None;
 
-        // ── Configurable megapixel gate ────────────────────────────────────────
-        // Peak RAM during decode = decoded RGBA size = W × H × 4 bytes.
-        // Example: 12 MP → 48 MB decoded + 8 MB display copy = 56 MB peak.
-        //          24 MP → 96 MB decoded + 8 MB display copy = 104 MB peak.
-        // On Pi Zero (512 MB) a limit of 12–16 MP is a safe default.
-        //
-        // Comparison uses multiplied pixel counts (no division on the hot path)
-        // — ARM11 has no hardware integer divider, so this matters per photo.
-        if self.config.max_megapixels > 0 {
-            let max_pixels = self.config.max_megapixels as u64 * 1_000_000;
-            let actual_pixels = img.width() as u64 * img.height() as u64;
-            if actual_pixels > max_pixels {
-                // Divide only on the error path (rare).
-                let mp = actual_pixels / 1_000_000;
-                return Err(anyhow::anyhow!(
-                    "image {}×{} ({} MP) exceeds max_megapixels={} — skipping \
-                     (set a higher limit or resize photos before uploading)",
-                    img.width(),
-                    img.height(),
-                    mp,
-                    self.config.max_megapixels,
-                ));
+        if is_jpeg {
+            let cursor = Cursor::new(bytes);
+            let options = zune_core::options::DecoderOptions::default()
+                .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
+
+            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
+            if decoder.decode_headers().is_ok() {
+                if let Some(info) = decoder.info() {
+                    let w = info.width;
+                    let h = info.height;
+
+                    // ── Hard dimension ceiling (OOM guard) ─────────────────────────
+                    if w > 16_000 || h > 16_000 {
+                        return Err(anyhow::anyhow!(
+                            "image {}×{} px exceeds the 16 000-px dimension safety limit",
+                            w,
+                            h
+                        ));
+                    }
+
+                    // ── Megapixel gate (configured value or built-in backstop) ──────
+                    check_megapixels(self.config.max_megapixels, w as u32, h as u32)?;
+
+                    match decoder.decode() {
+                        Ok(pixels) => {
+                            icc_profile = decoder.icc_profile();
+                            if let Some(rgb_img) =
+                                image::RgbImage::from_raw(w as u32, h as u32, pixels)
+                            {
+                                decoded_img = Some(image::DynamicImage::ImageRgb8(rgb_img));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("zune-jpeg failed to decode jpeg body: {:?}, falling back to image crate", e);
+                        }
+                    }
+                }
             }
         }
+
+        let img = if let Some(d_img) = decoded_img {
+            d_img
+        } else {
+            let img = image::load_from_memory(bytes).context("decoding image")?;
+
+            // ── Hard dimension ceiling (OOM guard) ─────────────────────────────────
+            if img.width() > 16_000 || img.height() > 16_000 {
+                return Err(anyhow::anyhow!(
+                    "image {}×{} px exceeds the 16 000-px dimension safety limit",
+                    img.width(),
+                    img.height()
+                ));
+            }
+
+            // ── Megapixel gate (configured value or built-in backstop) ──────────────
+            check_megapixels(self.config.max_megapixels, img.width(), img.height())?;
+            img
+        };
 
         // ── EXIF (single parse) ────────────────────────────────────────────────
         // Reads orientation + capture date in one Reader::read_from_container
@@ -492,15 +545,15 @@ impl Renderer {
             (self.width, self.height)
         };
 
-        let scaled = self.scale_image_to(img, target_w, target_h)?;
+        let scaled = self.scale_image_to(img, target_w, target_h, &icc_profile)?;
         let oriented = crate::exif_util::apply_orientation_rgba(scaled, orientation);
 
         // ── Blurred letterbox fill ─────────────────────────────────────────────
         // When letterboxing (no crop) and the photo doesn't cover the screen,
         // composite it onto a full-screen blurred copy of itself instead of
         // black bars. One-shot cost of a few ms per slide: blur happens on a
-        // 32-px-wide thumbnail; the GPU-friendly bilinear upscale and a
-        // row-memcpy composite do the rest.
+        // 64-px-wide thumbnail using stackblur-iter; the GPU-friendly bilinear
+        // upscale and a row-memcpy composite do the rest.
         let final_img = if self.config.letterbox_blur
             && !self.config.fill_screen
             && (oriented.width() < self.width || oriented.height() < self.height)
@@ -516,14 +569,20 @@ impl Renderer {
     // scale_image is kept for any future callers that don't need orientation.
     #[allow(dead_code)]
     fn scale_image(&self, img: DynamicImage) -> Result<RgbaImage> {
-        self.scale_image_to(img, self.width, self.height)
+        self.scale_image_to(img, self.width, self.height, &None)
     }
 
     /// Scale `img` to fit (letterbox) or cover (fill_screen) a `dw×dh` target.
     ///
     /// Failures propagate as errors so the caller skips the photo — same
     /// handling as a decode error — instead of displaying a black frame.
-    fn scale_image_to(&self, img: DynamicImage, dw: u32, dh: u32) -> Result<RgbaImage> {
+    fn scale_image_to(
+        &self,
+        img: DynamicImage,
+        dw: u32,
+        dh: u32,
+        icc_profile: &Option<Vec<u8>>,
+    ) -> Result<RgbaImage> {
         let (sw, sh) = (img.width(), img.height());
 
         // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
@@ -575,8 +634,26 @@ impl Renderer {
 
         // Expand the display-sized RGB result to the RGBA that SDL textures and
         // the orientation imageops require — one small (display-sized) copy.
-        let rgb = image::RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
+        let mut rgb = image::RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
             .context("resized pixel buffer has unexpected size")?;
+
+        // ── Color Profile Correction ──────────────────────────────────────────
+        // Only runs for images that carry an ICC profile; the sRGB output side
+        // is precomputed once (see `srgb_profile`), so this is just the input
+        // profile + a transform over the small display-sized buffer.
+        if let Some(icc_data) = icc_profile {
+            if let Some(input_profile) = qcms::Profile::new_from_slice(icc_data, false) {
+                if let Some(transform) = qcms::Transform::new(
+                    &input_profile,
+                    &self.srgb_profile,
+                    qcms::DataType::RGB8,
+                    qcms::Intent::default(),
+                ) {
+                    transform.apply(&mut rgb);
+                }
+            }
+        }
+
         Ok(DynamicImage::ImageRgb8(rgb).into_rgba8())
     }
 
@@ -705,6 +782,11 @@ impl Renderer {
             .map(|cur| rgba_to_texture(&tc, cur))
             .transpose()?;
         let next_tex = rgba_to_texture(&tc, next_rgba)?;
+        // Per-texture dimensions so each frame is drawn at the image's own
+        // (aspect-correct) size, centred — never stretched to fill the screen
+        // (which distorted letterboxed images mid-transition).
+        let cur_dims = current_rgba.map(|r| (r.width(), r.height()));
+        let (nw, nh) = (next_rgba.width(), next_rgba.height());
         let budget = Duration::from_millis(1000 / self.config.fps.max(1) as u64);
         let inv_dur = 1.0 / duration.as_secs_f32();
         self.canvas
@@ -725,7 +807,10 @@ impl Renderer {
                 1.0 - (-2.0 * t + 2.0_f32).powi(3) / 2.0
             };
             let offset = (w as f32 * t) as i32;
-            let (cur_x, next_x) = if leftward {
+            // Horizontal slide delta applied to each image's *centred* position:
+            // current exits one edge while next enters from the opposite edge a
+            // screen-width away. Vertical centring is fixed (no vertical motion).
+            let (cur_dx, next_dx) = if leftward {
                 (-offset, w - offset)
             } else {
                 (offset, offset - w)
@@ -733,17 +818,15 @@ impl Renderer {
 
             self.canvas.clear();
 
-            if let Some(ref cur) = cur_tex {
-                self.canvas
-                    .copy(cur, None, Rect::new(cur_x, 0, self.width, self.height))
-                    .ok();
+            if let (Some(ref cur), Some((cw, ch))) = (&cur_tex, cur_dims) {
+                let cx = (self.width as i32 - cw as i32) / 2 + cur_dx;
+                let cy = (self.height as i32 - ch as i32) / 2;
+                self.canvas.copy(cur, None, Rect::new(cx, cy, cw, ch)).ok();
             }
+            let nx = (self.width as i32 - nw as i32) / 2 + next_dx;
+            let ny = (self.height as i32 - nh as i32) / 2;
             self.canvas
-                .copy(
-                    &next_tex,
-                    None,
-                    Rect::new(next_x, 0, self.width, self.height),
-                )
+                .copy(&next_tex, None, Rect::new(nx, ny, nw, nh))
                 .ok();
             self.canvas.present();
 
@@ -830,10 +913,47 @@ impl Renderer {
     /// Returns every command in order (a `Vec`, not a single `Option`) so a
     /// burst of events in one poll is never dropped. Mouse-motion events are
     /// only emitted while the menu is open, so an idle slideshow produces none.
-    pub fn poll_events(&mut self, menu_open: bool) -> Vec<SlideshowCmd> {
+    pub fn poll_events(&mut self, menu_open: bool, editing: bool) -> Vec<SlideshowCmd> {
+        // Toggle SDL text input to match the edit state. Doing it here (one
+        // place, every tick) keeps it in lock-step with the menu without the
+        // caller driving start/stop.
+        if editing && !self.text_input_active {
+            self.text_input.start();
+            self.text_input_active = true;
+        } else if !editing && self.text_input_active {
+            self.text_input.stop();
+            self.text_input_active = false;
+        }
+
         let mut out = Vec::new();
         let half_w = self.width as i32 / 2;
         for event in self.event_pump.poll_iter() {
+            // ── Text edit mode ─────────────────────────────────────────────
+            // While a field is being edited, typed characters arrive as
+            // TextInput events; Backspace/Enter/Esc are the control keys.
+            // Everything else (menu nav, shortcuts, mouse) is ignored so it
+            // can't fire mid-edit.
+            if editing {
+                match event {
+                    Event::Quit { .. } => out.push(SlideshowCmd::Quit),
+                    Event::TextInput { text, .. } => {
+                        for ch in text.chars() {
+                            out.push(SlideshowCmd::TextChar(ch));
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(key), ..
+                    } => match key {
+                        Keycode::Backspace => out.push(SlideshowCmd::TextBackspace),
+                        Keycode::Return | Keycode::KpEnter => out.push(SlideshowCmd::TextCommit),
+                        Keycode::Escape => out.push(SlideshowCmd::TextCancel),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                continue;
+            }
+
             match event {
                 // Window close always quits, menu or not.
                 Event::Quit { .. } => out.push(SlideshowCmd::Quit),
@@ -939,6 +1059,39 @@ fn resize_rgba(
     RgbaImage::from_raw(dw, dh, dst.into_vec())
 }
 
+/// Built-in megapixel backstop applied when `max_megapixels` is unset (0).
+/// zune-jpeg decodes the full-resolution RGB before downscaling, so peak RAM
+/// is roughly 3 MB per megapixel — this caps it (~72 MB at 24 MP) so an
+/// oversized photo can't OOM a 512 MB Pi Zero 2. Override per install by
+/// setting `max_megapixels` in the config.
+const DEFAULT_MAX_MEGAPIXELS: u32 = 24;
+
+/// Effective decode cap in megapixels: the configured value, or the built-in
+/// backstop when unset (0).
+fn megapixel_cap(configured: u32) -> u32 {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_MAX_MEGAPIXELS
+    }
+}
+
+/// Reject a `w×h` image whose decoded pixel count exceeds the effective cap.
+/// Checked from header dimensions *before* the full decode, so an oversized
+/// photo is skipped without ever allocating its full-resolution buffer.
+fn check_megapixels(configured: u32, w: u32, h: u32) -> Result<()> {
+    let cap = megapixel_cap(configured);
+    let actual = w as u64 * h as u64;
+    if actual > cap as u64 * 1_000_000 {
+        return Err(anyhow::anyhow!(
+            "image {w}×{h} ({} MP) exceeds the {cap} MP limit — skipping \
+             (raise max_megapixels or resize the photo)",
+            actual / 1_000_000,
+        ));
+    }
+    Ok(())
+}
+
 /// Nearest-neighbour downsample of `src` into a fresh `dw×dh` RGBA thumbnail.
 ///
 /// Reads sampled pixels directly from `src` with no full-buffer clone (unlike
@@ -978,59 +1131,41 @@ fn downsample_nn(src: &RgbaImage, dw: u32, dh: u32) -> RgbaImage {
     out
 }
 
-/// In-place 3×3 box blur (one pass). Only ever runs on a ~32-px thumbnail,
-/// so the cost is microseconds.
-fn box_blur_3x3(img: &mut RgbaImage) {
-    let (w, h) = img.dimensions();
-    if w < 3 || h < 3 {
-        return;
-    }
-    let src = img.clone();
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let mut acc = [0u32; 3];
-            for dy in 0..3 {
-                for dx in 0..3 {
-                    let p = src.get_pixel(x + dx - 1, y + dy - 1);
-                    acc[0] += p[0] as u32;
-                    acc[1] += p[1] as u32;
-                    acc[2] += p[2] as u32;
-                }
-            }
-            img.put_pixel(
-                x,
-                y,
-                image::Rgba([
-                    (acc[0] / 9) as u8,
-                    (acc[1] / 9) as u8,
-                    (acc[2] / 9) as u8,
-                    255,
-                ]),
-            );
-        }
-    }
-}
-
 /// Build a full-screen frame: heavily blurred, darkened, stretched copy of
 /// `photo` as background, with the photo itself composited centred on top.
 fn compose_letterbox_blur(photo: &RgbaImage, sw: u32, sh: u32) -> RgbaImage {
     use fast_image_resize::{FilterType, ResizeAlg};
 
     // 1. Thumbnail at screen aspect (stretch — invisible after the blur).
-    //    Nearest-neighbour sampled straight from `photo`: reads only ~32×tiny_h
+    //    Nearest-neighbour sampled straight from `photo`: reads only ~64×tiny_h
     //    pixels instead of cloning and scanning the whole display-sized buffer,
-    //    and the sampling noise is washed out by the two blur passes below.
-    let tiny_w = 32u32;
+    //    and the sampling noise is washed out by the stack blur below.
+    let tiny_w = 64u32;
     let tiny_h = ((tiny_w as u64 * sh as u64 / sw.max(1) as u64) as u32).max(2);
     let mut tiny = downsample_nn(photo, tiny_w, tiny_h);
 
-    // 2. Blur twice (≈ wider gaussian), darken so the photo pops.
-    box_blur_3x3(&mut tiny);
-    box_blur_3x3(&mut tiny);
-    for px in tiny.as_mut().chunks_exact_mut(4) {
-        px[0] = ((px[0] as u32 * 11) >> 4) as u8; // × ~0.69
-        px[1] = ((px[1] as u32 * 11) >> 4) as u8;
-        px[2] = ((px[2] as u32 * 11) >> 4) as u8;
+    // 2. Blur using stackblur-iter and darken so the photo pops.
+    //    Convert RGBA to u32 ARGB (stackblur-iter expects 0xAARRGGBB format).
+    let mut pixels_u32: Vec<u32> = tiny
+        .pixels()
+        .map(|p| {
+            let [r, g, b, a] = p.0;
+            ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        })
+        .collect();
+
+    use stackblur_iter::imgref::ImgRefMut;
+    let mut imgref = ImgRefMut::new(&mut pixels_u32, tiny_w as usize, tiny_h as usize);
+    stackblur_iter::blur_argb(&mut imgref, 10);
+
+    // Convert back to tiny RgbaImage and apply darkening.
+    for (i, p) in tiny.pixels_mut().enumerate() {
+        let val = pixels_u32[i];
+        let a = ((val >> 24) & 0xff) as u8;
+        let r = ((((val >> 16) & 0xff) as u32 * 11) >> 4) as u8; // × ~0.69
+        let g = ((((val >> 8) & 0xff) as u32 * 11) >> 4) as u8;
+        let b = (((val & 0xff) as u32 * 11) >> 4) as u8;
+        *p = image::Rgba([r, g, b, a]);
     }
 
     // 3. Upscale to full screen (bilinear — cheap, mush is the goal).
@@ -1129,11 +1264,25 @@ pub enum SlideshowCmd {
     /// Move the menu selection by a relative amount (keyboard up/down).
     MenuMove(i32),
     /// Hover the menu row at this screen position (mouse motion).
-    MenuPoint { x: i32, y: i32 },
+    MenuPoint {
+        x: i32,
+        y: i32,
+    },
     /// Click the menu row at this screen position (left button).
-    MenuClick { x: i32, y: i32 },
+    MenuClick {
+        x: i32,
+        y: i32,
+    },
     /// Activate the currently-selected menu row (Enter/Space).
     MenuActivate,
+    /// A character typed while editing a menu text field.
+    TextChar(char),
+    /// Backspace while editing a menu text field.
+    TextBackspace,
+    /// Commit the edited field (Enter).
+    TextCommit,
+    /// Discard the edit (Esc).
+    TextCancel,
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -1142,6 +1291,21 @@ pub enum SlideshowCmd {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    #[test]
+    fn megapixel_backstop_applies_when_unset() {
+        // 0 → built-in backstop; configured value overrides it.
+        assert_eq!(megapixel_cap(0), DEFAULT_MAX_MEGAPIXELS);
+        assert_eq!(megapixel_cap(12), 12);
+
+        // With no configured limit, a 48 MP photo is rejected by the backstop
+        // but a 12 MP photo passes.
+        assert!(check_megapixels(0, 8000, 6000).is_err()); // 48 MP
+        assert!(check_megapixels(0, 4000, 3000).is_ok()); // 12 MP
+
+        // A higher explicit limit lets the big photo through.
+        assert!(check_megapixels(50, 8000, 6000).is_ok());
+    }
 
     #[test]
     fn downsample_nn_produces_requested_dimensions() {

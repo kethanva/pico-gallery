@@ -113,8 +113,9 @@ pub struct DisplayConfig {
     pub max_image_mb: u64,
 
     /// Maximum decoded image size in megapixels (width × height / 1 000 000).
-    /// 0 = no limit.  Peak RAM ≈ (MP × 4 MB) + 8 MB display copy.
-    /// Example: max_megapixels = 12 → peak ≈ 56 MB.
+    /// 0 = built-in 24 MP backstop (so an oversized photo can't OOM a 512 MB
+    /// Pi Zero 2). Peak RAM ≈ MP × 3 MB for the full-res RGB decode buffer.
+    /// Example: 24 MP → ≈72 MB. Set higher to allow 48 MP+ phone photos.
     #[serde(default)]
     pub max_megapixels: u32,
 
@@ -384,6 +385,36 @@ fn default_remote_bind() -> String {
     "0.0.0.0".to_string()
 }
 
+// ── Wi-Fi ──────────────────────────────────────────────────────────────────────
+
+/// Optional Wi-Fi credentials the app can apply to the host OS.
+///
+/// Only effective on Linux/Raspberry Pi: applying it (re)writes the system
+/// Wi-Fi configuration and reconnects, which needs root (the Pi appliance
+/// service runs as root). On other platforms applying is a logged no-op error.
+/// `password` is the WPA2 pre-shared key — WPA-Enterprise (username/identity)
+/// is not supported. Credentials live here so the on-screen settings menu can
+/// edit them; treat the config file as sensitive (it may hold the passphrase).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WifiConfig {
+    /// Apply these Wi-Fi settings at startup and when changed via the menu.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Network name (SSID).
+    #[serde(default)]
+    pub ssid: String,
+
+    /// WPA2 pre-shared key (passphrase).
+    #[serde(default)]
+    pub password: String,
+
+    /// ISO 3166 alpha-2 country code (e.g. "US", "GB"). Some regulatory setups
+    /// require it for `wpa_supplicant`; ignored by the `nmcli` backend.
+    #[serde(default)]
+    pub country: String,
+}
+
 // ── Plugins ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +440,10 @@ pub struct Config {
     /// Optional HTTP remote control.
     #[serde(default)]
     pub remote: RemoteConfig,
+
+    /// Optional Wi-Fi credentials applied to the host OS (Linux/Pi only).
+    #[serde(default)]
+    pub wifi: WifiConfig,
 
     /// One entry per plugin.  Order determines display order when mixing sources.
     #[serde(default)]

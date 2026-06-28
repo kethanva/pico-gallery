@@ -100,6 +100,20 @@ impl ImageCache {
             return Ok(()); // don't cache oversized blobs
         }
 
+        // An entry that cannot fit the configured budget is never stored.
+        // Without this, the eviction loop below would empty the whole cache
+        // trying to make room, then write anyway — leaving usage above max_mb.
+        // It also makes max_mb = 0 a clean "cache disabled" (nothing ever fits).
+        if size > self.max_bytes {
+            debug!(
+                "Cache skip (entry {} KB > budget {} KB): {}",
+                size / 1024,
+                self.max_bytes / 1024,
+                key
+            );
+            return Ok(());
+        }
+
         // Replace any existing entry for this key — a duplicate would
         // double-count used_bytes and let eviction of the old entry delete
         // the file the new entry still points at.
@@ -249,4 +263,64 @@ fn fnv1a_64(s: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
     hash
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique scratch dir under the system temp dir; removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            TempDir(std::env::temp_dir().join(format!(
+                "picogallery-cache-test-{}-{tag}-{nanos}",
+                std::process::id()
+            )))
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_larger_than_budget_is_not_cached() {
+        let tmp = TempDir::new("oversize");
+        let mut cache = ImageCache::open(&tmp.0, 1).await.unwrap(); // 1 MB budget
+                                                                    // 2 MB blob: over the 1 MB budget but under MAX_ENTRY_BYTES.
+        let big = vec![0u8; 2 * 1024 * 1024];
+        cache.put("k/big", &big).await.unwrap();
+        assert!(
+            !cache.contains("k/big"),
+            "over-budget entry must not be stored"
+        );
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn entry_within_budget_is_cached() {
+        let tmp = TempDir::new("fits");
+        let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        let small = vec![0u8; 256 * 1024]; // 256 KB
+        cache.put("k/small", &small).await.unwrap();
+        assert!(cache.contains("k/small"));
+        assert_eq!(cache.used_bytes, small.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn zero_budget_disables_caching() {
+        let tmp = TempDir::new("zero");
+        let mut cache = ImageCache::open(&tmp.0, 0).await.unwrap();
+        cache.put("k/x", &[1u8; 1024]).await.unwrap();
+        assert!(!cache.contains("k/x"));
+        assert_eq!(cache.used_bytes, 0);
+    }
 }

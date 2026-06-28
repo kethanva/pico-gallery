@@ -149,19 +149,25 @@ fn draw_glyph(img: &mut RgbaImage, rows: [u8; 8], ox: i32, oy: i32, color: [u8; 
     }
 }
 
-fn draw_char(img: &mut RgbaImage, ch: char, x: i32, y: i32) {
+/// Draw `ch` in `color` with a 1-px black drop shadow.
+fn draw_char_colored(img: &mut RgbaImage, ch: char, x: i32, y: i32, color: [u8; 4]) {
     let rows = font8x8::BASIC_FONTS
         .get(ch)
         .or_else(|| font8x8::BASIC_FONTS.get('?'))
         .unwrap_or([0u8; 8]);
     draw_glyph(img, rows, x + 1, y + 1, SHADOW);
-    draw_glyph(img, rows, x, y, FG);
+    draw_glyph(img, rows, x, y, color);
+}
+
+/// Draw `text` in `color` starting at `(x, y)`.
+fn draw_text_colored(img: &mut RgbaImage, text: &str, x: i32, y: i32, color: [u8; 4]) {
+    for (i, ch) in text.chars().enumerate() {
+        draw_char_colored(img, ch, x + i as i32 * GLYPH_W as i32, y, color);
+    }
 }
 
 fn draw_text(img: &mut RgbaImage, text: &str, x: i32, y: i32) {
-    for (i, ch) in text.chars().enumerate() {
-        draw_char(img, ch, x + i as i32 * GLYPH_W as i32, y);
-    }
+    draw_text_colored(img, text, x, y, FG);
 }
 
 // Marker used to keep the previous color-tuple constants out of the
@@ -387,21 +393,44 @@ pub fn draw_clock(img: &mut RgbaImage, text: &str) {
 
 // ── Settings menu ───────────────────────────────────────────────────────────────
 
-const MENU_ROW_H: u32 = GLYPH_H + 8; // row pitch (text + breathing room)
-const MENU_PAD: u32 = 16; // panel inner padding
-const MENU_BG: [u8; 4] = [20, 20, 28, 255]; // panel background
-const MENU_SEL: [u8; 4] = [54, 82, 140, 255]; // selected-row highlight
+const MENU_ROW_H: u32 = GLYPH_H + 10; // row pitch (text + breathing room)
+const MENU_PAD: u32 = 20; // panel inner padding
+const MENU_BG: [u8; 4] = [16, 18, 26, 232]; // translucent panel background
+const MENU_SHADOW: [u8; 4] = [0, 0, 0, 120]; // soft drop shadow behind the panel
+const MENU_BORDER: [u8; 4] = [78, 104, 168, 255]; // 2-px accent frame
+const MENU_RULE: [u8; 4] = [120, 150, 215, 110]; // hairline under the title
+const MENU_SEL: [u8; 4] = [46, 70, 122, 255]; // selected-row highlight
+const MENU_SEL_BAR: [u8; 4] = [128, 178, 255, 255]; // accent bar on the selected row
+const MENU_HEADER: [u8; 4] = [128, 156, 214, 255]; // section-header text (accent)
+const MENU_LABEL: [u8; 4] = [232, 236, 244, 255]; // item label text
+const MENU_VALUE: [u8; 4] = [150, 206, 198, 255]; // value text (after "label: ")
+const SEL_BAR_W: u32 = 4; // width of the selected-row accent bar
+const SHADOW_OFF: u32 = 8; // drop-shadow offset (px, down-right)
+
+/// One rendered menu line for the drawing/hit-testing layer: the label text and
+/// whether it is a non-selectable section header. Keeps `osd` decoupled from the
+/// `menu` module's row model — the caller flattens its rows into these.
+pub struct MenuItem<'a> {
+    pub label: &'a str,
+    pub is_header: bool,
+}
 
 /// Full panel geometry shared by `draw_menu` and `menu_hit_test` — the single
 /// source of truth so a click maps to exactly the row it lands on, in both
-/// axes. Returns `(panel_x, panel_top, panel_w, panel_h, rows_top, row_h)`.
-/// `panel_x`/`panel_top` may be negative only in degenerate cases (panel wider
-/// or taller than the screen); callers clamp before drawing.
-fn menu_geometry(img_w: u32, img_h: u32, title: &str, rows: &[String]) -> (i32, i32, u32, u32, i32, u32) {
+/// axes. Rows are a uniform `MENU_ROW_H` tall (headers included) so the mapping
+/// stays a simple division. Returns `(panel_x, panel_top, panel_w, panel_h,
+/// rows_top, row_h)`. `panel_x`/`panel_top` may be negative only in degenerate
+/// cases (panel wider or taller than the screen); callers clamp before drawing.
+fn menu_geometry(
+    img_w: u32,
+    img_h: u32,
+    title: &str,
+    rows: &[MenuItem],
+) -> (i32, i32, u32, u32, i32, u32) {
     // Width from the widest line (title or any row).
     let longest = rows
         .iter()
-        .map(|r| r.chars().count())
+        .map(|r| r.label.chars().count())
         .chain(std::iter::once(title.chars().count()))
         .max()
         .unwrap_or(0) as u32;
@@ -438,12 +467,69 @@ fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]
     }
 }
 
-/// Map a screen `(x, y)` to a menu row index, or `None` if the click lands
-/// outside the panel (used to dismiss the menu on click-away). Rejects clicks
-/// outside the panel horizontally too, so clicking the dimmed photo beside the
-/// panel dismisses rather than activating the row at that height. Mirrors
-/// `draw_menu`'s geometry exactly via the shared `menu_geometry`.
-pub fn menu_hit_test(img_w: u32, img_h: u32, title: &str, rows: &[String], x: i32, y: i32) -> Option<usize> {
+/// Alpha-composite `color` (with its alpha) over a rectangle, clipped to the
+/// image. Used for the translucent panel, drop shadow, and title rule so the
+/// menu has depth rather than a flat opaque slab. Menu-only (cold) path, so the
+/// per-pixel `/255` is fine.
+fn blend_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+    let a = color[3] as u32;
+    if a == 0 {
+        return;
+    }
+    if a >= 255 {
+        return fill_rect(img, x, y, w, h, color);
+    }
+    let ia = 255 - a;
+    let (iw, ih) = img.dimensions();
+    let x_end = (x + w).min(iw);
+    let y_end = (y + h).min(ih);
+    if x >= x_end || y >= y_end {
+        return;
+    }
+    let stride = iw as usize * 4;
+    let buf = img.as_mut();
+    for py in y..y_end {
+        let row_off = py as usize * stride;
+        for px in x..x_end {
+            let i = row_off + px as usize * 4;
+            buf[i] = ((buf[i] as u32 * ia + color[0] as u32 * a) / 255) as u8;
+            buf[i + 1] = ((buf[i + 1] as u32 * ia + color[1] as u32 * a) / 255) as u8;
+            buf[i + 2] = ((buf[i + 2] as u32 * ia + color[2] as u32 * a) / 255) as u8;
+            // Leave alpha opaque — the frame is composited onto an opaque base.
+        }
+    }
+}
+
+/// Draw a row's text as a two-tone "label: value" pair (label in `label_color`,
+/// the part after the first ": " in `MENU_VALUE`). Rows without a ": " are drawn
+/// entirely in `label_color`.
+fn draw_row_text(img: &mut RgbaImage, text: &str, x: i32, y: i32, label_color: [u8; 4]) {
+    if let Some(pos) = text.find(": ") {
+        let split = pos + 2; // keep ": " with the label
+        let label = &text[..split];
+        let value = &text[split..];
+        draw_text_colored(img, label, x, y, label_color);
+        let vx = x + label.chars().count() as i32 * GLYPH_W as i32;
+        draw_text_colored(img, value, vx, y, MENU_VALUE);
+    } else {
+        draw_text_colored(img, text, x, y, label_color);
+    }
+}
+
+/// Map a screen `(x, y)` to a menu row index, or `None` if it lands outside the
+/// panel (used to dismiss on click-away). Returns the geometric row regardless
+/// of kind — the caller ignores header rows. Rejects clicks outside the panel
+/// horizontally too, so clicking the dimmed photo beside the panel dismisses
+/// rather than hitting the row at that height. Mirrors `draw_menu`'s geometry
+/// exactly via the shared `menu_geometry`.
+pub fn menu_hit_test(
+    img_w: u32,
+    img_h: u32,
+    title: &str,
+    rows: &[MenuItem],
+    x: i32,
+    y: i32,
+) -> Option<usize> {
     let n_rows = rows.len();
     if n_rows == 0 {
         return None;
@@ -457,14 +543,16 @@ pub fn menu_hit_test(img_w: u32, img_h: u32, title: &str, rows: &[String], x: i3
     (idx < n_rows).then_some(idx)
 }
 
-/// Draw the settings menu: a centred dark panel over a dimmed photo, a title,
-/// and one row per entry with the selected row highlighted. Uses the same
-/// built-in 8×8 bitmap font as the rest of the OSD — no system font needed.
+/// Draw the settings menu: a translucent, accent-framed panel centred over a
+/// dimmed photo, a title with a hairline rule, and grouped rows. Section headers
+/// render in the accent colour; the selected item gets a highlight plus a left
+/// accent bar; values (the text after "label: ") render in a softer tint. Uses
+/// the same built-in 8×8 bitmap font as the rest of the OSD — no system font.
 ///
-/// Cost: two full-frame dim passes + an opaque panel fill + the glyphs. Only
+/// Cost: two full-frame dim passes, a few blended rects, and the glyphs. Only
 /// called while the menu is open *and* its state changed, so it never runs on
 /// the slideshow hot path.
-pub fn draw_menu(img: &mut RgbaImage, title: &str, rows: &[String], selected: usize) {
+pub fn draw_menu(img: &mut RgbaImage, title: &str, rows: &[MenuItem], selected: usize) {
     let (iw, ih) = img.dimensions();
     let (panel_x_i, panel_top, panel_w, panel_h, rows_top, row_h) =
         menu_geometry(iw, ih, title, rows);
@@ -475,22 +563,51 @@ pub fn draw_menu(img: &mut RgbaImage, title: &str, rows: &[String], selected: us
     darken_rect(img, 0, 0, iw, ih);
     darken_rect(img, 0, 0, iw, ih);
 
-    // Panel background.
-    fill_rect(img, panel_x, panel_top_u, panel_w, panel_h, MENU_BG);
-
-    // Title.
-    draw_text(
+    // Soft drop shadow (offset down-right) for depth, then the translucent panel.
+    blend_rect(
         img,
-        title,
-        (panel_x + MENU_PAD) as i32,
-        (panel_top_u + MENU_PAD) as i32,
+        panel_x + SHADOW_OFF,
+        panel_top_u + SHADOW_OFF,
+        panel_w,
+        panel_h,
+        MENU_SHADOW,
+    );
+    blend_rect(img, panel_x, panel_top_u, panel_w, panel_h, MENU_BG);
+
+    // 2-px accent frame around the panel.
+    draw_border(img, panel_x, panel_top_u, panel_w, panel_h, 2, MENU_BORDER);
+
+    // Title (fake-bold: drawn twice, 1 px apart) + hairline rule beneath it.
+    let title_x = (panel_x + MENU_PAD) as i32;
+    let title_y = (panel_top_u + MENU_PAD) as i32;
+    draw_text_colored(img, title, title_x, title_y, FG);
+    draw_text_colored(img, title, title_x + 1, title_y, FG);
+    blend_rect(
+        img,
+        panel_x + MENU_PAD,
+        panel_top_u + MENU_PAD + GLYPH_H + 6,
+        panel_w.saturating_sub(MENU_PAD * 2),
+        2,
+        MENU_RULE,
     );
 
     // Rows.
     let text_inset = ((MENU_ROW_H - GLYPH_H) / 2) as i32;
     for (i, row) in rows.iter().enumerate() {
         let row_y = rows_top + i as i32 * row_h as i32;
-        if i == selected && row_y >= 0 {
+        if row_y < 0 {
+            continue;
+        }
+        let text_x = (panel_x + MENU_PAD) as i32;
+        let text_y = row_y + text_inset;
+
+        if row.is_header {
+            // Headers: accent text, no highlight; sit a touch lower in the slot.
+            draw_text_colored(img, row.label, text_x, text_y, MENU_HEADER);
+            continue;
+        }
+
+        if i == selected {
             fill_rect(
                 img,
                 panel_x + MENU_PAD / 2,
@@ -499,9 +616,29 @@ pub fn draw_menu(img: &mut RgbaImage, title: &str, rows: &[String], selected: us
                 MENU_ROW_H,
                 MENU_SEL,
             );
+            // Left accent bar marking the selection.
+            fill_rect(
+                img,
+                panel_x + MENU_PAD / 2,
+                row_y as u32,
+                SEL_BAR_W,
+                MENU_ROW_H,
+                MENU_SEL_BAR,
+            );
+            // Selected row: whole line bright for contrast on the highlight.
+            draw_row_text(img, row.label, text_x, text_y, FG);
+        } else {
+            draw_row_text(img, row.label, text_x, text_y, MENU_LABEL);
         }
-        draw_text(img, row, (panel_x + MENU_PAD) as i32, row_y + text_inset);
     }
+}
+
+/// Draw a `t`-px-thick rectangular frame (four edges) in `color`.
+fn draw_border(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, t: u32, color: [u8; 4]) {
+    fill_rect(img, x, y, w, t, color); // top
+    fill_rect(img, x, y + h.saturating_sub(t), w, t, color); // bottom
+    fill_rect(img, x, y, t, h, color); // left
+    fill_rect(img, x + w.saturating_sub(t), y, t, h, color); // right
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -512,6 +649,17 @@ mod tests {
 
     fn white_img(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]))
+    }
+
+    /// Wrap plain labels as non-header menu items for the drawing/hit-test API.
+    fn items(labels: &[String]) -> Vec<MenuItem<'_>> {
+        labels
+            .iter()
+            .map(|l| MenuItem {
+                label: l.as_str(),
+                is_header: false,
+            })
+            .collect()
     }
 
     #[test]
@@ -576,20 +724,27 @@ mod tests {
     fn menu_hit_test_maps_clicks_to_rows() {
         let (img_w, img_h) = (1920u32, 1080u32);
         let title = "Settings";
-        let rows: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        let labels: Vec<String> = (0..10).map(|i| format!("row {i}")).collect();
+        let rows = items(&labels);
         let (panel_x, _pt, panel_w, _ph, rows_top, row_h) =
             menu_geometry(img_w, img_h, title, &rows);
         let cx = panel_x + panel_w as i32 / 2; // inside the panel horizontally
-        // Middle of row 3 resolves to index 3.
+                                               // Middle of row 3 resolves to index 3.
         let y = rows_top + 3 * row_h as i32 + row_h as i32 / 2;
         assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, y), Some(3));
         // Above the first row → no hit (click-away dismiss).
-        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, rows_top - 5), None);
+        assert_eq!(
+            menu_hit_test(img_w, img_h, title, &rows, cx, rows_top - 5),
+            None
+        );
         // Below the last row → no hit.
         let below = rows_top + rows.len() as i32 * row_h as i32 + 5;
         assert_eq!(menu_hit_test(img_w, img_h, title, &rows, cx, below), None);
         // Outside the panel horizontally → no hit even at a valid row height.
-        assert_eq!(menu_hit_test(img_w, img_h, title, &rows, panel_x - 5, y), None);
+        assert_eq!(
+            menu_hit_test(img_w, img_h, title, &rows, panel_x - 5, y),
+            None
+        );
         assert_eq!(
             menu_hit_test(img_w, img_h, title, &rows, panel_x + panel_w as i32 + 5, y),
             None
@@ -616,17 +771,19 @@ mod tests {
     #[test]
     fn draw_menu_does_not_panic() {
         let mut img = white_img(1920, 1080);
-        let rows: Vec<String> = (0..9).map(|i| format!("row {i}")).collect();
+        let labels: Vec<String> = (0..9).map(|i| format!("row {i}")).collect();
+        let mut rows = items(&labels);
+        rows[0].is_header = true; // exercise the header-drawing path
         draw_menu(&mut img, "PicoGallery — Settings", &rows, 2);
     }
 
     #[test]
     fn draw_menu_does_not_panic_on_small_image() {
         let mut img = white_img(160, 120);
-        let rows: Vec<String> = (0..12)
+        let labels: Vec<String> = (0..12)
             .map(|i| format!("a rather long row label {i}"))
             .collect();
-        draw_menu(&mut img, "Settings", &rows, 5);
+        draw_menu(&mut img, "Settings", &items(&labels), 5);
     }
 
     #[test]

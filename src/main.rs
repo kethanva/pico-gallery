@@ -105,6 +105,14 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
         }
     }
 
+    #[cfg(feature = "plugin-usb")]
+    {
+        if let Some(pcfg) = cfg.plugin_config("usb") {
+            info!("Registering plugin: usb");
+            plugins.push(Box::new(picogallery_usb::UsbPlugin::new(pcfg.clone())));
+        }
+    }
+
     plugins
 }
 
@@ -155,6 +163,17 @@ async fn main() -> Result<()> {
     };
 
     config.ensure_dirs()?;
+
+    // ── Wi-Fi (Linux / Raspberry Pi only) ─────────────────────────────────────
+    // Apply configured Wi-Fi to the OS at startup when enabled, so a freshly
+    // imaged Pi can join the network from config alone. Best-effort: a failure
+    // is logged but never stops the slideshow (it may already be online).
+    if config.wifi.enabled {
+        match picogallery::wifi::apply(&config.wifi).await {
+            Ok(()) => info!("Wi-Fi: applied from config (SSID '{}')", config.wifi.ssid),
+            Err(e) => eprintln!("Wi-Fi: could not apply config — {e}"),
+        }
+    }
 
     // ── Display schedule ──────────────────────────────────────────────────────
     if let Some(desc) = config.display.schedule_description() {
@@ -302,7 +321,8 @@ on_this_day_boost = true   # surface photos taken on today's date in past years
 
 # ── Memory-safety limits (skip oversized photos instead of OOM) ──────────────
 # max_image_mb   = 20    # raw file-size gate (0 = built-in 50 MB default)
-# max_megapixels = 12    # decoded-pixel gate (0 = no limit); 12 MP ≈ 56 MB peak
+# max_megapixels = 24    # decoded-pixel gate (0 = built-in 24 MP backstop); ≈3 MB/MP
+#                        # raise to allow 48 MP+ phone photos if you have the RAM
 
 # ── Optional display schedule (HH:MM, local time; both required) ─────────────
 # Turn the HDMI output off overnight. Omit both = always on.
@@ -335,6 +355,20 @@ prefetch_count = 3    # how many photos to pre-fetch ahead (keep low on Pi Zero)
 enabled = false
 port    = 8188
 bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wi-Fi  (Linux / Raspberry Pi only)
+# When enabled, these credentials are applied to the OS at startup and whenever
+# changed from the on-screen settings menu (right-click → Wi-Fi rows, edited
+# with a USB keyboard). Requires root — the Pi service runs as root. WPA2
+# personal only: network name (SSID) + password, no enterprise/username. The
+# passphrase is stored here in plain text, so keep this file private (chmod 600).
+# ─────────────────────────────────────────────────────────────────────────────
+[wifi]
+enabled  = false
+ssid     = ""
+password = ""
+# country  = "US"   # ISO 3166 code; some wpa_supplicant setups require it
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PLUGINS
@@ -497,6 +531,22 @@ password = "insecure"                       # or use app_password below
 # ── Transport ───────────────────────────────────────────────────────────────
 # skip_tls_verify       = false    # true for self-signed LAN certs
 # request_timeout_secs  = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] usb  ★ plug a USB stick / drive into the Pi and show its photos
+#
+# Polls for USB block devices (sda1, sdb1, …) every 5 seconds, auto-mounts new
+# ones, and recursively scans them for .jpg / .jpeg. Unplugging clears those
+# photos and unmounts (if we mounted it). Linux only — a no-op elsewhere.
+#
+# SETUP
+# 1. Set enabled = true and restart picogallery.
+# 2. Mounting uses `udisksctl` (no root needed) and falls back to `mount -o ro`.
+#    On a minimal image install udisks2:  sudo apt install udisks2
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "usb"
+enabled = false
 "#,
         photo_dir = photo_dir_str,
     )

@@ -18,3 +18,4 @@ pub mod osd;
 pub mod remote;
 pub mod renderer;
 pub mod slideshow;
+pub mod wifi;
