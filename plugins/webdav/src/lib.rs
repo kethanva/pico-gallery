@@ -216,6 +216,22 @@ fn url_origin(url: &str) -> &str {
     }
 }
 
+/// True when `url` is safe to send the configured Basic-Auth credentials to:
+/// it must be on the configured `origin` (scheme://host[:port]) AND its path
+/// must sit under the configured `base_path`. A malicious or compromised WebDAV
+/// server can return absolute hrefs in a PROPFIND response (e.g.
+/// `https://evil.example/steal`); without this gate the follow-up PROPFIND or
+/// GET would attach the username/password to that arbitrary URL. Both path and
+/// base are percent-decoded before comparison so encoding differences don't
+/// reject a legitimate in-tree href.
+fn href_in_scope(url: &str, origin: &str, base_path: &str) -> bool {
+    if url_origin(url) != origin {
+        return false;
+    }
+    let path = url.strip_prefix(origin).unwrap_or("");
+    url_decode(path).starts_with(&url_decode(base_path))
+}
+
 /// Decode `%XX` percent-encoding. Invalid sequences pass through unchanged.
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -459,6 +475,15 @@ impl WebDavPlugin {
                 } else {
                     format!("{origin}{}", entry.href)
                 };
+
+                // Security: never send Basic-Auth credentials off the configured
+                // origin / base path. A hostile or compromised server can return
+                // absolute hrefs pointing elsewhere; drop them before any PROPFIND
+                // (collections) or download (files) attaches the credentials.
+                if !href_in_scope(&full_url, origin, &base_href_path) {
+                    warn!("WebDAV: skipping out-of-scope href {}", entry.href);
+                    continue;
+                }
 
                 if entry.is_collection {
                     queue.push(full_url);
@@ -954,6 +979,59 @@ mod tests {
             "https://example.com:8443"
         );
         assert_eq!(url_origin("http://nas.local/photos"), "http://nas.local");
+    }
+
+    #[test]
+    fn href_in_scope_allows_same_origin_under_base() {
+        let origin = "https://nas.local";
+        let base = "/dav/photos";
+        assert!(href_in_scope(
+            "https://nas.local/dav/photos/trip/a.jpg",
+            origin,
+            base
+        ));
+        // Encoding differences between href and base must not reject in-tree URLs.
+        assert!(href_in_scope(
+            "https://nas.local/dav/photos/My%20Album/a.jpg",
+            origin,
+            base
+        ));
+    }
+
+    #[test]
+    fn href_in_scope_rejects_foreign_origin() {
+        // The credential-leak case: server returns an absolute href elsewhere.
+        assert!(!href_in_scope(
+            "https://evil.example/steal",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        // Same host, different scheme/port is still a different origin.
+        assert!(!href_in_scope(
+            "http://nas.local/dav/photos/a.jpg",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        assert!(!href_in_scope(
+            "https://nas.local:8443/dav/photos/a.jpg",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+    }
+
+    #[test]
+    fn href_in_scope_rejects_outside_base_path() {
+        assert!(!href_in_scope(
+            "https://nas.local/etc/passwd",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        // Empty base path = whole origin in scope (base_url has no path component).
+        assert!(href_in_scope(
+            "https://nas.local/anything/a.jpg",
+            "https://nas.local",
+            ""
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::cache::ImageCache;
 use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
-use crate::menu::{Menu, MenuAction};
+use crate::menu::{EditField, Menu, MenuAction};
 use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
 use crate::remote::SharedStatus;
 use crate::renderer::{Renderer, SlideshowCmd};
@@ -262,6 +262,13 @@ impl Slideshow {
             .checked_sub(slide_dur)
             .unwrap_or_else(Instant::now);
 
+        // Thermal guard: sample CPU temp at most once every few seconds instead
+        // of every loop iteration (~20×/s), so the cooling feature doesn't itself
+        // add steady sysfs I/O churn on a Pi Zero. `None` until the first sample.
+        const TEMP_POLL_INTERVAL: Duration = Duration::from_secs(5);
+        let mut cached_temp: Option<f32> = None;
+        let mut last_temp_check: Option<Instant> = None;
+
         loop {
             // Re-read timing each iteration so menu changes to slide duration /
             // transition take effect immediately (both are trivially cheap).
@@ -273,7 +280,8 @@ impl Slideshow {
             // both sources flow through the same match below. poll_events
             // interprets input differently while the menu is open, so it gets
             // the current menu state.
-            let mut cmds: Vec<SlideshowCmd> = renderer.poll_events(menu.open);
+            let mut cmds: Vec<SlideshowCmd> =
+                renderer.poll_events(menu.open, menu.editing.is_some());
             if let Some(rx) = remote_rx.as_mut() {
                 while let Ok(cmd) = rx.try_recv() {
                     cmds.push(cmd);
@@ -284,14 +292,20 @@ impl Slideshow {
             // map to the exact layout poll_events hit-tested against. Only built
             // when the menu is open *and* there is input to interpret — an
             // idle-open menu allocates nothing each tick (Pi Zero stays cold).
-            let (action_rows, action_labels) = if menu.open && !cmds.is_empty() {
+            let action_rows = if menu.open && !cmds.is_empty() {
                 let sources = self.source_list();
-                let rows = crate::menu::build_rows(&self.config.display, paused, &sources);
-                let labels: Vec<String> = rows.iter().map(|r| r.label.clone()).collect();
-                (rows, labels)
+                self.build_menu_rows(paused, &menu, &sources)
             } else {
-                (Vec::new(), Vec::new())
+                Vec::new()
             };
+            // Flattened view for hit-testing (borrows the rows just built).
+            let action_items: Vec<crate::osd::MenuItem> = action_rows
+                .iter()
+                .map(|r| crate::osd::MenuItem {
+                    label: &r.label,
+                    is_header: matches!(r.kind, crate::menu::RowKind::Header),
+                })
+                .collect();
             // At most one activation per batch — users don't double-click inside
             // a 30 ms tick, and this keeps the borrow-heavy action handling out
             // of the per-command match.
@@ -323,8 +337,9 @@ impl Slideshow {
                     }
                     SlideshowCmd::MenuMove(d) => {
                         if menu.open && !action_rows.is_empty() {
-                            let n = action_rows.len() as i32;
-                            menu.selected = (((menu.selected as i32 + d) % n + n) % n) as usize;
+                            // Step to the next selectable row, skipping headers.
+                            menu.selected =
+                                crate::menu::next_selectable(&action_rows, menu.selected, d);
                             menu_dirty = true;
                         }
                     }
@@ -334,11 +349,16 @@ impl Slideshow {
                                 renderer.width(),
                                 renderer.height(),
                                 MENU_TITLE,
-                                &action_labels,
+                                &action_items,
                                 x,
                                 y,
                             ) {
-                                if idx != menu.selected {
+                                // Don't move the highlight onto a section header.
+                                let is_item = action_rows
+                                    .get(idx)
+                                    .map(|r| r.kind == crate::menu::RowKind::Item)
+                                    .unwrap_or(false);
+                                if is_item && idx != menu.selected {
                                     menu.selected = idx;
                                     menu_dirty = true;
                                 }
@@ -351,14 +371,22 @@ impl Slideshow {
                                 renderer.width(),
                                 renderer.height(),
                                 MENU_TITLE,
-                                &action_labels,
+                                &action_items,
                                 x,
                                 y,
                             ) {
-                                Some(idx) => {
+                                // A click on a header is inert (panel stays open);
+                                // a click on an item selects and activates it.
+                                Some(idx)
+                                    if action_rows
+                                        .get(idx)
+                                        .map(|r| r.kind == crate::menu::RowKind::Item)
+                                        .unwrap_or(false) =>
+                                {
                                     menu.selected = idx;
                                     pending_activate = true;
                                 }
+                                Some(_) => {}
                                 // Click outside the panel dismisses the menu.
                                 None => {
                                     menu.open = false;
@@ -416,6 +444,38 @@ impl Slideshow {
                                 .await;
                         }
                     }
+                    // ── Text field editing (only meaningful while a field is open) ──
+                    SlideshowCmd::TextChar(c) => {
+                        if menu.editing.is_some() {
+                            // Cap length and drop control chars so a stray key
+                            // can't bloat or corrupt the field.
+                            const MAX_FIELD_CHARS: usize = 128;
+                            if !c.is_control() && menu.buffer.chars().count() < MAX_FIELD_CHARS {
+                                menu.buffer.push(c);
+                                menu_dirty = true;
+                            }
+                        }
+                    }
+                    SlideshowCmd::TextBackspace => {
+                        if menu.editing.is_some() {
+                            menu.buffer.pop();
+                            menu_dirty = true;
+                        }
+                    }
+                    SlideshowCmd::TextCommit => {
+                        if let Some(field) = menu.editing.take() {
+                            let value = std::mem::take(&mut menu.buffer);
+                            self.commit_edit(field, value);
+                            menu_dirty = true;
+                        }
+                    }
+                    SlideshowCmd::TextCancel => {
+                        if menu.editing.is_some() {
+                            menu.editing = None;
+                            menu.buffer.clear();
+                            menu_dirty = true;
+                        }
+                    }
                 }
             }
 
@@ -432,6 +492,14 @@ impl Slideshow {
                         if let Some(status) = &remote_status {
                             status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
                         }
+                        menu_dirty = true;
+                    }
+                    // Entering a text field needs the loop-local `menu`, so it is
+                    // handled here rather than in the action helper. Secrets start
+                    // empty; other fields preload their current value to edit.
+                    MenuAction::BeginEdit(field) => {
+                        menu.buffer = self.edit_initial(field);
+                        menu.editing = Some(field);
                         menu_dirty = true;
                     }
                     other => match self.handle_menu_action(other, renderer).await {
@@ -477,11 +545,17 @@ impl Slideshow {
             if menu.open {
                 if menu_dirty {
                     let sources = self.source_list();
-                    let labels: Vec<String> =
-                        crate::menu::build_rows(&self.config.display, paused, &sources)
-                            .into_iter()
-                            .map(|r| r.label)
-                            .collect();
+                    let rows = self.build_menu_rows(paused, &menu, &sources);
+                    // Keep the highlight off section headers after any row-set
+                    // change (menu just opened, or a conditional group appeared).
+                    menu.selected = crate::menu::snap_to_selectable(&rows, menu.selected);
+                    let items: Vec<crate::osd::MenuItem> = rows
+                        .iter()
+                        .map(|r| crate::osd::MenuItem {
+                            label: &r.label,
+                            is_header: matches!(r.kind, crate::menu::RowKind::Header),
+                        })
+                        .collect();
                     // Composite onto a full-screen base so the menu geometry is
                     // in screen coordinates. Otherwise click/hover hit-testing
                     // (which uses the screen height) would be vertically offset
@@ -495,7 +569,7 @@ impl Slideshow {
                     if let Some(img) = &current_rgba {
                         blit_center(&mut frame, img);
                     }
-                    crate::osd::draw_menu(&mut frame, MENU_TITLE, &labels, menu.selected);
+                    crate::osd::draw_menu(&mut frame, MENU_TITLE, &items, menu.selected);
                     if let Err(e) = renderer.show_cut(&frame) {
                         warn!("menu render error: {e}");
                     }
@@ -553,7 +627,37 @@ impl Slideshow {
             // decoded-and-ready in RAM through the whole on-screen period, and
             // a failed fetch is retried within ~50 ms rather than one slot per
             // slide. When the buffer is already full this is a cheap no-op.
-            if last_advance.elapsed() < slide_dur {
+            let mut current_slide_dur = slide_dur;
+            // Thermal Throttling Guard — refresh the cached reading on its own
+            // interval, then derive the interval from the cached value. Throttling
+            // only ever *lengthens* the interval (never shorter than configured),
+            // so a long base slide duration can't be sped up by a hot CPU.
+            if last_temp_check.is_none_or(|t| t.elapsed() >= TEMP_POLL_INTERVAL) {
+                cached_temp = read_cpu_temp();
+                last_temp_check = Some(Instant::now());
+                
+                if let Some(temp) = cached_temp {
+                    if temp >= 80.0 {
+                        warn!("CPU temperature is extremely high ({:.1}°C) — throttling slide interval to cool down", temp);
+                    } else if temp >= 75.0 {
+                        warn!("CPU temperature is high ({:.1}°C) — throttling slide interval", temp);
+                    } else if temp >= 70.0 {
+                        warn!("CPU temperature is warm ({:.1}°C) — throttling slide interval", temp);
+                    }
+                }
+            }
+
+            if let Some(temp) = cached_temp {
+                if temp >= 80.0 {
+                    current_slide_dur = slide_dur.max(Duration::from_secs(60));
+                } else if temp >= 75.0 {
+                    current_slide_dur = slide_dur * 2;
+                } else if temp >= 70.0 {
+                    current_slide_dur = slide_dur + slide_dur / 2;
+                }
+            }
+
+            if last_advance.elapsed() < current_slide_dur {
                 self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
                     .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -752,6 +856,96 @@ impl Slideshow {
             .collect()
     }
 
+    /// Build the settings-menu rows from the live config + menu edit state.
+    /// Shared by the input-interpretation pass and the render pass so both see
+    /// identical rows (clicks map to exactly what is drawn).
+    fn build_menu_rows(
+        &self,
+        paused: bool,
+        menu: &Menu,
+        sources: &[(String, bool)],
+    ) -> Vec<crate::menu::MenuRow> {
+        crate::menu::build_rows(&crate::menu::RowsCtx {
+            display: &self.config.display,
+            paused,
+            sources,
+            wifi: &self.config.wifi,
+            photoprism: self.photoprism_fields(),
+            editing: menu.editing,
+            buffer: &menu.buffer,
+        })
+    }
+
+    /// `(url, username, has_password)` for the configured PhotoPrism source, or
+    /// `None` if there is no `photoprism` entry. Never returns the password —
+    /// only whether one is set — so it can't leak into a menu label.
+    fn photoprism_fields(&self) -> Option<(&str, &str, bool)> {
+        let entry = self
+            .config
+            .plugins
+            .iter()
+            .find(|p| p.name == "photoprism")?;
+        let url = entry.config.get_str("url").unwrap_or("");
+        let user = entry.config.get_str("username").unwrap_or("");
+        let has_pw = entry
+            .config
+            .get_str("password")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        Some((url, user, has_pw))
+    }
+
+    /// Current value of a PhotoPrism config key (empty string if absent).
+    fn photoprism_value(&self, key: &str) -> String {
+        self.config
+            .plugins
+            .iter()
+            .find(|p| p.name == "photoprism")
+            .and_then(|e| e.config.get_str(key))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Initial buffer when a field starts being edited. Secrets start empty so
+    /// the stored value is never shown; other fields preload so the user edits
+    /// rather than retypes.
+    fn edit_initial(&self, field: EditField) -> String {
+        match field {
+            EditField::WifiSsid => self.config.wifi.ssid.clone(),
+            EditField::WifiPassword => String::new(),
+            EditField::PhotoPrismUrl => self.photoprism_value("url"),
+            EditField::PhotoPrismUser => self.photoprism_value("username"),
+            EditField::PhotoPrismPassword => String::new(),
+        }
+    }
+
+    /// Write a committed text edit back into the live config. (Persisted to disk
+    /// only when the user later picks "Save settings".)
+    fn commit_edit(&mut self, field: EditField, value: String) {
+        match field {
+            EditField::WifiSsid => self.config.wifi.ssid = value,
+            EditField::WifiPassword => self.config.wifi.password = value,
+            EditField::PhotoPrismUrl => self.set_photoprism_value("url", value),
+            EditField::PhotoPrismUser => self.set_photoprism_value("username", value),
+            EditField::PhotoPrismPassword => self.set_photoprism_value("password", value),
+        }
+    }
+
+    /// Set a key in the PhotoPrism plugin's config (no-op if the entry is gone).
+    fn set_photoprism_value(&mut self, key: &str, value: String) {
+        if let Some(entry) = self
+            .config
+            .plugins
+            .iter_mut()
+            .find(|p| p.name == "photoprism")
+        {
+            entry
+                .config
+                .values
+                .insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+
     /// Apply a menu action other than pause (pause is a loop local). Returns how
     /// the display loop should react. Never fails the slideshow — problems are
     /// logged and reported as `Stay`.
@@ -761,6 +955,9 @@ impl Slideshow {
         renderer: &mut Renderer,
     ) -> MenuOutcome {
         match action {
+            // Section headers carry Noop and are never activated; harmless if one
+            // somehow reaches here.
+            MenuAction::Noop => MenuOutcome::Stay,
             MenuAction::TogglePause => MenuOutcome::Stay, // handled by caller
             MenuAction::CycleTransition => {
                 self.config.display.transition = next_transition(&self.config.display.transition);
@@ -801,6 +998,45 @@ impl Slideshow {
                 }
             }
             MenuAction::SwitchSource(idx) => self.switch_source(idx, renderer).await,
+            // BeginEdit is intercepted by the caller (it needs the loop-local
+            // menu state); reaching here means nothing to do.
+            MenuAction::BeginEdit(_) => MenuOutcome::Stay,
+            MenuAction::ToggleWifi => {
+                self.config.wifi.enabled = !self.config.wifi.enabled;
+                info!(
+                    "Wi-Fi config {}",
+                    if self.config.wifi.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                MenuOutcome::Stay
+            }
+            MenuAction::ApplyWifi => {
+                match crate::wifi::apply(&self.config.wifi).await {
+                    Ok(()) => info!("Wi-Fi: applied (SSID '{}')", self.config.wifi.ssid),
+                    Err(e) => warn!("Wi-Fi apply failed: {e}"),
+                }
+                MenuOutcome::Stay
+            }
+            MenuAction::ConnectPhotoPrism => {
+                match self
+                    .config
+                    .plugins
+                    .iter()
+                    .position(|p| p.name == "photoprism")
+                {
+                    // Reconnect = switch to the (re-configured) photoprism source,
+                    // reusing the full rebuild + re-auth + re-queue path with
+                    // rollback on failure.
+                    Some(idx) => self.switch_source(idx, renderer).await,
+                    None => {
+                        warn!("Connect PhotoPrism: no photoprism source configured");
+                        MenuOutcome::Stay
+                    }
+                }
+            }
             MenuAction::SaveConfig => {
                 match self.save_config() {
                     Ok(()) => info!("Settings saved to {}", self.config_path.display()),
@@ -892,7 +1128,9 @@ impl Slideshow {
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&self.config_path, text)
+        // The file holds Wi-Fi and PhotoPrism passwords in plain text, so it must
+        // not be world-readable. Write 0600 on Unix; a plain write elsewhere.
+        write_private(&self.config_path, &text)
             .with_context(|| format!("writing config {}", self.config_path.display()))?;
         Ok(())
     }
@@ -988,6 +1226,41 @@ fn next_slide_secs(current: u64) -> u64 {
         Some(i) => PRESETS[(i + 1) % PRESETS.len()],
         None => 10,
     }
+}
+
+/// Atomically write `text` to `path`, owner-read/write only (0600) on Unix so
+/// the saved config can't leak the stored Wi-Fi/PhotoPrism passwords to other
+/// local users. Writes a sibling temp file then renames over the target, so a
+/// failure mid-write never leaves the live config truncated or empty. On
+/// non-Unix targets this is a plain (non-atomic) write.
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Temp file in the same dir so the rename is a same-filesystem atomic swap.
+    let tmp = path.with_extension("toml.tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600) // created fresh each time, so mode always applies
+        .open(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    // Atomic replace: readers see either the old or new complete file, at 0600.
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
 }
 
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
@@ -1094,6 +1367,18 @@ fn date_cluster_order(all: Vec<(usize, PhotoMeta)>, seed: u64) -> Vec<(usize, Ph
 
     shuffle(&mut clusters, seed);
     clusters.into_iter().flatten().collect()
+}
+
+fn read_cpu_temp() -> Option<f32> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(temp_str) = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
+            if let Ok(temp_val) = temp_str.trim().parse::<i32>() {
+                return Some(temp_val as f32 / 1000.0);
+            }
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

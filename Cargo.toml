@@ -8,6 +8,7 @@ members = [
     "plugins/directory",
     "plugins/webdav",
     "plugins/photoprism",
+    "plugins/usb",
 ]
 resolver = "2"
 
@@ -64,6 +65,10 @@ image               = { version = "0.24", default-features = false, features = [
 fast_image_resize   = "2.7"
 sdl2                = { version = "0.36", default-features = false, features = ["use-pkgconfig"] }
 clap                = { version = "4", features = ["derive", "env"] }
+zune-jpeg           = "0.5"
+zune-core           = "0.5"
+stackblur-iter      = "0.2"
+qcms                = "0.3"
 
 # Plugins (compiled in via feature flags — no cycle: plugins depend on core, not on this crate)
 picogallery-google-photos = { path = "plugins/google-photos", optional = true }
@@ -72,6 +77,7 @@ picogallery-local         = { path = "plugins/local",         optional = true }
 picogallery-directory     = { path = "plugins/directory",     optional = true }
 picogallery-webdav        = { path = "plugins/webdav",        optional = true }
 picogallery-photoprism    = { path = "plugins/photoprism",    optional = true }
+picogallery-usb           = { path = "plugins/usb",           optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
@@ -80,13 +86,14 @@ drm = "0.15"
 cc = "1"
 
 [features]
-default              = ["plugin-google-photos", "plugin-local", "plugin-directory", "plugin-webdav", "plugin-photoprism"]
+default              = ["plugin-google-photos", "plugin-local", "plugin-directory", "plugin-webdav", "plugin-photoprism", "plugin-usb"]
 plugin-google-photos = ["dep:picogallery-google-photos"]
 plugin-amazon-photos = ["dep:picogallery-amazon-photos"]
 plugin-local         = ["dep:picogallery-local"]
 plugin-directory     = ["dep:picogallery-directory"]
 plugin-webdav        = ["dep:picogallery-webdav"]
 plugin-photoprism    = ["dep:picogallery-photoprism"]
+plugin-usb           = ["dep:picogallery-usb"]
 
 [profile.release]
 opt-level     = "z"
