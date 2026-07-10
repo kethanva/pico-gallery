@@ -22,8 +22,57 @@ use crate::renderer::{Renderer, SlideshowCmd};
 use tokio::sync::mpsc::Receiver;
 
 const PAGE_SIZE: usize = 50; // photos fetched per API page
+/// Hard cap per plugin when paging the remote library into the play queue.
+const MAX_PHOTOS_PER_PLUGIN: usize = 2000;
+/// Fetch the next API page when navigation is within this many items of the end.
+const LOAD_AHEAD_MARGIN: usize = 30;
 /// Thumbnails decoded per gallery tick — balances Pi Zero CPU with fast fill.
 const GALLERY_THUMBS_PER_TICK: usize = 4;
+
+/// Tracks how many photos have been pulled from each plugin so far.
+struct QueueLoader {
+    plugin_offsets: Vec<usize>,
+    plugin_exhausted: Vec<bool>,
+    shuffle_seed: u64,
+}
+
+impl QueueLoader {
+    fn new(plugin_count: usize) -> Self {
+        Self {
+            plugin_offsets: vec![0; plugin_count],
+            plugin_exhausted: vec![false; plugin_count],
+            shuffle_seed: shuffle_seed_now(),
+        }
+    }
+
+    fn all_exhausted(&self) -> bool {
+        self.plugin_exhausted.iter().all(|&e| e)
+    }
+
+    fn mark_fully_loaded(&mut self) {
+        self.plugin_exhausted.fill(true);
+    }
+
+    fn sync_counts(&mut self, queue: &[(usize, PhotoMeta)]) {
+        self.plugin_offsets.fill(0);
+        for (pi, _) in queue {
+            if *pi < self.plugin_offsets.len() {
+                self.plugin_offsets[*pi] += 1;
+            }
+        }
+        for (i, off) in self.plugin_offsets.iter().enumerate() {
+            if *off >= MAX_PHOTOS_PER_PLUGIN {
+                self.plugin_exhausted[i] = true;
+            }
+        }
+    }
+
+    fn near_end(&self, trigger_idx: usize, queue_len: usize) -> bool {
+        !self.all_exhausted()
+            && queue_len > 0
+            && trigger_idx + LOAD_AHEAD_MARGIN >= queue_len.saturating_sub(1)
+    }
+}
 
 /// Settings-menu title. Used both to render the panel and to compute its
 /// geometry for click/hover hit-testing, so the two must use the same string.
@@ -91,7 +140,8 @@ impl Slideshow {
         // 1. Authenticate all plugins.
         self.authenticate_all().await?;
 
-        // 2. Build the play queue (all photos from all plugins, shuffled).
+        // 2. Build the initial play queue (first API page per plugin — more load
+        // on demand as the user pages through the gallery or slideshow).
         let queue = self.build_queue().await?;
         if queue.is_empty() {
             anyhow::bail!(
@@ -147,78 +197,135 @@ impl Slideshow {
     // ── Queue building ────────────────────────────────────────────────────
 
     async fn build_queue(&self) -> Result<Vec<(usize, PhotoMeta)>> {
-        Self::build_queue_with(&self.plugins, &self.config.display).await
+        Self::build_queue_with(&self.plugins, &self.config.display, false).await
     }
 
-    /// Build the shuffled/ordered play queue from an explicit plugin set and
-    /// display config. Used both at startup and when the source is switched at
-    /// runtime — keeping it free of `&self` lets the switch path build a queue
-    /// from a fresh, not-yet-installed plugin set before committing to it.
+    /// Build the play queue from an explicit plugin set and display config.
+    /// `full = false` loads one API page per plugin (fast gallery startup);
+    /// `full = true` pages until each plugin is exhausted (menu re-order / switch).
     async fn build_queue_with(
         plugins: &[BoxedPlugin],
         display: &DisplayConfig,
+        full: bool,
     ) -> Result<Vec<(usize, PhotoMeta)>> {
+        let mut loader = QueueLoader::new(plugins.len());
         let mut all: Vec<(usize, PhotoMeta)> = Vec::new();
-
-        for (plugin_idx, plugin) in plugins.iter().enumerate() {
-            let mut offset = 0;
-            loop {
-                match plugin.list_photos(PAGE_SIZE, offset).await {
-                    Ok(page) if page.is_empty() => break,
-                    Ok(page) => {
-                        info!(
-                            "  {} loaded {} photos (offset {})",
-                            plugin.name(),
-                            page.len(),
-                            offset
-                        );
-                        offset += page.len();
-                        all.extend(page.into_iter().map(|m| (plugin_idx, m)));
-                        if offset >= 2000 {
-                            break;
-                        } // cap at 2 000 per plugin
-                    }
-                    Err(e) => {
-                        warn!("  {} list_photos error: {}", plugin.name(), e);
-                        break;
-                    }
-                }
+        loop {
+            let batch = Self::fetch_queue_round(plugins, &mut loader).await;
+            if batch.is_empty() {
+                break;
+            }
+            all.extend(batch);
+            if !full {
+                break;
             }
         }
 
-        // Nanosecond clock as shuffle seed. On an RTC-less Pi that cold-boots
-        // before NTP sync the clock (and therefore the seed) is roughly the
-        // same every boot — including the literal-42 fallback if the clock
-        // sits before the epoch — so the shuffle order repeats until time
-        // syncs. Cosmetic only; not worth an entropy source.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(42);
+        apply_order(&mut all, display, loader.shuffle_seed);
 
         match display.order {
-            PhotoOrder::Shuffle => {
-                shuffle(&mut all, seed);
-                if display.on_this_day_boost {
-                    weave_on_this_day(&mut all);
-                }
-                info!("Photo order: shuffle ({} photos)", all.len());
-            }
-            PhotoOrder::Chronological => {
-                all.sort_by_key(|(_, m)| m.taken_at);
-                info!("Photo order: chronological ({} photos)", all.len());
-            }
-            PhotoOrder::NewestFirst => {
-                all.sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
-                info!("Photo order: newest first ({} photos)", all.len());
-            }
-            PhotoOrder::DateCluster => {
-                all = date_cluster_order(all, seed);
-                info!("Photo order: date clusters ({} photos)", all.len());
-            }
+            PhotoOrder::Shuffle => info!("Photo order: shuffle ({} photos)", all.len()),
+            PhotoOrder::Chronological => info!("Photo order: chronological ({} photos)", all.len()),
+            PhotoOrder::NewestFirst => info!("Photo order: newest first ({} photos)", all.len()),
+            PhotoOrder::DateCluster => info!("Photo order: date clusters ({} photos)", all.len()),
         }
 
         Ok(all)
+    }
+
+    /// Pull one API page from every plugin that still has more photos.
+    async fn fetch_queue_round(
+        plugins: &[BoxedPlugin],
+        loader: &mut QueueLoader,
+    ) -> Vec<(usize, PhotoMeta)> {
+        let mut batch = Vec::new();
+        for (plugin_idx, plugin) in plugins.iter().enumerate() {
+            if loader.plugin_exhausted[plugin_idx] {
+                continue;
+            }
+            let offset = loader.plugin_offsets[plugin_idx];
+            if offset >= MAX_PHOTOS_PER_PLUGIN {
+                loader.plugin_exhausted[plugin_idx] = true;
+                continue;
+            }
+            match plugin.list_photos(PAGE_SIZE, offset).await {
+                Ok(page) if page.is_empty() => {
+                    loader.plugin_exhausted[plugin_idx] = true;
+                }
+                Ok(page) => {
+                    info!(
+                        "  {} loaded {} photos (offset {})",
+                        plugin.name(),
+                        page.len(),
+                        offset
+                    );
+                    let n = page.len();
+                    loader.plugin_offsets[plugin_idx] += n;
+                    batch.extend(page.into_iter().map(|m| (plugin_idx, m)));
+                    if n < PAGE_SIZE || loader.plugin_offsets[plugin_idx] >= MAX_PHOTOS_PER_PLUGIN
+                    {
+                        loader.plugin_exhausted[plugin_idx] = true;
+                    }
+                }
+                Err(e) => {
+                    warn!("  {} list_photos error: {}", plugin.name(), e);
+                    loader.plugin_exhausted[plugin_idx] = true;
+                }
+            }
+        }
+        batch
+    }
+
+    /// Append the next API page when the user is near the end of the queue.
+    async fn try_extend_queue(
+        &self,
+        queue: &mut Vec<(usize, PhotoMeta)>,
+        loader: &mut QueueLoader,
+        trigger_idx: usize,
+        remote_status: &Option<SharedStatus>,
+    ) -> bool {
+        if !loader.near_end(trigger_idx, queue.len()) {
+            return false;
+        }
+        self.extend_queue_once(queue, loader, remote_status).await
+    }
+
+    /// Always try to append the next API page (e.g. user hit the last row/photo).
+    async fn try_extend_queue_force(
+        &self,
+        queue: &mut Vec<(usize, PhotoMeta)>,
+        loader: &mut QueueLoader,
+        remote_status: &Option<SharedStatus>,
+    ) -> bool {
+        if loader.all_exhausted() {
+            return false;
+        }
+        self.extend_queue_once(queue, loader, remote_status).await
+    }
+
+    async fn extend_queue_once(
+        &self,
+        queue: &mut Vec<(usize, PhotoMeta)>,
+        loader: &mut QueueLoader,
+        remote_status: &Option<SharedStatus>,
+    ) -> bool {
+        let before = queue.len();
+        let batch = Self::fetch_queue_round(&self.plugins, loader).await;
+        if batch.is_empty() {
+            return false;
+        }
+        let from = queue.len();
+        queue.extend(batch);
+        apply_order_tail(queue, from, &self.config.display, loader.shuffle_seed);
+        info!(
+            "Loaded {} more photos ({} total)",
+            queue.len() - before,
+            queue.len()
+        );
+        if let Some(status) = remote_status {
+            status.lock().unwrap_or_else(|e| e.into_inner()).total = queue.len();
+        }
+        true
     }
 
     // ── Display loop ──────────────────────────────────────────────────────
@@ -230,6 +337,8 @@ impl Slideshow {
         mut remote_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
     ) -> Result<()> {
+        let mut queue_loader = QueueLoader::new(self.plugins.len());
+        queue_loader.sync_counts(&queue);
         // Prefetch ring: up to `prefetch_count` photos fetched *and* fully
         // decoded/scaled ahead of time, so showing a slide is just a texture
         // upload + transition — the costly JPEG decode and Lanczos resize run
@@ -461,6 +570,14 @@ impl Slideshow {
                     }
                     SlideshowCmd::Next => {
                         if !menu.open && !in_gallery {
+                            if current_queue_idx + 1 >= queue.len() {
+                                self.try_extend_queue_force(
+                                    &mut queue,
+                                    &mut queue_loader,
+                                    &remote_status,
+                                )
+                                .await;
+                            }
                             last_advance = Instant::now()
                                 .checked_sub(slide_dur)
                                 .unwrap_or_else(Instant::now); // force advance
@@ -555,7 +672,28 @@ impl Slideshow {
                     SlideshowCmd::GalleryPage(dir) => {
                         if in_gallery {
                             if let Some(grid) = gallery.as_mut() {
-                                if grid.scroll_page(dir, queue.len(), renderer.height()) {
+                                let mut scrolled =
+                                    grid.scroll_page(dir, queue.len(), renderer.height());
+                                if !scrolled
+                                    && dir > 0
+                                    && grid.at_scroll_bottom(queue.len(), renderer.height())
+                                {
+                                    if self
+                                        .try_extend_queue_force(
+                                            &mut queue,
+                                            &mut queue_loader,
+                                            &remote_status,
+                                        )
+                                        .await
+                                    {
+                                        scrolled = grid.scroll_page(
+                                            dir,
+                                            queue.len(),
+                                            renderer.height(),
+                                        );
+                                    }
+                                }
+                                if scrolled {
                                     gallery_dirty = true;
                                 }
                             }
@@ -564,7 +702,20 @@ impl Slideshow {
                     SlideshowCmd::GalleryMoveSelection { dx, dy } => {
                         if in_gallery {
                             if let Some(grid) = gallery.as_mut() {
-                                grid.move_selection(dx, dy, queue.len());
+                                let mut blocked =
+                                    grid.move_selection(dx, dy, queue.len());
+                                if blocked {
+                                    if self
+                                        .try_extend_queue_force(
+                                            &mut queue,
+                                            &mut queue_loader,
+                                            &remote_status,
+                                        )
+                                        .await
+                                    {
+                                        blocked = grid.move_selection(dx, dy, queue.len());
+                                    }
+                                }
                                 grid.ensure_selected_visible(
                                     renderer.height(),
                                     queue.len(),
@@ -694,6 +845,8 @@ impl Slideshow {
                         }
                         MenuOutcome::NewQueue(q) => {
                             queue = q;
+                            queue_loader.sync_counts(&queue);
+                            queue_loader.mark_fully_loaded();
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
@@ -706,6 +859,8 @@ impl Slideshow {
                         }
                         MenuOutcome::Switched(q) => {
                             queue = q;
+                            queue_loader.sync_counts(&queue);
+                            queue_loader.mark_fully_loaded();
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
@@ -779,6 +934,17 @@ impl Slideshow {
                 if let Some(grid) = gallery.as_mut() {
                     grid.clamp_scroll(queue.len(), renderer.height());
                     let sel = grid.selected.min(queue.len().saturating_sub(1));
+                    if self
+                        .try_extend_queue(
+                            &mut queue,
+                            &mut queue_loader,
+                            sel,
+                            &remote_status,
+                        )
+                        .await
+                    {
+                        gallery_dirty = true;
+                    }
                     // Always load the selected thumb first so it is visible.
                     if !queue.is_empty() && grid.thumb(sel).is_none() {
                         let (pidx, meta) = &queue[sel];
@@ -837,6 +1003,15 @@ impl Slideshow {
             // Recovery: if the ring is empty (failed fetches, just opened with
             // a bad photo, etc.) try to refill before the advance path.
             if prefetched.is_empty() && !queue.is_empty() {
+                if queue_loader.near_end(current_queue_idx, queue.len()) {
+                    self.try_extend_queue(
+                        &mut queue,
+                        &mut queue_loader,
+                        current_queue_idx,
+                        &remote_status,
+                    )
+                    .await;
+                }
                 for _ in 0..prefetch_n {
                     self.prefetch_one(
                         &queue,
@@ -933,6 +1108,15 @@ impl Slideshow {
             }
 
             if last_advance.elapsed() < current_slide_dur {
+                if queue_loader.near_end(cursor, queue.len()) {
+                    self.try_extend_queue(
+                        &mut queue,
+                        &mut queue_loader,
+                        cursor,
+                        &remote_status,
+                    )
+                    .await;
+                }
                 self.prefetch_one(
                     &queue,
                     &mut cursor,
@@ -1377,7 +1561,7 @@ impl Slideshow {
             }
             MenuAction::CycleOrder => {
                 self.config.display.order = next_order(&self.config.display.order);
-                match Self::build_queue_with(&self.plugins, &self.config.display).await {
+                match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
                     Ok(q) => MenuOutcome::NewQueue(q),
                     Err(e) => {
                         warn!("Re-order failed: {e}");
@@ -1505,7 +1689,7 @@ impl Slideshow {
             warn!("Reload after album change failed: {e}");
             return MenuOutcome::Stay;
         }
-        match Self::build_queue_with(&self.plugins, &self.config.display).await {
+        match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
             Ok(q) if !q.is_empty() => {
                 info!("Album target: {}", self.config.targeting.album_label());
                 MenuOutcome::NewQueue(q)
@@ -1536,7 +1720,7 @@ impl Slideshow {
             warn!("Reload after favourites toggle failed: {e}");
             return MenuOutcome::Stay;
         }
-        match Self::build_queue_with(&self.plugins, &self.config.display).await {
+        match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
             Ok(q) if !q.is_empty() => {
                 info!(
                     "Favourites-only {}",
@@ -1611,7 +1795,7 @@ impl Slideshow {
             }
         }
 
-        match Self::build_queue_with(&new_plugins, &trial.display).await {
+        match Self::build_queue_with(&new_plugins, &trial.display, true).await {
             Ok(queue) if !queue.is_empty() => {
                 info!("Switched source to '{name}' ({} photos)", queue.len());
                 self.config = trial;
@@ -1643,6 +1827,7 @@ impl Slideshow {
         // not be world-readable. Write 0600 on Unix; a plain write elsewhere.
         write_private(&self.config_path, &text)
             .with_context(|| format!("writing config {}", self.config_path.display()))?;
+        Config::restrict_private_permissions(&self.config_path);
         Ok(())
     }
 
@@ -1823,6 +2008,62 @@ fn shuffle<T>(v: &mut [T], seed: u64) {
 }
 
 // ── Queue ordering helpers ────────────────────────────────────────────────────
+
+fn shuffle_seed_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(42)
+}
+
+fn apply_order(
+    queue: &mut Vec<(usize, PhotoMeta)>,
+    display: &DisplayConfig,
+    seed: u64,
+) {
+    match display.order {
+        PhotoOrder::Shuffle => {
+            shuffle(queue, seed);
+            if display.on_this_day_boost {
+                weave_on_this_day(queue);
+            }
+        }
+        PhotoOrder::Chronological => {
+            queue.sort_by_key(|(_, m)| m.taken_at);
+        }
+        PhotoOrder::NewestFirst => {
+            queue.sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
+        }
+        PhotoOrder::DateCluster => {
+            *queue = date_cluster_order(std::mem::take(queue), seed);
+        }
+    }
+}
+
+fn apply_order_tail(
+    queue: &mut Vec<(usize, PhotoMeta)>,
+    from: usize,
+    display: &DisplayConfig,
+    seed: u64,
+) {
+    if from >= queue.len() {
+        return;
+    }
+    match display.order {
+        PhotoOrder::Shuffle => {
+            shuffle(&mut queue[from..], seed.wrapping_add(from as u64));
+        }
+        PhotoOrder::Chronological => {
+            queue[from..].sort_by_key(|(_, m)| m.taken_at);
+        }
+        PhotoOrder::NewestFirst => {
+            queue[from..].sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
+        }
+        PhotoOrder::DateCluster => {
+            queue[from..].sort_by_key(|(_, m)| m.taken_at);
+        }
+    }
+}
 
 /// "On this day": photos taken on today's calendar date (any year) get woven
 /// near the front of the shuffled queue, one every `SPACING` slides, so

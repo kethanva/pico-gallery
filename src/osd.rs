@@ -9,9 +9,12 @@
 ///
 /// All pixel writes go through the raw `RgbaImage::as_mut()` byte slice with
 /// a precomputed row stride — no `get_pixel`/`put_pixel` per-pixel bounds
-/// checks.  Darkening uses `(c * 7) >> 4` instead of `(c * 45) / 100`,
-/// because ARM11 (Pi Zero / Pi Zero W) has no hardware integer divider.
-/// On a 1080p screen this brings OSD render time from ~80 ms to ~5 ms.
+/// checks.  Darkening uses `(c * 7) >> 4` instead of `(c * 45) / 100` to
+/// avoid integer division in the hot loop (especially costly on the original
+/// Pi Zero / Pi Zero W ARM11 core; Pi Zero 2 W has hardware divide but the
+/// shift form is still cheaper).  On 1080p, shift-based dimming is roughly an
+/// order of magnitude faster than per-pixel division in local profiling on
+/// Pi Zero — treat exact timings as hardware-dependent estimates.
 use font8x8::UnicodeFonts;
 use image::{Rgba, RgbaImage};
 use picogallery_core::PhotoMeta;
@@ -49,7 +52,7 @@ fn truncate(s: &str, max: usize) -> Cow<'_, str> {
 
 /// Darken a rectangular region of `img` by ~44 % (`out = (in * 7) >> 4`).
 ///
-/// Pure shift-and-multiply — no division (ARM11 has no hardware divider).
+/// Pure shift-and-multiply in the hot loop — no per-pixel division.
 /// Operates on `img.as_mut()` directly so the inner loop has no per-pixel
 /// bounds checks or index recomputation.
 fn darken_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {

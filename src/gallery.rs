@@ -129,10 +129,12 @@ impl GalleryGrid {
     }
 
     /// Move the selection by grid cells (dx = column, dy = row).
-    pub fn move_selection(&mut self, dx: i32, dy: i32, count: usize) {
-        if count == 0 || self.cols == 0 {
-            return;
+    /// Returns true when a forward move (right/down) was blocked at the edge.
+    pub fn move_selection(&mut self, dx: i32, dy: i32, count: usize) -> bool {
+        if count == 0 || self.cols == 0 || (dx == 0 && dy == 0) {
+            return false;
         }
+        let before = self.selected;
         let cols = self.cols as i32;
         let row = (self.selected as i32 / cols) + dy;
         let col = (self.selected as i32 % cols) + dx;
@@ -140,6 +142,16 @@ impl GalleryGrid {
         let col = col.clamp(0, cols - 1);
         let idx = row as usize * self.cols as usize + col as usize;
         self.selected = idx.min(count - 1);
+        before == self.selected && (dx > 0 || dy > 0)
+    }
+
+    /// True when the grid is scrolled to the bottom of `count` photos.
+    pub fn at_scroll_bottom(&self, count: usize, screen_h: u32) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let max_scroll = self.content_height(count).saturating_sub(screen_h) as i32;
+        self.scroll_y >= max_scroll.max(0)
     }
 
     /// Scroll the minimum amount to bring the selected cell into the viewport.
@@ -418,9 +430,26 @@ mod tests {
     fn move_selection_wraps_columns() {
         let mut g = GalleryGrid::new(800);
         g.set_selected(0, 20);
-        g.move_selection(1, 0, 20);
+        assert!(!g.move_selection(1, 0, 20));
         assert_eq!(g.selected, 1);
-        g.move_selection(0, 1, 20);
+        assert!(!g.move_selection(0, 1, 20));
         assert_eq!(g.selected, 1 + g.cols as usize);
+    }
+
+    #[test]
+    fn move_selection_blocked_at_last_cell() {
+        let mut g = GalleryGrid::new(800);
+        g.set_selected(9, 10);
+        assert!(g.move_selection(1, 0, 10));
+        assert_eq!(g.selected, 9);
+    }
+
+    #[test]
+    fn at_scroll_bottom_when_fully_scrolled() {
+        let mut g = GalleryGrid::new(400);
+        let count = 40;
+        let h = 300;
+        while g.scroll_page(1, count, h) {}
+        assert!(g.at_scroll_bottom(count, h));
     }
 }

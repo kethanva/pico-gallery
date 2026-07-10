@@ -539,7 +539,46 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        let config: Self = toml::from_str(&text)
+            .with_context(|| format!("parsing config {}", path.display()))?;
+        Self::restrict_private_permissions(path);
+        Ok(config)
+    }
+
+    /// Best-effort: owner-only permissions on the config file (0600) and its
+    /// parent directory (0700).  The file may hold Wi-Fi and PhotoPrism
+    /// passwords in plain text — tighten perms on load so older installs that
+    /// were created world-readable are fixed at startup.
+    pub fn restrict_private_permissions(path: &Path) {
+        #[cfg(unix)]
+        {
+            use log::warn;
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = path.parent() {
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!(
+                        "Could not restrict config dir {} to 0700: {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+            if path.exists() {
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    warn!(
+                        "Could not restrict config {} to 0600: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     /// Default config file path: `~/.config/picogallery/config.toml`.

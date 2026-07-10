@@ -288,7 +288,7 @@ pub fn build_rows(ctx: &RowsCtx) -> Vec<MenuRow> {
         rows.push(edit_row(
             ctx,
             EditField::PhotoPrismPassword,
-            if has_pw { "****" } else { "(unset)" },
+            secret_from_set(has_pw),
         ));
         rows.push(MenuRow::new(
             "Connect PhotoPrism",
@@ -328,10 +328,15 @@ fn display_value(s: &str) -> String {
 /// Masked representation of a secret: fixed-width dots when set (length not
 /// leaked), placeholder when empty.
 fn secret_value(s: &str) -> &'static str {
-    if s.is_empty() {
-        "(unset)"
-    } else {
+    secret_from_set(!s.is_empty())
+}
+
+/// Masked label when only a presence flag is available (e.g. PhotoPrism password).
+fn secret_from_set(has_secret: bool) -> &'static str {
+    if has_secret {
         "****"
+    } else {
+        "(unset)"
     }
 }
 
@@ -504,6 +509,11 @@ mod tests {
             r.action,
             MenuAction::BeginEdit(EditField::PhotoPrismUrl)
         ) && r.label.contains("pp.local")));
+        let pw = with
+            .iter()
+            .find(|r| matches!(r.action, MenuAction::BeginEdit(EditField::PhotoPrismPassword)))
+            .unwrap();
+        assert!(pw.label.contains("****"));
     }
 
     #[test]
