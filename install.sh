@@ -50,7 +50,7 @@ section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 #     --photoprism-url http://192.168.68.71:2342 \
 #     --photoprism-user admin --photoprism-pass 'secret'
 #
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 
 MODE_FLAG=""            # download | build | all
 ASSUME_YES=0
