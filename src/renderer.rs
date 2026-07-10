@@ -185,16 +185,21 @@ impl Renderer {
         // to a private /tmp/runtime-$UID dir with 0700 perms.
         #[cfg(target_os = "linux")]
         {
-            if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-                let uid: u32 = std::fs::read_to_string("/proc/self/status")
-                    .ok()
-                    .and_then(|s| {
-                        s.lines()
-                            .find(|l| l.starts_with("Uid:"))
-                            .and_then(|l| l.split_whitespace().nth(1))
-                            .and_then(|v| v.parse::<u32>().ok())
-                    })
-                    .unwrap_or(1000);
+            let uid: u32 = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<u32>().ok())
+                })
+                .unwrap_or(1000);
+
+            let runtime_ok = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(|p| std::path::Path::new(&p).is_dir())
+                .unwrap_or(false);
+
+            if !runtime_ok {
                 let run_user = format!("/run/user/{}", uid);
                 let chosen = if std::path::Path::new(&run_user).is_dir() {
                     run_user

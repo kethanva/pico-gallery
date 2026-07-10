@@ -433,8 +433,12 @@ TARGET_USER="${USER_FLAG:-${SUDO_USER:-$(whoami)}}"
 if ! id "$TARGET_USER" &>/dev/null; then
   die "Target user '$TARGET_USER' does not exist. Create it first, or pass --user <name>."
 fi
-[[ -d "/home/${TARGET_USER}" ]] || die "Home directory /home/${TARGET_USER} not found for user '$TARGET_USER'."
-info "Installing for user: $TARGET_USER"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "Home directory for '$TARGET_USER' not found (got: ${TARGET_HOME:-<empty>}). Pass --user <name>."
+if [[ "$TARGET_USER" == "root" && -z "$USER_FLAG" ]]; then
+  warn "Installing for root — prefer a dedicated kiosk user:  --user dietpi"
+fi
+info "Installing for user: $TARGET_USER ($TARGET_HOME)"
 for group in video render input; do
   if getent group "$group" &>/dev/null; then
     sudo usermod -aG "$group" "$TARGET_USER"
@@ -457,7 +461,7 @@ done
 
 section "Setting up sample photos"
 
-PHOTO_DIR="/home/${TARGET_USER}/Pictures/PicoGallery"
+PHOTO_DIR="${TARGET_HOME}/Pictures/PicoGallery"
 sudo -u "$TARGET_USER" mkdir -p "$PHOTO_DIR"
 
 PHOTO_DIR_IS_EMPTY=0
@@ -509,7 +513,7 @@ fi
 
 section "Setting up configuration"
 
-CONFIG_DIR="/home/${TARGET_USER}/.config/picogallery"
+CONFIG_DIR="${TARGET_HOME}/.config/picogallery"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 sudo -u "$TARGET_USER" mkdir -p "$CONFIG_DIR"
 
@@ -671,11 +675,12 @@ Wants=network-online.target
 Type=simple
 User=${TARGET_USER}
 Group=video
+Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info
-# SDL2 / mesa / dbus need XDG_RUNTIME_DIR. systemd-logind only creates
-# /run/user/%U for interactive sessions; point at it anyway and let the
-# binary create a /tmp fallback if the dir doesn't exist.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
+# systemd does not create /run/user/%U for non-login service users — use a
+# dedicated runtime dir instead of pointing at a path that may not exist.
+RuntimeDirectory=picogallery
+Environment=XDG_RUNTIME_DIR=/run/picogallery
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/picogallery
 Restart=on-failure
@@ -764,6 +769,16 @@ section "Enabling service"
 
 sudo systemctl enable picogallery
 info "PicoGallery will start automatically on boot."
+
+if [[ "${REBOOT_REQUIRED:-0}" == "1" ]]; then
+  warn "Skipping service start — reboot first so /dev/dri is available."
+elif [[ "$ASSUME_YES" == "1" ]]; then
+  info "Starting picogallery service..."
+  if ! sudo systemctl restart picogallery; then
+    warn "Service start failed. After fixing issues: sudo systemctl restart picogallery"
+    warn "Logs: sudo journalctl -u picogallery -n 50 --no-pager"
+  fi
+fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 

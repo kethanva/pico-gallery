@@ -64,7 +64,9 @@ INSTALL_SCRIPT="${INSTALL_SCRIPT:-/tmp/picogallery-install.sh}"
 id "$KIOSK_USER" &>/dev/null || die "User '$KIOSK_USER' does not exist (set KIOSK_USER)."
 [[ -n "$PICOGALLERY_VERSION" ]] || die "Set PICOGALLERY_VERSION to a GitHub release tag (e.g. v0.1.3-kva.1). Run ./release.sh --prerelease on your dev machine first."
 
-CONFIG_FILE="/home/${KIOSK_USER}/.config/picogallery/config.toml"
+CONFIG_FILE="$(getent passwd "$KIOSK_USER" | cut -d: -f6)/.config/picogallery/config.toml"
+[[ -n "$CONFIG_FILE" && "$CONFIG_FILE" != "/.config"* ]] || die "Could not resolve home for $KIOSK_USER"
+KIOSK_HOME="${CONFIG_FILE%/.config/picogallery/config.toml}"
 
 # ── Stop the running slideshow ───────────────────────────────────────────────
 info "Stopping picogallery service"
@@ -94,7 +96,7 @@ PICOGALLERY_VERSION="$PICOGALLERY_VERSION" "$INSTALL_SCRIPT" --mode download -y 
 # ── Clear regenerable caches ─────────────────────────────────────────────────
 if [[ "$CLEAR_USER_CACHE" == "1" ]]; then
   info "Clearing $KIOSK_USER caches"
-  rm -rf "/home/${KIOSK_USER}/.cache" "/home/${KIOSK_USER}/.local"
+  rm -rf "${KIOSK_HOME}/.cache" "${KIOSK_HOME}/.local"
 fi
 
 # ── Start ────────────────────────────────────────────────────────────────────
