@@ -19,6 +19,8 @@ transition          = "fade"  # "cut" | "fade" | "slide_left" | "slide_right"
 transition_ms       = 800     # transition duration (ms); set 0 to disable
 fill_screen         = false   # true = crop-to-fill; false = letterbox (black bars)
 fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
+resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | "lanczos3"
+                                    # lighter = less CPU/slide; "lanczos3" = sharpest, heaviest
 # width  = 1920
 # height = 1080
 

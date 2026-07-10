@@ -96,7 +96,12 @@ plugin-photoprism    = ["dep:picogallery-photoprism"]
 plugin-usb           = ["dep:picogallery-usb"]
 
 [profile.release]
-opt-level     = "z"
+# opt-level 2 (not "z"): this is a compute-bound image app (JPEG decode + fir
+# resize + color transform per slide). "z" disables the inlining/vectorization
+# those hot loops depend on, which is a poor trade on a slow ARM core. Keeping
+# lto=true recovers most of the size increase. Set to "z" if binary size on the
+# release asset ever becomes the constraint.
+opt-level     = 2
 lto           = true
 codegen-units = 1
 strip         = true

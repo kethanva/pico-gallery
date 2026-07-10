@@ -18,6 +18,25 @@ pub enum Transition {
     SlideRight,
 }
 
+/// Downscale filter used when scaling a decoded photo to the display.
+///
+/// `Lanczos3` is the sharpest but samples a wide window (~36 taps/pixel) —
+/// costly on a Pi Zero. `CatmullRom` (bicubic) is the default: visually close
+/// to Lanczos3 for photographic downscales at roughly half the work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeFilter {
+    /// Fastest, slightly soft.
+    Bilinear,
+    /// Bicubic middle-ground — default. Near-Lanczos quality, ~half the cost.
+    #[default]
+    CatmullRom,
+    /// Bicubic tuned to reduce ringing/blur.
+    Mitchell,
+    /// Sharpest, widest sampling window, highest CPU cost.
+    Lanczos3,
+}
+
 /// Order in which photos are presented.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +143,11 @@ pub struct DisplayConfig {
     #[serde(default = "default_true")]
     pub letterbox_blur: bool,
 
+    /// Downscale filter for the main slide. Lighter filters trade a little
+    /// sharpness for materially less CPU per slide on the Pi Zero.
+    #[serde(default)]
+    pub resize_filter: ResizeFilter,
+
     /// Slow Ken Burns zoom/pan on each photo. Renders continuously at the
     /// configured fps while a slide is showing (more CPU/GPU load — off by
     /// default; fine on Pi Zero 2, not recommended on the original Pi Zero).
@@ -183,6 +207,7 @@ impl Default for DisplayConfig {
             max_image_mb: 0,
             max_megapixels: 0,
             letterbox_blur: true,
+            resize_filter: ResizeFilter::CatmullRom,
             ken_burns: false,
             on_this_day_boost: true,
             night_start: None,
@@ -509,6 +534,27 @@ mod tests {
 
     fn t(h: u32, m: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    // ── resize_filter: lighter default + config override + back-compat ──────
+
+    #[test]
+    fn resize_filter_defaults_to_catmull_rom() {
+        assert_eq!(DisplayConfig::default().resize_filter, ResizeFilter::CatmullRom);
+    }
+
+    #[test]
+    fn resize_filter_parses_snake_case_override() {
+        let cfg: DisplayConfig =
+            toml::from_str("resize_filter = \"lanczos3\"").expect("parse resize_filter");
+        assert_eq!(cfg.resize_filter, ResizeFilter::Lanczos3);
+    }
+
+    #[test]
+    fn resize_filter_absent_falls_back_to_default() {
+        // Existing configs written before this field must still deserialize.
+        let cfg: DisplayConfig = toml::from_str("fps = 15").expect("parse without resize_filter");
+        assert_eq!(cfg.resize_filter, ResizeFilter::CatmullRom);
     }
 
     // ── time_in_window: overnight wrap (22:00–06:00) ────────────────────────

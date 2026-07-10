@@ -659,7 +659,13 @@ impl Renderer {
             fir::PixelType::U8x3,
         );
 
-        let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
+        let filter = match self.config.resize_filter {
+            crate::config::ResizeFilter::Bilinear => fir::FilterType::Bilinear,
+            crate::config::ResizeFilter::CatmullRom => fir::FilterType::CatmullRom,
+            crate::config::ResizeFilter::Mitchell => fir::FilterType::Mitchell,
+            crate::config::ResizeFilter::Lanczos3 => fir::FilterType::Lanczos3,
+        };
+        let mut resizer = fir::Resizer::new(fir::ResizeAlg::Convolution(filter));
         resizer
             .resize(&src.view(), &mut dst.view_mut())
             .map_err(|e| anyhow::anyhow!("image resize: {}", e))?;
