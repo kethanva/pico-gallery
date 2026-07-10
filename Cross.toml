@@ -10,14 +10,16 @@
 # workflow `env:` block; cross auto-forwards any CARGO_* / PKG_CONFIG_* vars
 # to the container, so no [target.*.env] section is needed here.
 
+# Retry apt up to 3× — ports.ubuntu.com occasionally drops connections mid-fetch
+# during CI cross image builds (especially armhf).
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config",
+    "for attempt in 1 2 3; do apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config && break || sleep 30; done",
 ]
 
 [target.armv7-unknown-linux-gnueabihf]
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config",
+    "for attempt in 1 2 3; do apt-get update && apt-get install --assume-yes --no-install-recommends libsdl2-dev:$CROSS_DEB_ARCH libdrm-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH pkg-config && break || sleep 30; done",
 ]

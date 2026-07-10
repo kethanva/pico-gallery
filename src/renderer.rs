@@ -1047,48 +1047,43 @@ impl Renderer {
                 Event::MouseButtonDown {
                     mouse_btn, x, y, ..
                 } => {
-                    if menu_open {
-                        match mouse_btn {
-                            MouseButton::Right => out.push(SlideshowCmd::CloseMenu),
-                            MouseButton::Left => out.push(SlideshowCmd::MenuClick { x, y }),
-                            _ => {}
-                        }
-                    } else if in_gallery {
-                        match mouse_btn {
-                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
-                            MouseButton::Left => out.push(SlideshowCmd::GalleryClick { x, y }),
-                            _ => {}
-                        }
-                    } else if gallery_mode {
-                        match mouse_btn {
-                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
-                            MouseButton::Left if crate::osd::close_button_hit(
+                    push_pointer_action(
+                        &mut out,
+                        mouse_btn,
+                        x,
+                        y,
+                        menu_open,
+                        in_gallery,
+                        gallery_mode,
+                        half_w,
+                        self.width,
+                        self.height,
+                    );
+                }
+
+                // Touchscreens on Pi often deliver taps on button-up; handle
+                // gallery picks and the × close control without mapping release
+                // to slideshow prev/next (mouse-down still does that).
+                Event::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } if !menu_open
+                    && (in_gallery
+                        || (gallery_mode
+                            && !in_gallery
+                            && crate::osd::close_button_hit(
                                 x,
                                 y,
                                 self.width,
                                 self.height,
-                            ) =>
-                            {
-                                out.push(SlideshowCmd::BackToGallery)
-                            }
-                            MouseButton::Left => out.push(if x < half_w {
-                                SlideshowCmd::Prev
-                            } else {
-                                SlideshowCmd::Next
-                            }),
-                            _ => {}
-                        }
+                            ))) =>
+                {
+                    if in_gallery {
+                        out.push(SlideshowCmd::GalleryClick { x, y });
                     } else {
-                        match mouse_btn {
-                            // Right-click anywhere opens the settings menu.
-                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
-                            // Left/middle: position-based prev/next.
-                            _ => out.push(if x < half_w {
-                                SlideshowCmd::Prev
-                            } else {
-                                SlideshowCmd::Next
-                            }),
-                        }
+                        out.push(SlideshowCmd::BackToGallery);
                     }
                 }
 
@@ -1116,6 +1111,56 @@ impl Renderer {
             .set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         self.canvas.clear();
         self.canvas.present();
+    }
+}
+
+/// Map a mouse button press to slideshow commands.
+fn push_pointer_action(
+    out: &mut Vec<SlideshowCmd>,
+    mouse_btn: MouseButton,
+    x: i32,
+    y: i32,
+    menu_open: bool,
+    in_gallery: bool,
+    gallery_mode: bool,
+    half_w: i32,
+    width: u32,
+    height: u32,
+) {
+    if menu_open {
+        match mouse_btn {
+            MouseButton::Right => out.push(SlideshowCmd::CloseMenu),
+            MouseButton::Left => out.push(SlideshowCmd::MenuClick { x, y }),
+            _ => {}
+        }
+    } else if in_gallery {
+        match mouse_btn {
+            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+            MouseButton::Left => out.push(SlideshowCmd::GalleryClick { x, y }),
+            _ => {}
+        }
+    } else if gallery_mode {
+        match mouse_btn {
+            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+            MouseButton::Left if crate::osd::close_button_hit(x, y, width, height) => {
+                out.push(SlideshowCmd::BackToGallery)
+            }
+            MouseButton::Left => out.push(if x < half_w {
+                SlideshowCmd::Prev
+            } else {
+                SlideshowCmd::Next
+            }),
+            _ => {}
+        }
+    } else {
+        match mouse_btn {
+            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+            _ => out.push(if x < half_w {
+                SlideshowCmd::Prev
+            } else {
+                SlideshowCmd::Next
+            }),
+        }
     }
 }
 
