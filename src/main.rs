@@ -258,6 +258,7 @@ fn generate_config(path: &std::path::Path, force: bool) -> Result<()> {
 
     std::fs::write(path, default_config())
         .with_context(|| format!("writing config to {}", path.display()))?;
+    Config::restrict_private_permissions(path);
 
     eprintln!(
         "Config written to {}.\n\

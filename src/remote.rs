@@ -12,9 +12,11 @@
 //!   POST /api/favorite → favourite/un-favourite the current photo
 //!   GET  /api/status   → {"paused":…,"index":…,"total":…,"filename":…,"album":…,"favorite":…}
 //!
-//! Security: no authentication — bind to a trusted LAN only (see
-//! `[remote] bind` in config). Commands are display-control only; no photo
-//! bytes or filesystem paths are exposed.
+//! Security:
+//!   - No authentication — bind to a trusted LAN only (see `[remote] bind`).
+//!   - Commands are display-control only; no photo bytes or filesystem paths.
+//!   - `/api/status` returns [`Status`] only — no Wi-Fi, PhotoPrism, or other
+//!     credentials are ever included in the JSON payload.
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
@@ -33,8 +35,10 @@ use crate::renderer::SlideshowCmd;
 /// rather than queue up a pile of stale button presses.
 const CMD_QUEUE_CAP: usize = 16;
 
-/// Snapshot of what the slideshow is currently doing, shared with the
-/// HTTP server. Updated by the display loop, read by `/api/status`.
+/// Snapshot of what the slideshow is currently showing, shared with the
+/// HTTP server and serialised by `/api/status`.
+///
+/// Deliberately excludes credentials, filesystem paths, and photo bytes.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
     pub paused: bool,
