@@ -869,11 +869,16 @@ impl PhotoPrismPlugin {
 // ── Conversion: PpPhoto → PhotoMeta ───────────────────────────────────────────
 
 /// Mirror of `pickHash()` in the reference `minimal-photo-app.js`.
+/// Skips files PhotoPrism marks as missing so we don't build thumb URLs that 404.
 fn pick_hash(photo: &PpPhoto) -> Option<String> {
     if !photo.hash.is_empty() {
         return Some(photo.hash.clone());
     }
-    if let Some(f) = photo.files.iter().find(|f| f.primary && !f.hash.is_empty()) {
+    if let Some(f) = photo
+        .files
+        .iter()
+        .find(|f| f.primary && !f.missing && !f.hash.is_empty())
+    {
         return Some(f.hash.clone());
     }
     photo
@@ -891,12 +896,12 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
     let file = p
         .files
         .iter()
-        .find(|f| f.hash == hash && !f.video)
+        .find(|f| f.hash == hash && !f.missing && !f.video)
         .or_else(|| {
             p.files
                 .iter()
-                .find(|f| f.primary && !f.video)
-                .or_else(|| p.files.iter().find(|f| !f.video))
+                .find(|f| f.primary && !f.missing && !f.video)
+                .or_else(|| p.files.iter().find(|f| !f.missing && !f.video))
         });
     let file = file?;
 
@@ -1130,9 +1135,9 @@ impl PhotoPlugin for PhotoPrismPlugin {
             .get("hash")
             .ok_or_else(|| anyhow!("photoprism: meta missing `hash` for '{}'", meta.filename))?;
         // Prefer live session tokens (refreshed via /config and list headers).
-        let (preview_token, download_token) = {
+        let (preview_token, download_token, headers) = {
             let state = self.state.lock().await;
-            if let Some(sess) = state.session.as_ref() {
+            let (preview_token, download_token) = if let Some(sess) = state.session.as_ref() {
                 (sess.preview_token.clone(), sess.download_token.clone())
             } else {
                 (
@@ -1145,7 +1150,13 @@ impl PhotoPlugin for PhotoPrismPlugin {
                         .cloned()
                         .unwrap_or_else(|| "public".into()),
                 )
-            }
+            };
+            let headers = state
+                .session
+                .as_ref()
+                .map(Self::auth_headers)
+                .unwrap_or_default();
+            (preview_token, download_token, headers)
         };
         let preview_token = preview_token.as_str();
         let download_token = download_token.as_str();
@@ -1165,17 +1176,6 @@ impl PhotoPlugin for PhotoPrismPlugin {
         let need_original = self.allow_original()
             && dw.max(dh) > largest_thumb_px
             && meta.width.max(meta.height) > largest_thumb_px;
-
-        // Attach session headers if we have one (some PhotoPrism deployments
-        // require auth even for token-signed URLs).
-        let headers = {
-            let state = self.state.lock().await;
-            state
-                .session
-                .as_ref()
-                .map(Self::auth_headers)
-                .unwrap_or_default()
-        };
 
         // The download token rides in the query string so reqwest encodes it.
         // The preview token is path-embedded; PhotoPrism issues alphanumeric
@@ -1712,7 +1712,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(pick_hash(&p).as_deref(), Some("missinghash"));
+        assert_eq!(pick_hash(&p).as_deref(), Some("goodhash"));
     }
 
     #[test]

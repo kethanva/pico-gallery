@@ -53,6 +53,12 @@ impl QueueLoader {
         self.plugin_exhausted.fill(true);
     }
 
+    /// Recompute per-plugin item counts from an externally-built `queue` (e.g.
+    /// the single-round initial load). A count of zero, or one that isn't an
+    /// exact multiple of `PAGE_SIZE`, means the last page fetched for that
+    /// plugin was short — i.e. the plugin already signalled exhaustion during
+    /// that fetch — so mark it exhausted here too rather than re-discovering
+    /// that with a wasted round-trip the first time navigation nears the end.
     fn sync_counts(&mut self, queue: &[(usize, PhotoMeta)]) {
         self.plugin_offsets.fill(0);
         for (pi, _) in queue {
@@ -61,7 +67,7 @@ impl QueueLoader {
             }
         }
         for (i, off) in self.plugin_offsets.iter().enumerate() {
-            if *off >= MAX_PHOTOS_PER_PLUGIN {
+            if *off >= MAX_PHOTOS_PER_PLUGIN || *off == 0 || *off % PAGE_SIZE != 0 {
                 self.plugin_exhausted[i] = true;
             }
         }
@@ -702,19 +708,17 @@ impl Slideshow {
                     SlideshowCmd::GalleryMoveSelection { dx, dy } => {
                         if in_gallery {
                             if let Some(grid) = gallery.as_mut() {
-                                let mut blocked =
-                                    grid.move_selection(dx, dy, queue.len());
-                                if blocked {
-                                    if self
+                                let blocked = grid.move_selection(dx, dy, queue.len());
+                                if blocked
+                                    && self
                                         .try_extend_queue_force(
                                             &mut queue,
                                             &mut queue_loader,
                                             &remote_status,
                                         )
                                         .await
-                                    {
-                                        blocked = grid.move_selection(dx, dy, queue.len());
-                                    }
+                                {
+                                    let _ = grid.move_selection(dx, dy, queue.len());
                                 }
                                 grid.ensure_selected_visible(
                                     renderer.height(),
@@ -2040,6 +2044,11 @@ fn apply_order(
     }
 }
 
+/// Apply display ordering to a newly appended queue segment only.
+///
+/// Incremental pages are sorted/shuffled within the new tail — not merged back
+/// into the existing queue (a full re-sort on every extension would be costly
+/// on a Pi Zero). `on_this_day_boost` is not re-run for tail segments.
 fn apply_order_tail(
     queue: &mut Vec<(usize, PhotoMeta)>,
     from: usize,
@@ -2201,6 +2210,62 @@ mod tests {
         assert_eq!(next_slide_secs(3), 5);
         assert_eq!(next_slide_secs(60), 3); // wraps
         assert_eq!(next_slide_secs(7), 10); // not a preset → snaps to 10
+    }
+
+    fn meta_for(id: &str) -> PhotoMeta {
+        PhotoMeta {
+            id: id.into(),
+            filename: format!("{id}.jpg"),
+            width: 0,
+            height: 0,
+            taken_at: None,
+            download_url: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn sync_counts_marks_short_page_as_exhausted() {
+        // Plugin 0 returned only 10 items (< PAGE_SIZE) in the single initial
+        // round — it must be treated as exhausted so navigation near the end
+        // doesn't waste a round-trip re-discovering that.
+        let queue: Vec<_> = (0..10).map(|i| (0usize, meta_for(&format!("p{i}")))).collect();
+        let mut loader = QueueLoader::new(1);
+        loader.sync_counts(&queue);
+        assert!(loader.all_exhausted());
+    }
+
+    #[test]
+    fn sync_counts_leaves_full_page_not_exhausted() {
+        // A full PAGE_SIZE page might not be the last one — don't assume
+        // exhaustion just because the count happens to align.
+        let queue: Vec<_> = (0..PAGE_SIZE)
+            .map(|i| (0usize, meta_for(&format!("p{i}"))))
+            .collect();
+        let mut loader = QueueLoader::new(1);
+        loader.sync_counts(&queue);
+        assert!(!loader.all_exhausted());
+    }
+
+    #[test]
+    fn sync_counts_marks_zero_items_as_exhausted() {
+        let mut loader = QueueLoader::new(2);
+        loader.sync_counts(&[]);
+        assert!(loader.all_exhausted());
+    }
+
+    #[test]
+    fn near_end_false_once_all_plugins_exhausted() {
+        let mut loader = QueueLoader::new(1);
+        loader.mark_fully_loaded();
+        assert!(!loader.near_end(0, 5));
+    }
+
+    #[test]
+    fn near_end_true_within_margin_of_queue_end() {
+        let loader = QueueLoader::new(1);
+        assert!(loader.near_end(9, 10));
+        assert!(!loader.near_end(0, 1000));
     }
 
     #[test]
