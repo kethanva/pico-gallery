@@ -123,26 +123,46 @@ const THUMB_SIZES: &[(&str, u32)] = &[
 struct SessionResponse {
     #[serde(default, alias = "id", alias = "session_id")]
     session_id: String,
-    #[serde(default)]
+    #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
-    #[serde(default)]
+    // PhotoPrism serialises these as camelCase (`previewToken` / `downloadToken`);
+    // the snake_case aliases keep older/proxied payloads working too.
+    #[serde(default, rename = "previewToken", alias = "preview_token")]
     preview_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "downloadToken", alias = "download_token")]
     download_token: Option<String>,
     #[serde(default)]
     config: Option<ServerConfig>,
 }
 
+/// The `config` object embedded in a `POST /api/v1/session` response — a subset
+/// of PhotoPrism's `ClientConfig`, which uses camelCase JSON keys.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ServerConfig {
-    #[serde(default)]
+    #[serde(default, alias = "preview_token")]
     preview_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "download_token")]
+    download_token: Option<String>,
+}
+
+/// `GET /api/v1/config` — runtime preview/download tokens (see
+/// `minimal-photo-app.js` `ensureRuntimeConfig()`, which reads `cfg.previewToken`).
+/// PhotoPrism's `ClientConfig` uses camelCase keys, so match that (with a
+/// snake_case alias as a defensive fallback).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigResponse {
+    #[serde(default, alias = "preview_token")]
+    preview_token: Option<String>,
+    #[serde(default, alias = "download_token")]
     download_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PpPhoto {
+    #[serde(default, rename = "Hash")]
+    hash: String,
     #[serde(default, rename = "UID")]
     uid: String,
     #[serde(default, rename = "FileName")]
@@ -199,6 +219,8 @@ struct PpFile {
     height: u32,
     #[serde(default, rename = "Video")]
     video: bool,
+    #[serde(default, rename = "Missing")]
+    missing: bool,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -599,7 +621,10 @@ impl PhotoPrismPlugin {
         if state.session.is_some() {
             return Ok(());
         }
-        state.session = Some(self.login().await?);
+        let mut sess = self.login().await?;
+        // Mirror the reference boot path: session login, then /config for tokens.
+        self.fetch_config(&mut sess).await?;
+        state.session = Some(sess);
         Ok(())
     }
 
@@ -620,9 +645,58 @@ impl PhotoPrismPlugin {
         h
     }
 
+    /// Apply preview/download tokens from response headers (reference:
+    /// `applyPreviewTokenFromResponse()` in minimal-photo-app.js).
+    fn apply_tokens_from_headers(headers: &header::HeaderMap, sess: &mut Session) {
+        if let Some(token) = headers
+            .get("x-preview-token")
+            .and_then(|v| v.to_str().ok())
+            .filter(|t| !t.is_empty())
+        {
+            sess.preview_token = token.to_string();
+        }
+        if let Some(token) = headers
+            .get("x-download-token")
+            .and_then(|v| v.to_str().ok())
+            .filter(|t| !t.is_empty())
+        {
+            sess.download_token = token.to_string();
+        }
+    }
+
+    /// `GET /api/v1/config` — refresh preview/download tokens after login.
+    async fn fetch_config(&self, sess: &mut Session) -> Result<()> {
+        let url = self.api_url("/config")?;
+        let resp = self
+            .client
+            .get(&url)
+            .headers(Self::auth_headers(sess))
+            .send()
+            .await
+            .with_context(|| format!("GET {url} (config)"))?;
+
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(anyhow::Error::new(SessionExpired).context(format!("GET {url} (config)")));
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("GET {url}: HTTP error"))?;
+
+        Self::apply_tokens_from_headers(resp.headers(), sess);
+
+        let cfg: ConfigResponse = resp.json().await.context("parsing /config JSON")?;
+        if let Some(t) = cfg.preview_token.filter(|t| !t.is_empty()) {
+            sess.preview_token = t;
+        }
+        if let Some(t) = cfg.download_token.filter(|t| !t.is_empty()) {
+            sess.download_token = t;
+        }
+        Ok(())
+    }
+
     // ── API: GET /api/v1/photos ────────────────────────────────────────────
 
-    async fn fetch_page(&self, sess: &Session, page: u32) -> Result<Vec<PpPhoto>> {
+    async fn fetch_page(&self, sess: &mut Session, page: u32) -> Result<Vec<PpPhoto>> {
         let url = self.api_url("/photos")?;
         let per_page = self.per_page();
         let offset = page.saturating_mul(per_page);
@@ -636,6 +710,10 @@ impl PhotoPrismPlugin {
         ];
         // Typed filters, each bound to an exact PhotoPrism form field.
         params.extend(self.search_params());
+        // Reference minimal-photo-app always sends quality=0 (no quality floor).
+        if !self.cfg.values.contains_key("quality") {
+            params.push(("quality", "0".into()));
+        }
         // "Memories": today's month + day across all years (server-side filter).
         params.extend(self.memories_params());
         // Free-form Q-language escape hatch, last so it can't be clobbered.
@@ -659,6 +737,8 @@ impl PhotoPrismPlugin {
         let resp = resp
             .error_for_status()
             .with_context(|| format!("GET {url}: HTTP error"))?;
+
+        Self::apply_tokens_from_headers(resp.headers(), sess);
 
         let photos: Vec<PpPhoto> = resp.json().await.context("parsing /photos JSON")?;
         debug!("PhotoPrism: page {page} returned {} photos", photos.len());
@@ -735,22 +815,27 @@ impl PhotoPrismPlugin {
             // Resolve the configured album to its human title once per page —
             // a String clone, so it doesn't borrow `state` across the push below.
             let album_title = self.resolve_album_title(&state.albums);
-            let sess = state.session.as_ref().expect("session set above");
-
             let page = state.next_page;
-            let photos = match self.fetch_page(sess, page).await {
-                Ok(p) => p,
-                Err(e) if e.root_cause().is::<SessionExpired>() => {
-                    reauth_attempts += 1;
-                    if reauth_attempts > 3 {
-                        return Err(anyhow!("photoprism: repeated 401 after {reauth_attempts} re-auth attempts — check credentials"));
+            // `fetch_page` may refresh preview/download tokens on the session.
+            let photos = {
+                let sess = state.session.as_mut().expect("session set above");
+                match self.fetch_page(sess, page).await {
+                    Ok(p) => p,
+                    Err(e) if e.root_cause().is::<SessionExpired>() => {
+                        reauth_attempts += 1;
+                        if reauth_attempts > 3 {
+                            return Err(anyhow!("photoprism: repeated 401 after {reauth_attempts} re-auth attempts — check credentials"));
+                        }
+                        warn!(
+                            "PhotoPrism: re-authenticating after 401 (attempt {reauth_attempts})"
+                        );
+                        state.session = None;
+                        continue;
                     }
-                    warn!("PhotoPrism: re-authenticating after 401 (attempt {reauth_attempts})");
-                    state.session = None;
-                    continue;
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             };
+            let sess = state.session.as_ref().expect("session set above");
 
             let returned = photos.len() as u32;
             for p in photos {
@@ -770,20 +855,37 @@ impl PhotoPrismPlugin {
 
 // ── Conversion: PpPhoto → PhotoMeta ───────────────────────────────────────────
 
+/// Mirror of `pickHash()` in the reference `minimal-photo-app.js`.
+fn pick_hash(photo: &PpPhoto) -> Option<String> {
+    if !photo.hash.is_empty() {
+        return Some(photo.hash.clone());
+    }
+    if let Some(f) = photo.files.iter().find(|f| f.primary && !f.hash.is_empty()) {
+        return Some(f.hash.clone());
+    }
+    photo
+        .files
+        .iter()
+        .find(|f| !f.missing && !f.hash.is_empty())
+        .map(|f| f.hash.clone())
+}
+
 fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Option<PhotoMeta> {
-    // Photos only — pick the primary still, falling back to the first non-video
-    // file. Video items (no still file) are skipped entirely: this is a photo
-    // frame and a Pi Zero can't decode video. Live Photos keep their JPEG
-    // primary, so they still show as stills.
+    let hash = pick_hash(&p)?;
+
+    // Photos only — skip when the resolved hash belongs to a video file.
+    // Live Photos keep their JPEG primary, so they still show as stills.
     let file = p
         .files
         .iter()
-        .find(|f| f.primary && !f.video)
-        .or_else(|| p.files.iter().find(|f| !f.video))?;
-
-    if file.hash.is_empty() {
-        return None;
-    }
+        .find(|f| f.hash == hash && !f.video)
+        .or_else(|| {
+            p.files
+                .iter()
+                .find(|f| f.primary && !f.video)
+                .or_else(|| p.files.iter().find(|f| !f.video))
+        });
+    let file = file?;
 
     let filename = if !p.file_name.is_empty() {
         p.file_name
@@ -806,7 +908,7 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
         .and_then(parse_pp_date);
 
     let mut extra: HashMap<String, String> = HashMap::new();
-    extra.insert("hash".into(), file.hash.clone());
+    extra.insert("hash".into(), hash.clone());
     extra.insert("uid".into(), p.uid.clone());
     extra.insert("preview_token".into(), sess.preview_token.clone());
     extra.insert("download_token".into(), sess.download_token.clone());
@@ -842,7 +944,7 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
         id: if !p.uid.is_empty() {
             p.uid
         } else {
-            file.hash.clone()
+            hash.clone()
         },
         filename,
         width,
@@ -991,16 +1093,26 @@ impl PhotoPlugin for PhotoPrismPlugin {
             .extra
             .get("hash")
             .ok_or_else(|| anyhow!("photoprism: meta missing `hash` for '{}'", meta.filename))?;
-        let preview_token = meta
-            .extra
-            .get("preview_token")
-            .map(String::as_str)
-            .unwrap_or("public");
-        let download_token = meta
-            .extra
-            .get("download_token")
-            .map(String::as_str)
-            .unwrap_or("public");
+        // Prefer live session tokens (refreshed via /config and list headers).
+        let (preview_token, download_token) = {
+            let state = self.state.lock().await;
+            if let Some(sess) = state.session.as_ref() {
+                (sess.preview_token.clone(), sess.download_token.clone())
+            } else {
+                (
+                    meta.extra
+                        .get("preview_token")
+                        .cloned()
+                        .unwrap_or_else(|| "public".into()),
+                    meta.extra
+                        .get("download_token")
+                        .cloned()
+                        .unwrap_or_else(|| "public".into()),
+                )
+            }
+        };
+        let preview_token = preview_token.as_str();
+        let download_token = download_token.as_str();
 
         let cap = self.max_thumb_cap();
         let size = pick_thumb_size(dw, dh, cap);
@@ -1224,6 +1336,7 @@ mod tests {
     #[test]
     fn photo_to_meta_picks_primary_file() {
         let p = PpPhoto {
+            hash: String::new(),
             uid: "uid42".into(),
             file_name: "2024/01/IMG_42.jpg".into(),
             name: "IMG_42".into(),
@@ -1245,6 +1358,7 @@ mod tests {
                     width: 1920,
                     height: 1080,
                     video: true,
+                    missing: false,
                 },
                 PpFile {
                     hash: "primaryhash".into(),
@@ -1252,6 +1366,7 @@ mod tests {
                     width: 4000,
                     height: 3000,
                     video: false,
+                    missing: false,
                 },
             ],
         };
@@ -1271,6 +1386,7 @@ mod tests {
     #[test]
     fn photo_to_meta_skips_video_only() {
         let p = PpPhoto {
+            hash: String::new(),
             uid: "u".into(),
             file_name: "v.mp4".into(),
             name: "".into(),
@@ -1291,6 +1407,7 @@ mod tests {
                 width: 0,
                 height: 0,
                 video: true,
+                missing: false,
             }],
         };
         // Video-only photos are always skipped — this is a photo frame.
@@ -1493,6 +1610,76 @@ mod tests {
     }
 
     #[test]
+    fn pick_hash_prefers_photo_level_hash() {
+        let p = PpPhoto {
+            hash: "photohash".into(),
+            uid: String::new(),
+            file_name: String::new(),
+            name: String::new(),
+            original_name: String::new(),
+            title: String::new(),
+            place_city: String::new(),
+            place_state: String::new(),
+            place_country: String::new(),
+            width: 0,
+            height: 0,
+            taken_at: None,
+            taken_at_local: None,
+            media_type: String::new(),
+            favorite: false,
+            files: vec![PpFile {
+                hash: "filehash".into(),
+                primary: true,
+                width: 0,
+                height: 0,
+                video: false,
+                missing: false,
+            }],
+        };
+        assert_eq!(pick_hash(&p).as_deref(), Some("photohash"));
+    }
+
+    #[test]
+    fn pick_hash_skips_missing_files() {
+        let p = PpPhoto {
+            hash: String::new(),
+            uid: String::new(),
+            file_name: String::new(),
+            name: String::new(),
+            original_name: String::new(),
+            title: String::new(),
+            place_city: String::new(),
+            place_state: String::new(),
+            place_country: String::new(),
+            width: 0,
+            height: 0,
+            taken_at: None,
+            taken_at_local: None,
+            media_type: String::new(),
+            favorite: false,
+            files: vec![
+                PpFile {
+                    hash: "missinghash".into(),
+                    primary: true,
+                    width: 0,
+                    height: 0,
+                    video: false,
+                    missing: true,
+                },
+                PpFile {
+                    hash: "goodhash".into(),
+                    primary: false,
+                    width: 0,
+                    height: 0,
+                    video: false,
+                    missing: false,
+                },
+            ],
+        };
+        assert_eq!(pick_hash(&p).as_deref(), Some("missinghash"));
+    }
+
+    #[test]
     fn format_location_composes_city_country() {
         assert_eq!(
             format_location("Paris", "", "France").as_deref(),
@@ -1516,5 +1703,41 @@ mod tests {
             format_location("Tokyo", "Unknown", "Unknown").as_deref(),
             Some("Tokyo")
         );
+    }
+
+    #[test]
+    fn session_response_parses_camelcase_tokens() {
+        // Shape a real PhotoPrism `POST /api/v1/session` returns: session id in
+        // `id`, tokens in camelCase inside the embedded `config` object.
+        let json = r#"{
+            "id": "sess-abc123",
+            "config": {
+                "previewToken": "pv-live-tok",
+                "downloadToken": "dl-live-tok"
+            }
+        }"#;
+        let parsed: SessionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.session_id, "sess-abc123");
+        let cfg = parsed.config.expect("config object present");
+        assert_eq!(cfg.preview_token.as_deref(), Some("pv-live-tok"));
+        assert_eq!(cfg.download_token.as_deref(), Some("dl-live-tok"));
+    }
+
+    #[test]
+    fn config_response_parses_camelcase_tokens() {
+        // `GET /api/v1/config` (ClientConfig) uses camelCase keys.
+        let json = r#"{ "previewToken": "pv-tok", "downloadToken": "dl-tok" }"#;
+        let parsed: ConfigResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.preview_token.as_deref(), Some("pv-tok"));
+        assert_eq!(parsed.download_token.as_deref(), Some("dl-tok"));
+    }
+
+    #[test]
+    fn config_response_accepts_snakecase_alias() {
+        // Defensive: a proxy or older build emitting snake_case still parses.
+        let json = r#"{ "preview_token": "pv", "download_token": "dl" }"#;
+        let parsed: ConfigResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.preview_token.as_deref(), Some("pv"));
+        assert_eq!(parsed.download_token.as_deref(), Some("dl"));
     }
 }

@@ -18,11 +18,45 @@ warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 die()     { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 
+# ── CLI flags ─────────────────────────────────────────────────────────────────
+ASSUME_YES=0
+USER_FLAG=""
+PURGE=0
+
+print_usage() {
+  cat <<'USAGE'
+PicoGallery uninstaller
+
+Usage: sudo ./uninstall.sh [options]
+
+Options:
+  --user <name>   uninstall for this user (default: the sudo user).
+  --purge         also remove the photo directory and cache without prompting.
+  -y, --yes       non-interactive; assume yes to every prompt.
+  -h, --help      show this help and exit.
+
+Env: PICOGALLERY_AUTO_UNINSTALL=1 is equivalent to -y (photos kept unless --purge).
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user)     USER_FLAG="${2:-}"; shift 2 ;;
+    --user=*)   USER_FLAG="${1#*=}"; shift ;;
+    --purge)    PURGE=1; shift ;;
+    -y|--yes)   ASSUME_YES=1; shift ;;
+    -h|--help)  print_usage; exit 0 ;;
+    *) die "Unknown option: $1  (run with --help)" ;;
+  esac
+done
+
+[[ "${PICOGALLERY_AUTO_UNINSTALL:-0}" == "1" ]] && ASSUME_YES=1
+
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 
 [[ "$(uname -s)" == "Linux" ]] || die "This script only supports Linux (Raspberry Pi OS)."
 
-TARGET_USER="${SUDO_USER:-$(whoami)}"
+TARGET_USER="${USER_FLAG:-${SUDO_USER:-$(whoami)}}"
 
 echo -e "${BOLD}"
 echo "  ╔═══════════════════════════════════════════╗"
@@ -30,7 +64,7 @@ echo "  ║  PicoGallery — Raspberry Pi Uninstaller   ║"
 echo "  ╚═══════════════════════════════════════════╝"
 echo -e "${RESET}"
 
-if [[ "${PICOGALLERY_AUTO_UNINSTALL:-0}" != "1" ]]; then
+if [[ "$ASSUME_YES" != "1" ]]; then
     read -p "This will remove PicoGallery, its configuration, and (optionally) sample photos. Are you sure? (y/N) " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -84,19 +118,32 @@ else
     info "Configuration directory not found, skipping."
 fi
 
+# On-disk image cache is always regenerable — remove it unconditionally.
+CACHE_DIR="/home/${TARGET_USER}/.cache/picogallery"
+if [[ -d "$CACHE_DIR" ]]; then
+    sudo rm -rf "$CACHE_DIR"
+    info "Removed cache directory: $CACHE_DIR"
+else
+    info "Cache directory not found, skipping."
+fi
+
 PHOTO_DIR="/home/${TARGET_USER}/Pictures/PicoGallery"
 if [[ -d "$PHOTO_DIR" ]]; then
-    if [[ "${PICOGALLERY_AUTO_UNINSTALL:-0}" == "1" ]]; then
-        info "Auto-uninstall flag set, keeping photo directory just in case: $PHOTO_DIR"
+    REMOVE_PHOTOS=0
+    if [[ "$PURGE" == "1" ]]; then
+        REMOVE_PHOTOS=1
+    elif [[ "$ASSUME_YES" == "1" ]]; then
+        info "Non-interactive — keeping photo directory (use --purge to remove): $PHOTO_DIR"
     else
         read -p "Do you want to remove the photo directory ($PHOTO_DIR) and all its contents? (y/N) " -n 1 -r
         echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            sudo rm -rf "$PHOTO_DIR"
-            info "Removed photo directory: $PHOTO_DIR"
-        else
-            info "Kept photo directory: $PHOTO_DIR"
-        fi
+        [[ $REPLY =~ ^[Yy]$ ]] && REMOVE_PHOTOS=1
+    fi
+    if [[ "$REMOVE_PHOTOS" == "1" ]]; then
+        sudo rm -rf "$PHOTO_DIR"
+        info "Removed photo directory: $PHOTO_DIR"
+    else
+        info "Kept photo directory: $PHOTO_DIR"
     fi
 else
     info "Photo directory not found, skipping."

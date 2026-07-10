@@ -41,6 +41,82 @@ warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 die()     { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
 section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 
+# ── CLI flags ─────────────────────────────────────────────────────────────────
+# The PICOGALLERY_* env vars (see header) still work; these flags override them
+# and add one-shot PhotoPrism provisioning, so a single command installs and
+# points the frame at a server:
+#
+#   sudo ./install.sh --mode all -y \
+#     --photoprism-url http://192.168.68.71:2342 \
+#     --photoprism-user admin --photoprism-pass 'secret'
+#
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+MODE_FLAG=""            # download | build | all
+ASSUME_YES=0
+USER_FLAG=""
+PP_URL=""
+PP_USER=""
+PP_PASS=""
+PP_APP_PASS=""
+
+print_usage() {
+  cat <<'USAGE'
+PicoGallery installer
+
+Usage: sudo ./install.sh [options]
+
+Options:
+  --mode <download|build|all>    download = prebuilt release (default);
+                                 build/all = compile from source (all = every plugin).
+  --user <name>                  install for this user (default: the sudo user).
+  --photoprism-url <url>         provision the PhotoPrism plugin against this server
+                                 (implies a source build so the plugin is compiled in).
+  --photoprism-user <name>       PhotoPrism username (default: admin).
+  --photoprism-pass <pass>       PhotoPrism password.
+  --photoprism-app-password <p>  PhotoPrism app password (alternative to --photoprism-pass).
+  -y, --yes                      non-interactive; assume yes.
+  -h, --help                     show this help and exit.
+
+Env vars (PICOGALLERY_VERSION / _BUILD / _FEATURES / _PROFILE / _RESET_CONFIG)
+still apply; explicit flags win.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)                       MODE_FLAG="${2:-}"; shift 2 ;;
+    --mode=*)                     MODE_FLAG="${1#*=}"; shift ;;
+    --user)                       USER_FLAG="${2:-}"; shift 2 ;;
+    --user=*)                     USER_FLAG="${1#*=}"; shift ;;
+    --photoprism-url)             PP_URL="${2:-}"; shift 2 ;;
+    --photoprism-url=*)           PP_URL="${1#*=}"; shift ;;
+    --photoprism-user)            PP_USER="${2:-}"; shift 2 ;;
+    --photoprism-user=*)          PP_USER="${1#*=}"; shift ;;
+    --photoprism-pass)            PP_PASS="${2:-}"; shift 2 ;;
+    --photoprism-pass=*)          PP_PASS="${1#*=}"; shift ;;
+    --photoprism-app-password)    PP_APP_PASS="${2:-}"; shift 2 ;;
+    --photoprism-app-password=*)  PP_APP_PASS="${1#*=}"; shift ;;
+    -y|--yes)                     ASSUME_YES=1; shift ;;
+    -h|--help)                    print_usage; exit 0 ;;
+    *) die "Unknown option: $1  (run with --help)" ;;
+  esac
+done
+
+# Normalise --mode. `all` also flips the feature set to every plugin.
+MODE_ALL=0
+case "$MODE_FLAG" in
+  ""|download)  : ;;                              # keep default (download)
+  all)          MODE_ALL=1; INSTALL_MODE="build" ;;
+  build)        INSTALL_MODE="build" ;;
+  *) die "Invalid --mode '$MODE_FLAG'  (want: download | build | all)" ;;
+esac
+
+# PhotoPrism provisioning needs the plugin compiled in — force a source build.
+if [[ -n "$PP_URL" ]]; then
+  INSTALL_MODE="build"
+fi
+
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 
 [[ "$(uname -s)" == "Linux" ]] || die "This installer only supports Linux (Raspberry Pi OS)."
@@ -164,11 +240,10 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
   fi
 fi
 
-# ── Build from source (Disabled per request) ──────────────────────────────────
-# To re-enable, revert the changes that commented out this section.
+# ── Build from source ──────────────────────────────────────────────────────────
+# Enabled via  --mode build|all,  --photoprism-url …,  or  PICOGALLERY_BUILD=1.
 if [[ "${INSTALL_MODE:-}" == "build" ]]; then
-  section "Building from source (DISABLED)"
-  die "Source builds are disabled in this version of the installer. Please use a Release."
+  section "Building from source"
 
   # ── Choose build profile ──
   # release-fast: ~3-4x faster compile, binary ~30% larger (used on Pi Zero/low-RAM).
@@ -183,10 +258,19 @@ if [[ "${INSTALL_MODE:-}" == "build" ]]; then
   fi
 
   # ── Choose feature set ──
-  # Only the 'directory' plugin is enabled by default — it's what 95% of users
-  # actually use, and dropping the other plugins roughly halves compile time.
-  # Override with PICOGALLERY_FEATURES to re-enable google-photos / local.
-  FEATURES="${PICOGALLERY_FEATURES:-plugin-directory}"
+  # Only the 'directory' plugin builds by default — it's what most users use and
+  # dropping the rest roughly halves compile time. `--mode all` compiles every
+  # plugin; `--photoprism-url` pulls in the photoprism plugin. PICOGALLERY_FEATURES
+  # overrides all of this.
+  if [[ -n "${PICOGALLERY_FEATURES:-}" ]]; then
+    FEATURES="$PICOGALLERY_FEATURES"
+  elif [[ "$MODE_ALL" == "1" ]]; then
+    FEATURES="plugin-directory,plugin-local,plugin-google-photos,plugin-webdav,plugin-photoprism,plugin-usb"
+  elif [[ -n "$PP_URL" ]]; then
+    FEATURES="plugin-directory,plugin-photoprism"
+  else
+    FEATURES="plugin-directory"
+  fi
 
   # ── Pick job count based on RAM ──
   # Each rustc job needs ~400-600 MB. Empirical safe rule: 1 job per ~500 MB RAM.
@@ -247,10 +331,18 @@ if [[ "${INSTALL_MODE:-}" == "build" ]]; then
   fi
   info "Rust $(rustc --version)"
 
-  # ── Clone source (shallow) ──
-  SRC_DIR="${TMPDIR}/picogallery-src"
-  info "Cloning repository (shallow, single-branch)..."
-  git clone --depth 1 --single-branch "${REPO_URL}.git" "$SRC_DIR"
+  # ── Source tree ──
+  # Prefer the checkout this script lives in, so a locally checked-out branch (or
+  # fix) is exactly what gets built. Fall back to a shallow clone when run
+  # standalone (e.g. curl | bash).
+  if [[ -f "$SCRIPT_DIR/Cargo.toml" ]]; then
+    SRC_DIR="$SCRIPT_DIR"
+    info "Building from local checkout: $SRC_DIR"
+  else
+    SRC_DIR="${TMPDIR}/picogallery-src"
+    info "Cloning repository (shallow, single-branch)..."
+    git clone --depth 1 --single-branch "${REPO_URL}.git" "$SRC_DIR"
+  fi
 
   # ── Build ──
   cd "$SRC_DIR"
@@ -327,7 +419,12 @@ info "Binary size: $(du -h /usr/local/bin/picogallery | cut -f1)"
 
 section "Configuring user groups"
 
-TARGET_USER="${SUDO_USER:-$(whoami)}"
+TARGET_USER="${USER_FLAG:-${SUDO_USER:-$(whoami)}}"
+if ! id "$TARGET_USER" &>/dev/null; then
+  die "Target user '$TARGET_USER' does not exist. Create it first, or pass --user <name>."
+fi
+[[ -d "/home/${TARGET_USER}" ]] || die "Home directory /home/${TARGET_USER} not found for user '$TARGET_USER'."
+info "Installing for user: $TARGET_USER"
 for group in video render input; do
   if getent group "$group" &>/dev/null; then
     sudo usermod -aG "$group" "$TARGET_USER"
@@ -358,7 +455,7 @@ if [[ -z "$(ls -A "$PHOTO_DIR" 2>/dev/null)" ]]; then
   PHOTO_DIR_IS_EMPTY=1
 fi
 
-if [[ "$PHOTO_DIR_IS_EMPTY" == "1" ]]; then
+if [[ "$PHOTO_DIR_IS_EMPTY" == "1" && -z "$PP_URL" ]]; then
   SAMPLE_SRC=""
   if [[ -d "${EXTRACT_DIR}/sample_photos" ]] && \
      ls -A "${EXTRACT_DIR}/sample_photos" &>/dev/null; then
@@ -392,6 +489,8 @@ if [[ "$PHOTO_DIR_IS_EMPTY" == "1" ]]; then
   sudo chown -R "$TARGET_USER:$TARGET_USER" "$PHOTO_DIR"
   PHOTO_COUNT=$(find "$PHOTO_DIR" -maxdepth 2 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' \) 2>/dev/null | wc -l | tr -d ' ')
   info "Photo directory ready: $PHOTO_DIR (${PHOTO_COUNT} photos)"
+elif [[ -n "$PP_URL" ]]; then
+  info "PhotoPrism mode — photos stream from the server; skipping local samples."
 else
   info "Photo directory already has content — leaving it alone."
 fi
@@ -406,8 +505,24 @@ sudo -u "$TARGET_USER" mkdir -p "$CONFIG_DIR"
 
 # Build a known-good config that matches the binary's compiled features.
 # Double-quoted heredoc, so ${PHOTO_DIR} IS expanded — don't change to 'CONFIG_EOF'.
+# Escape a value for a double-quoted TOML string (backslash then quote).
+toml_escape() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '%s' "$v"
+}
+
 WRITE_CONFIG=0
-if [[ ! -f "$CONFIG_FILE" ]]; then
+if [[ -n "$PP_URL" ]]; then
+  # PhotoPrism provisioning always (re)writes a config for the given server, so
+  # a re-run picks up changed credentials. Back up any existing file first.
+  WRITE_CONFIG=1
+  if [[ -f "$CONFIG_FILE" ]]; then
+    sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
+    info "Backed up existing config before writing PhotoPrism settings."
+  fi
+elif [[ ! -f "$CONFIG_FILE" ]]; then
   WRITE_CONFIG=1
   info "No existing config — writing a default."
 elif [[ "${PICOGALLERY_RESET_CONFIG:-0}" == "1" ]]; then
@@ -424,7 +539,60 @@ else
   info "Config already exists at $CONFIG_FILE — keeping it."
 fi
 
-if [[ "$WRITE_CONFIG" == "1" ]]; then
+if [[ "$WRITE_CONFIG" == "1" && -n "$PP_URL" ]]; then
+  # ── PhotoPrism-backed config ──
+  PP_USER_EFF="${PP_USER:-admin}"
+  PP_URL_ESC="$(toml_escape "$PP_URL")"
+  PP_USER_ESC="$(toml_escape "$PP_USER_EFF")"
+  # App password wins when supplied; otherwise username + password.
+  if [[ -n "$PP_APP_PASS" ]]; then
+    PP_AUTH_LINES=$(printf 'username     = "%s"\napp_password = "%s"' \
+      "$PP_USER_ESC" "$(toml_escape "$PP_APP_PASS")")
+  else
+    PP_AUTH_LINES=$(printf 'username = "%s"\npassword = "%s"' \
+      "$PP_USER_ESC" "$(toml_escape "$PP_PASS")")
+  fi
+
+  sudo -u "$TARGET_USER" tee "$CONFIG_FILE" > /dev/null <<CONFIG_EOF
+# PicoGallery configuration — auto-generated by install.sh (PhotoPrism mode)
+# Docs: https://github.com/kethanva/pico-gallery
+# Re-provision with:  ./install.sh --photoprism-url … --photoprism-user … --photoprism-pass …
+
+[display]
+slide_duration_secs = 10
+transition          = "fade"
+transition_ms       = 800
+fill_screen         = false
+fps                 = 15
+
+[cache]
+max_mb         = 256
+prefetch_count = 3
+
+# ── PhotoPrism plugin: streams photos on demand from a PhotoPrism server ──────
+[[plugins]]
+name     = "photoprism"
+enabled  = true
+url      = "${PP_URL_ESC}"
+${PP_AUTH_LINES}
+# order    = "newest"     # newest | oldest | added | name | random | similar
+# per_page = 100
+# max_thumb = "fit_1920"  # cap thumbnail size to save Pi-Zero RAM
+# skip_tls_verify = false # true for self-signed LAN certificates
+
+# ── Local directory: disabled while PhotoPrism is the source ──────────────────
+[[plugins]]
+name      = "directory"
+enabled   = false
+path      = "${PHOTO_DIR}"
+order     = "shuffle"
+recursive = true
+CONFIG_EOF
+  sudo chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE"
+  sudo chmod 600 "$CONFIG_FILE"   # holds a password — keep it private
+  info "Wrote $CONFIG_FILE with PhotoPrism plugin enabled → $PP_URL"
+
+elif [[ "$WRITE_CONFIG" == "1" ]]; then
   sudo -u "$TARGET_USER" tee "$CONFIG_FILE" > /dev/null <<CONFIG_EOF
 # PicoGallery configuration — auto-generated by install.sh
 # Docs: https://github.com/kethanva/pico-gallery
@@ -599,6 +767,9 @@ echo "  Mode    : ${INSTALL_MODE}"
 echo "  Binary  : /usr/local/bin/picogallery"
 echo "  Config  : ${CONFIG_DIR}/config.toml"
 echo "  Service : picogallery.service"
+if [[ -n "$PP_URL" ]]; then
+echo "  Source  : PhotoPrism @ ${PP_URL} (user: ${PP_USER:-admin})"
+fi
 echo ""
 echo "  Next steps:"
 echo ""
