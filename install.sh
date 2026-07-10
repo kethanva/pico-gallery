@@ -213,8 +213,12 @@ fi
 if [[ "$INSTALL_MODE" == "download" ]]; then
   section "Downloading PicoGallery ${VERSION}"
 
-  TARBALL="picogallery-${VERSION}-linux-${ARTIFACT_ARCH}.tar.gz"
-  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
+  # GitHub release tags keep a leading "v" (v0.1.3-kva.7) but CI artifact
+  # names drop it (picogallery-0.1.3-kva.7-linux-aarch64.tar.gz).
+  RELEASE_TAG="$VERSION"
+  ARTIFACT_VERSION="${VERSION#v}"
+  TARBALL="picogallery-${ARTIFACT_VERSION}-linux-${ARTIFACT_ARCH}.tar.gz"
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${TARBALL}"
   SHA_URL="${DOWNLOAD_URL}.sha256"
 
   info "URL: $DOWNLOAD_URL"
