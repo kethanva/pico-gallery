@@ -136,9 +136,11 @@ fn parse_login_response(
     body: &serde_json::Value,
     header_sid: Option<String>,
 ) -> Result<Session> {
-    let sid = json_str(body, &["session_id", "id"])
+    // PhotoPrism returns the session token as `id` (+ X-Session-ID header).
+    // Prefer those over a secondary `session_id` field some builds also emit.
+    let sid = header_sid
+        .or_else(|| json_str(body, &["id", "session_id"]))
         .or_else(|| json_str(body, &["accessToken", "access_token"]))
-        .or(header_sid)
         .ok_or_else(|| anyhow!("photoprism: session response missing session id"))?;
 
     let config = body.get("config");
@@ -630,8 +632,10 @@ impl PhotoPrismPlugin {
             return Ok(());
         }
         let mut sess = self.login().await?;
-        // Mirror the reference boot path: session login, then /config for tokens.
-        self.fetch_config(&mut sess).await?;
+        // Best-effort token refresh; /config is public on some installs.
+        if let Err(e) = self.fetch_config(&mut sess).await {
+            warn!("PhotoPrism: /config token refresh failed (non-fatal): {e:#}");
+        }
         state.session = Some(sess);
         Ok(())
     }
@@ -645,9 +649,7 @@ impl PhotoPrismPlugin {
     fn session_headers(sid: &str) -> header::HeaderMap {
         let mut h = header::HeaderMap::new();
         if let Ok(v) = header::HeaderValue::from_str(sid) {
-            h.insert("X-Session-ID", v.clone());
-            // Older PhotoPrism builds expect X-Auth-Token; newer ones accept
-            // either. Sending both is harmless.
+            // Reference proxy + PhotoPrism docs: X-Auth-Token is the session token.
             h.insert("X-Auth-Token", v);
         }
         h
@@ -739,8 +741,11 @@ impl PhotoPrismPlugin {
             .with_context(|| format!("GET {url} (photos page={page})"))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            return Err(anyhow::Error::new(SessionExpired)
-                .context(format!("GET {url} (photos page={page})")));
+            let hint = resp.text().await.unwrap_or_default();
+            let hint = hint.chars().take(200).collect::<String>();
+            return Err(anyhow::Error::new(SessionExpired).context(format!(
+                "GET {url} (photos page={page}) HTTP 401: {hint}"
+            )));
         }
         let resp = resp
             .error_for_status()
@@ -1725,7 +1730,18 @@ mod tests {
         }"#;
         let body: serde_json::Value = serde_json::from_str(json).unwrap();
         let sess = parse_login_response(&body, None).unwrap();
-        assert_eq!(sess.session_id, "from-sid");
+        assert_eq!(sess.session_id, "from-id");
+
+        let body2: serde_json::Value = serde_json::from_str(
+            r#"{"id":"good-id","session_id":"bad-sid"}"#,
+        )
+        .unwrap();
+        let sess2 = parse_login_response(&body2, None).unwrap();
+        assert_eq!(sess2.session_id, "good-id");
+
+        let body3: serde_json::Value = serde_json::from_str(r#"{"id":"hdr-id"}"#).unwrap();
+        let sess3 = parse_login_response(&body3, Some("header-id".into())).unwrap();
+        assert_eq!(sess3.session_id, "header-id");
         assert_eq!(sess.preview_token, "pv-live-tok");
         assert_eq!(sess.download_token, "dl-live-tok");
     }
