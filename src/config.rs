@@ -157,6 +157,12 @@ pub struct DisplayConfig {
     /// Reduces blue/green channels to cut harsh cold light.
     #[serde(default = "default_night_warmth")]
     pub night_warmth: u8,
+
+    /// Start in a browsable thumbnail grid (PhotoPrism kiosk style). Click a
+    /// photo for fullscreen; Escape or the close control returns to the grid.
+    /// Defaults to true so Escape/× return to the gallery instead of quitting.
+    #[serde(default = "default_true")]
+    pub gallery_mode: bool,
 }
 
 impl Default for DisplayConfig {
@@ -183,6 +189,7 @@ impl Default for DisplayConfig {
             night_end: None,
             night_dim_percent: default_night_dim(),
             night_warmth: default_night_warmth(),
+            gallery_mode: true,
         }
     }
 }

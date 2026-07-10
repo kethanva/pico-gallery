@@ -5,7 +5,7 @@
 /// Zero I/O.  All plugin calls are async and non-blocking.
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::cache::ImageCache;
 use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
+use crate::gallery::GalleryGrid;
 use crate::menu::{EditField, Menu, MenuAction};
 use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
 use crate::remote::SharedStatus;
@@ -251,11 +252,21 @@ impl Slideshow {
         let mut menu = Menu::default();
         let mut menu_dirty = false;
 
+        let gallery_mode = self.config.display.gallery_mode;
+        let mut in_gallery = gallery_mode;
+        let mut gallery = gallery_mode.then(|| GalleryGrid::new(renderer.width()));
+        let mut gallery_thumb_cursor = 0usize;
+        // Repaint the grid only when something changed (scroll, a thumb loaded,
+        // or we just (re)entered it) so an idle grid costs no steady CPU/GPU.
+        let mut gallery_dirty = true;
+
         // Pre-warm the prefetch ring (fetch + decode the first N photos).
         let mut cursor = 0usize;
-        for _ in 0..prefetch_n {
-            self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
-                .await;
+        if !in_gallery {
+            for _ in 0..prefetch_n {
+                self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
+                    .await;
+            }
         }
 
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
@@ -283,8 +294,12 @@ impl Slideshow {
             // both sources flow through the same match below. poll_events
             // interprets input differently while the menu is open, so it gets
             // the current menu state.
-            let mut cmds: Vec<SlideshowCmd> =
-                renderer.poll_events(menu.open, menu.editing.is_some());
+            let mut cmds: Vec<SlideshowCmd> = renderer.poll_events(
+                menu.open,
+                menu.editing.is_some(),
+                gallery_mode,
+                in_gallery,
+            );
             if let Some(rx) = remote_rx.as_mut() {
                 while let Ok(cmd) = rx.try_recv() {
                     cmds.push(cmd);
@@ -313,6 +328,8 @@ impl Slideshow {
             // a 30 ms tick, and this keeps the borrow-heavy action handling out
             // of the per-command match.
             let mut pending_activate = false;
+            // Deferred so we can await the selected-photo fetch outside the match.
+            let mut pending_open: Option<usize> = None;
 
             for cmd in cmds {
                 match cmd {
@@ -329,8 +346,11 @@ impl Slideshow {
                     SlideshowCmd::CloseMenu => {
                         if menu.open {
                             menu.open = false;
-                            // Repaint the photo underneath so the menu vanishes.
-                            if let Some(img) = &current_rgba {
+                            if in_gallery {
+                                // Grid repaints on the next tick to cover the menu.
+                                gallery_dirty = true;
+                            } else if let Some(img) = &current_rgba {
+                                // Repaint the photo underneath so the menu vanishes.
                                 let _ = renderer.show_cut(img);
                             }
                             if !paused {
@@ -393,7 +413,9 @@ impl Slideshow {
                                 // Click outside the panel dismisses the menu.
                                 None => {
                                     menu.open = false;
-                                    if let Some(img) = &current_rgba {
+                                    if in_gallery {
+                                        gallery_dirty = true;
+                                    } else if let Some(img) = &current_rgba {
                                         let _ = renderer.show_cut(img);
                                     }
                                     if !paused {
@@ -411,7 +433,7 @@ impl Slideshow {
                     // Normal slideshow commands are ignored while the menu is
                     // up (the photo behind it isn't advancing anyway).
                     SlideshowCmd::TogglePause => {
-                        if !menu.open {
+                        if !menu.open && !in_gallery {
                             paused = !paused;
                             info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                             last_advance = Instant::now();
@@ -421,14 +443,14 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::Next => {
-                        if !menu.open {
+                        if !menu.open && !in_gallery {
                             last_advance = Instant::now()
                                 .checked_sub(slide_dur)
                                 .unwrap_or_else(Instant::now); // force advance
                         }
                     }
                     SlideshowCmd::Prev => {
-                        if !menu.open {
+                        if !menu.open && !in_gallery {
                             current_queue_idx = if current_queue_idx == 0 {
                                 queue.len().saturating_sub(1)
                             } else {
@@ -442,7 +464,7 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::ToggleFavorite => {
-                        if !menu.open {
+                        if !menu.open && !in_gallery {
                             self.toggle_favorite(&mut current_meta, &remote_status)
                                 .await;
                         }
@@ -478,6 +500,99 @@ impl Slideshow {
                             menu.buffer.clear();
                             menu_dirty = true;
                         }
+                    }
+                    SlideshowCmd::BackToGallery => {
+                        if gallery_mode && !in_gallery {
+                            in_gallery = true;
+                            paused = false;
+                            prefetched.clear();
+                            current_rgba = None;
+                            current_meta = None;
+                            gallery_thumb_cursor = 0;
+                            gallery_dirty = true;
+                            info!("Returned to gallery grid.");
+                        }
+                    }
+                    SlideshowCmd::OpenSlideshow(idx) => {
+                        if gallery_mode && idx < queue.len() {
+                            pending_open = Some(idx);
+                        }
+                    }
+                    SlideshowCmd::GalleryClick { x, y } => {
+                        if gallery_mode && in_gallery {
+                            if let Some(grid) = gallery.as_ref() {
+                                if let Some(idx) = grid.index_at(x, y, queue.len()) {
+                                    pending_open = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                    SlideshowCmd::GalleryScroll(delta) => {
+                        if in_gallery {
+                            if let Some(grid) = gallery.as_mut() {
+                                let before = grid.scroll_y;
+                                grid.scroll_by(delta, queue.len(), renderer.height());
+                                if grid.scroll_y != before {
+                                    gallery_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    SlideshowCmd::GalleryOpenVisible => {
+                        if gallery_mode && in_gallery && !queue.is_empty() {
+                            let idx = gallery
+                                .as_ref()
+                                .map(|g| {
+                                    g.visible_indices(renderer.height(), queue.len())
+                                        .into_iter()
+                                        .next()
+                                        .unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+                            pending_open = Some(idx);
+                        }
+                    }
+                }
+            }
+
+            // Open the selected photo: load THAT index into the prefetch ring
+            // first so a decode failure on it cannot silently show a neighbour.
+            if let Some(idx) = pending_open {
+                if idx < queue.len() {
+                    prefetched.clear();
+                    current_rgba = None;
+                    self.load_photo_into_prefetch(&queue, idx, &mut prefetched, renderer)
+                        .await;
+                    if prefetched.is_empty() {
+                        // Keep the user on the grid rather than advancing to a
+                        // different photo they did not click.
+                        in_gallery = true;
+                        gallery_dirty = true;
+                        warn!(
+                            "Could not open photo {} ({}) — staying in gallery",
+                            idx + 1,
+                            queue[idx].1.filename
+                        );
+                    } else {
+                        in_gallery = false;
+                        paused = false;
+                        current_queue_idx = idx;
+                        cursor = (idx + 1) % queue.len();
+                        // Top up the rest of the ring from the following photos.
+                        for _ in 0..prefetch_n.saturating_sub(1) {
+                            self.prefetch_one(
+                                &queue,
+                                &mut cursor,
+                                &mut prefetched,
+                                prefetch_n,
+                                renderer,
+                            )
+                            .await;
+                        }
+                        last_advance = Instant::now()
+                            .checked_sub(slide_dur)
+                            .unwrap_or_else(Instant::now);
+                        info!("Opened slideshow at photo {}.", idx + 1);
                     }
                 }
             }
@@ -516,6 +631,10 @@ impl Slideshow {
                             if !queue.is_empty() {
                                 cursor = (current_queue_idx + 1) % queue.len();
                             }
+                            if let Some(grid) = gallery.as_mut() {
+                                grid.clear();
+                            }
+                            gallery_dirty = true;
                             menu_dirty = true;
                         }
                         MenuOutcome::NewQueue(q) => {
@@ -523,6 +642,10 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
+                            if let Some(grid) = gallery.as_mut() {
+                                grid.clear();
+                            }
+                            gallery_dirty = true;
                             menu_dirty = true;
                         }
                         MenuOutcome::Switched(q) => {
@@ -531,11 +654,21 @@ impl Slideshow {
                             current_queue_idx = 0;
                             prefetched.clear();
                             current_meta = None;
+                            current_rgba = None;
                             menu.open = false;
-                            // Show the new source promptly.
-                            last_advance = Instant::now()
-                                .checked_sub(slide_dur)
-                                .unwrap_or_else(Instant::now);
+                            if let Some(grid) = gallery.as_mut() {
+                                grid.clear();
+                            }
+                            gallery_dirty = true;
+                            // If we were browsing the grid, stay there with the
+                            // new source; otherwise force an immediate slide.
+                            if in_gallery {
+                                gallery_thumb_cursor = 0;
+                            } else {
+                                last_advance = Instant::now()
+                                    .checked_sub(slide_dur)
+                                    .unwrap_or_else(Instant::now);
+                            }
                         }
                     },
                 }
@@ -580,6 +713,62 @@ impl Slideshow {
                 }
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 continue;
+            }
+
+            // ── Gallery grid ───────────────────────────────────────────────
+            if in_gallery {
+                if let Some(grid) = gallery.as_mut() {
+                    grid.clamp_scroll(queue.len(), renderer.height());
+                    // Load one missing thumb per tick for a visible cell so the
+                    // Pi Zero stays responsive while scrolling; a newly-loaded
+                    // thumb marks the grid dirty so it repaints once.
+                    let visible = grid.visible_indices(renderer.height(), queue.len());
+                    if !visible.is_empty() {
+                        let start = gallery_thumb_cursor % visible.len();
+                        for offset in 0..visible.len() {
+                            let pick = visible[(start + offset) % visible.len()];
+                            if grid.thumb(pick).is_some() {
+                                continue;
+                            }
+                            gallery_thumb_cursor = (start + offset + 1) % visible.len();
+                            let (pidx, meta) = &queue[pick];
+                            let thumb_px = grid.cell;
+                            if let Some(bytes) =
+                                self.fetch_photo_thumb(*pidx, meta, thumb_px, renderer).await
+                            {
+                                if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
+                                    grid.insert_thumb(pick, img);
+                                    gallery_dirty = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // Only repaint when something changed — an idle, fully
+                    // loaded grid does no render or blit work.
+                    if gallery_dirty {
+                        let frame =
+                            grid.render(renderer.width(), renderer.height(), queue.len());
+                        if let Err(e) = renderer.show_cut(&frame) {
+                            warn!("gallery render error: {e}");
+                        }
+                        gallery_dirty = false;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                continue;
+            }
+
+            // Recovery: if the ring is empty (failed fetches, just opened with
+            // a bad photo, etc.) try to refill before the advance path.
+            if prefetched.is_empty() && !queue.is_empty() {
+                for _ in 0..prefetch_n {
+                    self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
+                        .await;
+                    if !prefetched.is_empty() {
+                        break;
+                    }
+                }
             }
 
             // ── Display schedule ───────────────────────────────────────────
@@ -687,9 +876,27 @@ impl Slideshow {
                 // Stamp metadata overlay before handing to the transition.
                 // exif_date comes from the same EXIF parse that corrected
                 // orientation during prefetch — no second parse needed.
+                // When gallery mode is on, composite onto a full-screen frame
+                // before drawing the × close control so its screen-space hit
+                // test matches the pixels the user sees (letterboxed photos
+                // would otherwise put × on the photo while hit-testing the
+                // screen corner).
+                let mut frame = if gallery_mode
+                    && (rgba.width() != renderer.width() || rgba.height() != renderer.height())
+                {
+                    let mut f = RgbaImage::from_pixel(
+                        renderer.width().max(1),
+                        renderer.height().max(1),
+                        Rgba([0, 0, 0, 255]),
+                    );
+                    blit_center(&mut f, &rgba);
+                    f
+                } else {
+                    rgba
+                };
                 if self.config.display.show_osd {
-                    crate::osd::draw_photo_info(&mut rgba, &meta, exif_date.as_deref());
-                    crate::osd::draw_nav_arrows(&mut rgba);
+                    crate::osd::draw_photo_info(&mut frame, &meta, exif_date.as_deref());
+                    crate::osd::draw_nav_arrows(&mut frame);
                     // Mark already-favourited photos with a ♥ in the corner.
                     if meta
                         .extra
@@ -697,31 +904,36 @@ impl Slideshow {
                         .map(|v| v == "true")
                         .unwrap_or(false)
                     {
-                        crate::osd::draw_favorite(&mut rgba);
+                        crate::osd::draw_favorite(&mut frame);
                     }
+                }
+                // Close (×) must remain available even when OSD info is off —
+                // it is the mouse path back to the gallery grid.
+                if gallery_mode {
+                    crate::osd::draw_close_button(&mut frame);
                 }
                 // Clock is its own toggle (independent of show_osd). Formatted
                 // here from the wall clock at display time, so it reflects the
                 // current minute each slide.
                 if self.config.display.show_clock {
                     let now = chrono::Local::now().format("%H:%M").to_string();
-                    crate::osd::draw_clock(&mut rgba, &now);
+                    crate::osd::draw_clock(&mut frame, &now);
                 }
                 let result = match self.config.display.transition {
-                    Transition::Cut => renderer.show_cut(&rgba),
+                    Transition::Cut => renderer.show_cut(&frame),
                     Transition::Fade => {
                         renderer
-                            .show_fade(current_rgba.as_ref(), &rgba, trans_dur)
+                            .show_fade(current_rgba.as_ref(), &frame, trans_dur)
                             .await
                     }
                     Transition::SlideLeft => {
                         renderer
-                            .show_slide_left(current_rgba.as_ref(), &rgba, trans_dur)
+                            .show_slide_left(current_rgba.as_ref(), &frame, trans_dur)
                             .await
                     }
                     Transition::SlideRight => {
                         renderer
-                            .show_slide_right(current_rgba.as_ref(), &rgba, trans_dur)
+                            .show_slide_right(current_rgba.as_ref(), &frame, trans_dur)
                             .await
                     }
                 };
@@ -729,7 +941,7 @@ impl Slideshow {
                     warn!("Render error: {}", e);
                 }
                 current_queue_idx = q_idx;
-                current_rgba = Some(rgba);
+                current_rgba = Some(frame);
                 // Remember the source plugin + metadata for the favourite toggle.
                 let plugin_idx = queue[q_idx].0;
                 let favorite = meta
@@ -769,6 +981,31 @@ impl Slideshow {
     /// The cursor is advanced before the (slow) fetch+decode so a photo that
     /// fails to download or decode is simply dropped — it never wedges the
     /// ring, and the next tick moves on to the following photo.
+    /// Fetch + decode a specific queue index into the front of the prefetch
+    /// ring. Used when opening a photo from the gallery so the clicked photo
+    /// is what appears — not a neighbour that happened to decode first.
+    async fn load_photo_into_prefetch(
+        &self,
+        queue: &[(usize, PhotoMeta)],
+        idx: usize,
+        prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
+        renderer: &Renderer,
+    ) {
+        if idx >= queue.len() {
+            return;
+        }
+        let (pidx, meta) = &queue[idx];
+        let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
+            return;
+        };
+        match renderer.decode_and_scale(&bytes) {
+            Ok((rgba, exif_date)) => {
+                prefetched.push_front((idx, meta.clone(), rgba, exif_date));
+            }
+            Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+        }
+    }
+
     async fn prefetch_one(
         &self,
         queue: &[(usize, PhotoMeta)],
@@ -1139,6 +1376,37 @@ impl Slideshow {
     }
 
     // ── Fetching ──────────────────────────────────────────────────────────
+
+    async fn fetch_photo_thumb(
+        &self,
+        plugin_idx: usize,
+        meta: &PhotoMeta,
+        thumb_px: u32,
+        _renderer: &Renderer,
+    ) -> Option<Vec<u8>> {
+        let plugin = &self.plugins[plugin_idx];
+        let cache_key = format!("{}/thumb/{}", plugin.name(), meta.id);
+
+        if let Some(bytes) = self.cache.lock().await.get(&cache_key).await {
+            return Some(bytes);
+        }
+
+        let fetch = plugin.get_photo_bytes(meta, thumb_px, thumb_px);
+        match tokio::time::timeout(Duration::from_secs(30), fetch).await {
+            Ok(Ok(bytes)) => {
+                let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
+                Some(bytes)
+            }
+            Ok(Err(e)) => {
+                warn!("fetch_photo_thumb {} error: {}", meta.filename, e);
+                None
+            }
+            Err(_) => {
+                warn!("fetch_photo_thumb {} timed out after 30 s", meta.filename);
+                None
+            }
+        }
+    }
 
     async fn fetch_photo(
         &self,

@@ -315,6 +315,7 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 #              | "date_cluster" (small same-day/album runs, runs shuffled)
 order             = "shuffle"
 show_osd          = true   # show the album/date/filename pill + nav arrows
+gallery_mode      = true   # thumbnail grid; Esc/× returns from fullscreen
 letterbox_blur    = true   # fill letterbox bars with a blurred copy, not black
 ken_burns         = false  # slow zoom/pan per photo (more CPU; off on Pi Zero)
 on_this_day_boost = true   # surface photos taken on today's date in past years

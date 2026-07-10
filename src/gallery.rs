@@ -1,0 +1,303 @@
+//! Browsable thumbnail grid — PhotoPrism kiosk style.
+//!
+//! Shows all loaded photos in a scrollable grid. Clicking a thumbnail opens the
+//! fullscreen slideshow; Escape or the close control returns here.
+
+use image::{Rgba, RgbaImage};
+use std::collections::HashMap;
+
+pub const GAP: u32 = 8;
+pub const MIN_CELL: u32 = 140;
+pub const HEADER_H: u32 = 36;
+
+/// Scrollable photo grid with a small in-memory thumb cache.
+pub struct GalleryGrid {
+    pub scroll_y: i32,
+    pub cols: u32,
+    pub cell: u32,
+    thumbs: HashMap<usize, RgbaImage>,
+}
+
+impl GalleryGrid {
+    pub fn new(screen_w: u32) -> Self {
+        let cols = ((screen_w.saturating_sub(GAP)) / (MIN_CELL + GAP)).max(1);
+        let cell = (screen_w.saturating_sub(GAP * (cols + 1))) / cols;
+        Self {
+            scroll_y: 0,
+            cols,
+            cell,
+            thumbs: HashMap::new(),
+        }
+    }
+
+    pub fn rows_for_count(&self, count: usize) -> u32 {
+        if count == 0 || self.cols == 0 {
+            return 0;
+        }
+        (count as u32).div_ceil(self.cols)
+    }
+
+    pub fn content_height(&self, count: usize) -> u32 {
+        HEADER_H + self.rows_for_count(count) * (self.cell + GAP) + GAP
+    }
+
+    pub fn cell_origin(&self, index: usize) -> (u32, i32) {
+        let col = (index as u32) % self.cols;
+        let row = (index as u32) / self.cols;
+        let x = GAP + col * (self.cell + GAP);
+        let y = HEADER_H as i32 + row as i32 * (self.cell + GAP) as i32 - self.scroll_y;
+        (x, y)
+    }
+
+    /// Hit-test a click. Returns `None` for header, gaps, or out-of-range cells.
+    pub fn index_at(&self, x: i32, y: i32, count: usize) -> Option<usize> {
+        if count == 0 || x < 0 || y < HEADER_H as i32 {
+            return None;
+        }
+        let y_adj = y + self.scroll_y - HEADER_H as i32;
+        if y_adj < 0 {
+            return None;
+        }
+        let pitch = (self.cell + GAP) as i32;
+        let row = y_adj / pitch;
+        let col_x = x - GAP as i32;
+        if col_x < 0 {
+            return None;
+        }
+        let col = col_x / pitch;
+        // Reject clicks that land in the gap between cells.
+        let in_cell_x = col_x % pitch;
+        let in_cell_y = y_adj % pitch;
+        if in_cell_x >= self.cell as i32 || in_cell_y >= self.cell as i32 {
+            return None;
+        }
+        if col < 0 || col as u32 >= self.cols {
+            return None;
+        }
+        let idx = row as usize * self.cols as usize + col as usize;
+        if idx < count {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    pub fn visible_indices(&self, screen_h: u32, count: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            let (_, y) = self.cell_origin(i);
+            let y_end = y + self.cell as i32;
+            if y_end > HEADER_H as i32 && y < screen_h as i32 {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    pub fn insert_thumb(&mut self, index: usize, img: RgbaImage) {
+        // Prefer evicting thumbs that are far from the newly inserted index.
+        if self.thumbs.len() >= 96 {
+            let mut keys: Vec<_> = self.thumbs.keys().copied().collect();
+            keys.sort_by_key(|k| k.abs_diff(index));
+            for k in keys.into_iter().rev().take(48) {
+                self.thumbs.remove(&k);
+            }
+        }
+        // Cover-crop to the cell once at insert time so render never resizes.
+        let square = cover_square(img, self.cell);
+        self.thumbs.insert(index, square);
+    }
+
+    pub fn thumb(&self, index: usize) -> Option<&RgbaImage> {
+        self.thumbs.get(&index)
+    }
+
+    /// Drop all cached thumbs (e.g. after the play queue is rebuilt).
+    pub fn clear(&mut self) {
+        self.thumbs.clear();
+        self.scroll_y = 0;
+    }
+
+    pub fn scroll_by(&mut self, delta_y: i32, count: usize, screen_h: u32) {
+        // Positive delta_y = finger/wheel up = content moves down = scroll_y decreases.
+        // Renderer sends wheel * 40 where SDL y>0 is scroll up.
+        self.scroll_y -= delta_y;
+        self.clamp_scroll(count, screen_h);
+    }
+
+    pub fn clamp_scroll(&mut self, count: usize, screen_h: u32) {
+        let max_scroll = self.content_height(count).saturating_sub(screen_h) as i32;
+        self.scroll_y = self.scroll_y.clamp(0, max_scroll.max(0));
+    }
+
+    pub fn render(&self, screen_w: u32, screen_h: u32, count: usize) -> RgbaImage {
+        let mut frame = RgbaImage::from_pixel(screen_w, screen_h, Rgba([10, 10, 10, 255]));
+
+        draw_text_line(
+            &mut frame,
+            &format!("{count} photos — click to open, Esc closes preview"),
+            GAP as i32,
+            10,
+        );
+
+        for i in self.visible_indices(screen_h, count) {
+            let (x, y) = self.cell_origin(i);
+            // Clip cells that straddle the top/bottom of the viewport.
+            let src_y0 = if y < HEADER_H as i32 {
+                (HEADER_H as i32 - y) as u32
+            } else {
+                0
+            };
+            let dst_y = y.max(HEADER_H as i32) as u32;
+            if dst_y >= screen_h {
+                continue;
+            }
+            let draw_h = self.cell.saturating_sub(src_y0).min(screen_h - dst_y);
+            if draw_h == 0 {
+                continue;
+            }
+            fill_rect(
+                &mut frame,
+                x,
+                dst_y,
+                self.cell,
+                draw_h,
+                Rgba([28, 28, 28, 255]),
+            );
+            if let Some(thumb) = self.thumb(i) {
+                blit_thumb_clipped(&mut frame, thumb, x, dst_y, self.cell, draw_h, src_y0);
+            }
+        }
+        frame
+    }
+}
+
+fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
+    let (iw, ih) = img.dimensions();
+    for py in y..(y + h).min(ih) {
+        for px in x..(x + w).min(iw) {
+            img.put_pixel(px, py, color);
+        }
+    }
+}
+
+/// Cover-crop `src` into a `size×size` square (done once at thumb insert).
+fn cover_square(src: RgbaImage, size: u32) -> RgbaImage {
+    let size = size.max(1);
+    let (sw, sh) = src.dimensions();
+    if sw == 0 || sh == 0 {
+        return RgbaImage::from_pixel(size, size, Rgba([28, 28, 28, 255]));
+    }
+    if sw == size && sh == size {
+        return src;
+    }
+    let scale = (size as f32 / sw as f32).max(size as f32 / sh as f32);
+    let tw = ((sw as f32 * scale).ceil() as u32).max(1);
+    let th = ((sh as f32 * scale).ceil() as u32).max(1);
+    let scaled = image::imageops::resize(&src, tw, th, image::imageops::FilterType::Triangle);
+    let ox = scaled.width().saturating_sub(size) / 2;
+    let oy = scaled.height().saturating_sub(size) / 2;
+    image::imageops::crop_imm(&scaled, ox, oy, size, size).to_image()
+}
+
+/// Blit a cell-sized square thumb, optionally skipping `src_y0` rows (scroll clip).
+fn blit_thumb_clipped(
+    dst: &mut RgbaImage,
+    src: &RgbaImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    src_y0: u32,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (sw, sh) = src.dimensions();
+    let (iw, ih) = dst.dimensions();
+    let dstride = dst.width() as usize * 4;
+    let sstride = sw as usize * 4;
+    let dbuf = dst.as_mut();
+    let sbuf = src.as_raw();
+    let copy_w = w.min(sw);
+    for row in 0..h {
+        let dy = y + row;
+        if dy >= ih {
+            break;
+        }
+        let sy = src_y0 + row;
+        if sy >= sh {
+            continue;
+        }
+        let cols = copy_w.min(iw.saturating_sub(x));
+        if cols == 0 {
+            continue;
+        }
+        let d = dy as usize * dstride + x as usize * 4;
+        let s = sy as usize * sstride;
+        dbuf[d..d + cols as usize * 4].copy_from_slice(&sbuf[s..s + cols as usize * 4]);
+    }
+}
+
+fn draw_text_line(img: &mut RgbaImage, text: &str, x: i32, y: i32) {
+    use font8x8::UnicodeFonts;
+    const SCALE: u32 = 2;
+    let mut cx = x;
+    for ch in text.chars().take(72) {
+        if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+            for (row_i, byte) in glyph.iter().enumerate() {
+                for col in 0..8u32 {
+                    if byte & (1 << col) == 0 {
+                        continue;
+                    }
+                    for dy in 0..SCALE {
+                        for dx in 0..SCALE {
+                            let px = cx + (col * SCALE + dx) as i32;
+                            let py = y + (row_i as u32 * SCALE + dy) as i32;
+                            if px >= 0
+                                && py >= 0
+                                && (px as u32) < img.width()
+                                && (py as u32) < img.height()
+                            {
+                                img.put_pixel(px as u32, py as u32, Rgba([220, 220, 220, 255]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += 8 * SCALE as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_at_hits_first_cell() {
+        let g = GalleryGrid::new(800);
+        assert!(g.cols >= 1);
+        let (x, y) = g.cell_origin(0);
+        assert_eq!(g.index_at(x as i32 + 4, y + 4, 10), Some(0));
+    }
+
+    #[test]
+    fn index_at_rejects_header_and_gaps() {
+        let g = GalleryGrid::new(800);
+        assert_eq!(g.index_at(10, 5, 10), None); // header
+        let (x, _y) = g.cell_origin(0);
+        // Just past the right edge of cell 0 into the gap.
+        let gap_x = x as i32 + g.cell as i32 + 1;
+        assert_eq!(g.index_at(gap_x, HEADER_H as i32 + 4, 10), None);
+    }
+
+    #[test]
+    fn scroll_clamps_to_content() {
+        let mut g = GalleryGrid::new(400);
+        g.scroll_by(-10_000, 3, 300);
+        assert!(g.scroll_y >= 0);
+        g.scroll_by(10_000, 3, 300);
+        assert_eq!(g.scroll_y, 0);
+    }
+}

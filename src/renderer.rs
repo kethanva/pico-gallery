@@ -571,6 +571,33 @@ impl Renderer {
         Ok((final_img, exif_date))
     }
 
+    /// Decode and scale a photo to fit within `max_px` (for gallery thumbnails).
+    ///
+    /// Always contain-fits into a square (ignores `fill_screen`) so grid cells
+    /// stay consistent regardless of slideshow crop settings.
+    pub fn decode_thumbnail(&self, bytes: &[u8], max_px: u32) -> Result<RgbaImage> {
+        let max_bytes = if self.config.max_image_mb > 0 {
+            self.config.max_image_mb as usize * 1_048_576
+        } else {
+            50 * 1_048_576
+        };
+        if bytes.len() > max_bytes {
+            return Err(anyhow::anyhow!("thumbnail source too large"));
+        }
+        let img = image::load_from_memory(bytes).context("decoding thumbnail")?;
+        check_megapixels(self.config.max_megapixels, img.width(), img.height())?;
+        let orientation = crate::exif_util::read_exif(bytes).orientation;
+        let max_px = max_px.max(1);
+        let (sw, sh) = (img.width().max(1), img.height().max(1));
+        let scale = f32::min(max_px as f32 / sw as f32, max_px as f32 / sh as f32);
+        let nw = ((sw as f32 * scale) as u32).max(1);
+        let nh = ((sh as f32 * scale) as u32).max(1);
+        let rgba = img
+            .resize_exact(nw, nh, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        Ok(crate::exif_util::apply_orientation_rgba(rgba, orientation))
+    }
+
     // scale_image is kept for any future callers that don't need orientation.
     #[allow(dead_code)]
     fn scale_image(&self, img: DynamicImage) -> Result<RgbaImage> {
@@ -918,7 +945,13 @@ impl Renderer {
     /// Returns every command in order (a `Vec`, not a single `Option`) so a
     /// burst of events in one poll is never dropped. Mouse-motion events are
     /// only emitted while the menu is open, so an idle slideshow produces none.
-    pub fn poll_events(&mut self, menu_open: bool, editing: bool) -> Vec<SlideshowCmd> {
+    pub fn poll_events(
+        &mut self,
+        menu_open: bool,
+        editing: bool,
+        gallery_mode: bool,
+        in_gallery: bool,
+    ) -> Vec<SlideshowCmd> {
         // Toggle SDL text input to match the edit state. Doing it here (one
         // place, every tick) keeps it in lock-step with the menu without the
         // caller driving start/stop.
@@ -976,6 +1009,28 @@ impl Renderer {
                             }
                             _ => {}
                         }
+                    } else if in_gallery {
+                        match key {
+                            Keycode::Escape | Keycode::Q => out.push(SlideshowCmd::Quit),
+                            Keycode::Up => out.push(SlideshowCmd::GalleryScroll(80)),
+                            Keycode::Down => out.push(SlideshowCmd::GalleryScroll(-80)),
+                            Keycode::Return | Keycode::KpEnter | Keycode::Space => {
+                                out.push(SlideshowCmd::GalleryOpenVisible)
+                            }
+                            Keycode::M => out.push(SlideshowCmd::OpenMenu),
+                            _ => {}
+                        }
+                    } else if gallery_mode {
+                        match key {
+                            Keycode::Escape => out.push(SlideshowCmd::BackToGallery),
+                            Keycode::Q => out.push(SlideshowCmd::Quit),
+                            Keycode::Right | Keycode::Space => out.push(SlideshowCmd::Next),
+                            Keycode::Left => out.push(SlideshowCmd::Prev),
+                            Keycode::P => out.push(SlideshowCmd::TogglePause),
+                            Keycode::F => out.push(SlideshowCmd::ToggleFavorite),
+                            Keycode::M => out.push(SlideshowCmd::OpenMenu),
+                            _ => {}
+                        }
                     } else {
                         match key {
                             Keycode::Escape | Keycode::Q => out.push(SlideshowCmd::Quit),
@@ -998,6 +1053,31 @@ impl Renderer {
                             MouseButton::Left => out.push(SlideshowCmd::MenuClick { x, y }),
                             _ => {}
                         }
+                    } else if in_gallery {
+                        match mouse_btn {
+                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+                            MouseButton::Left => out.push(SlideshowCmd::GalleryClick { x, y }),
+                            _ => {}
+                        }
+                    } else if gallery_mode {
+                        match mouse_btn {
+                            MouseButton::Right => out.push(SlideshowCmd::OpenMenu),
+                            MouseButton::Left if crate::osd::close_button_hit(
+                                x,
+                                y,
+                                self.width,
+                                self.height,
+                            ) =>
+                            {
+                                out.push(SlideshowCmd::BackToGallery)
+                            }
+                            MouseButton::Left => out.push(if x < half_w {
+                                SlideshowCmd::Prev
+                            } else {
+                                SlideshowCmd::Next
+                            }),
+                            _ => {}
+                        }
                     } else {
                         match mouse_btn {
                             // Right-click anywhere opens the settings menu.
@@ -1010,6 +1090,10 @@ impl Renderer {
                             }),
                         }
                     }
+                }
+
+                Event::MouseWheel { y, .. } if in_gallery && !menu_open => {
+                    out.push(SlideshowCmd::GalleryScroll(y * 40));
                 }
 
                 // Hover only matters while the menu is up; ignored otherwise so
@@ -1288,6 +1372,19 @@ pub enum SlideshowCmd {
     TextCommit,
     /// Discard the edit (Esc).
     TextCancel,
+    /// Return from fullscreen slideshow to the gallery grid.
+    BackToGallery,
+    /// Open slideshow at a queue index (from gallery click).
+    OpenSlideshow(usize),
+    /// Click in the gallery grid.
+    GalleryClick {
+        x: i32,
+        y: i32,
+    },
+    /// Scroll the gallery grid (positive = up).
+    GalleryScroll(i32),
+    /// Open the first photo currently visible in the gallery viewport.
+    GalleryOpenVisible,
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────

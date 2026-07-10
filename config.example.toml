@@ -43,6 +43,14 @@ fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
 #
 # show_osd = true
 
+# ── Gallery grid (PhotoPrism kiosk style) ─────────────────────────────────────
+#
+# Start on a thumbnail grid of all photos. Click a photo for fullscreen;
+# Escape or the × button returns to the grid (instead of quitting).
+# Set false for classic slideshow-only mode (Escape quits).
+#
+# gallery_mode = true
+
 # ── Memory-safety limits ──────────────────────────────────────────────────────
 #
 # These two limits are checked BEFORE the image is decoded.  When a photo

@@ -578,6 +578,7 @@ transition          = "fade"
 transition_ms       = 800
 fill_screen         = false
 fps                 = 15
+gallery_mode        = true
 
 [cache]
 max_mb         = 256
@@ -618,6 +619,7 @@ transition          = "fade"
 transition_ms       = 800
 fill_screen         = false
 fps                 = 15
+gallery_mode        = true
 
 [cache]
 max_mb         = 256

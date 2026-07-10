@@ -361,7 +361,8 @@ pub fn draw_favorite(img: &mut RgbaImage) {
     let (iw, _ih) = img.dimensions();
     let box_w = GLYPH_W + PAD * 2;
     let box_h = GLYPH_H + PAD * 2;
-    let bx = iw.saturating_sub(box_w + EDGE);
+    // Sit left of the close button when both are shown.
+    let bx = iw.saturating_sub(box_w + EDGE + box_w + 4);
     let by = EDGE;
 
     darken_rect(img, bx, by, box_w, box_h);
@@ -369,6 +370,43 @@ pub fn draw_favorite(img: &mut RgbaImage) {
     let gy = (by + PAD) as i32;
     draw_glyph(img, HEART, gx + 1, gy + 1, SHADOW);
     draw_glyph(img, HEART, gx, gy, FAV_RED);
+}
+
+// ── Close control (return to gallery grid) ───────────────────────────────────
+
+const CLOSE_BTN: u32 = 44;
+
+/// Draw an × close pill in the top-right corner (PhotoPrism kiosk style).
+pub fn draw_close_button(img: &mut RgbaImage) {
+    let (iw, _ih) = img.dimensions();
+    let bx = iw.saturating_sub(CLOSE_BTN + EDGE);
+    let by = EDGE;
+    darken_rect(img, bx, by, CLOSE_BTN, CLOSE_BTN);
+    let cx = (bx + CLOSE_BTN / 2) as i32;
+    let cy = (by + CLOSE_BTN / 2) as i32;
+    let arm = 10i32;
+    for d in -arm..=arm {
+        for t in 0..2 {
+            let (px, py) = (cx + d, cy + d + t);
+            if px >= 0 && py >= 0 && (px as u32) < iw {
+                img.put_pixel(px as u32, py as u32, Rgba(FG));
+            }
+            let (px, py) = (cx + d, cy - d + t);
+            if px >= 0 && py >= 0 && (px as u32) < iw {
+                img.put_pixel(px as u32, py as u32, Rgba(FG));
+            }
+        }
+    }
+}
+
+/// Returns true when `(x, y)` hits the close button region.
+pub fn close_button_hit(x: i32, y: i32, iw: u32, _ih: u32) -> bool {
+    let bx = iw.saturating_sub(CLOSE_BTN + EDGE) as i32;
+    let by = EDGE as i32;
+    x >= bx - 4
+        && y >= by - 4
+        && x < bx + CLOSE_BTN as i32 + 4
+        && y < by + CLOSE_BTN as i32 + 4
 }
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
@@ -702,9 +740,9 @@ mod tests {
         let (w, h) = (320u32, 240u32);
         let mut img = white_img(w, h);
         draw_favorite(&mut img);
-        // Pill sits in the top-right; its centre should no longer be pure white.
+        // Pill sits left of the close button in the top-right area.
         let box_w = GLYPH_W + PAD * 2;
-        let cx = w - box_w / 2 - EDGE;
+        let cx = w - box_w / 2 - EDGE - box_w - 4;
         let cy = EDGE + (GLYPH_H + PAD * 2) / 2;
         let px = img.get_pixel(cx, cy);
         assert!(
@@ -801,5 +839,46 @@ mod tests {
             "expected darkened pill at right arrow, got {:?}",
             px
         );
+    }
+
+    #[test]
+    fn draw_close_button_darkens_top_right_and_draws_x() {
+        let (w, h) = (1920u32, 1080u32);
+        let mut img = white_img(w, h);
+        draw_close_button(&mut img);
+        let bx = w.saturating_sub(CLOSE_BTN + EDGE);
+        let by = EDGE;
+        let pill_px = img.get_pixel(bx + 2, by + 2);
+        assert!(
+            pill_px[0] < 250 || pill_px[1] < 250 || pill_px[2] < 250,
+            "expected close pill to alter the top-right corner, got {:?}",
+            pill_px
+        );
+        let cx = (bx + CLOSE_BTN / 2) as i32;
+        let cy = (by + CLOSE_BTN / 2) as i32;
+        let x_px = img.get_pixel(cx as u32, cy as u32);
+        assert_eq!(
+            x_px.0, FG,
+            "expected white × stroke at button centre, got {:?}",
+            x_px
+        );
+    }
+
+    #[test]
+    fn close_button_hit_matches_drawn_region() {
+        let (w, h) = (1920u32, 1080u32);
+        let bx = w.saturating_sub(CLOSE_BTN + EDGE) as i32;
+        let by = EDGE as i32;
+        let cx = bx + CLOSE_BTN as i32 / 2;
+        let cy = by + CLOSE_BTN as i32 / 2;
+        assert!(close_button_hit(cx, cy, w, h));
+        assert!(close_button_hit(bx, by, w, h));
+        assert!(close_button_hit(bx + CLOSE_BTN as i32 - 1, by + CLOSE_BTN as i32 - 1, w, h));
+        assert!(!close_button_hit(bx - 5, cy, w, h));
+        assert!(!close_button_hit(cx, by - 5, w, h));
+        assert!(!close_button_hit(bx + CLOSE_BTN as i32 + 4, cy, w, h));
+        assert!(!close_button_hit(cx, by + CLOSE_BTN as i32 + 4, w, h));
+        // Right-half click outside the close pill should not register as close.
+        assert!(!close_button_hit(w as i32 / 2 + 100, cy, w, h));
     }
 }
