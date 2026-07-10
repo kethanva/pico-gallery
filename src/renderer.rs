@@ -1018,10 +1018,16 @@ impl Renderer {
                     } else if in_gallery {
                         match key {
                             Keycode::Escape | Keycode::Q => out.push(SlideshowCmd::Quit),
-                            Keycode::Up => out.push(SlideshowCmd::GalleryScroll(80)),
-                            Keycode::Down => out.push(SlideshowCmd::GalleryScroll(-80)),
+                            Keycode::Left => {
+                                out.push(SlideshowCmd::GalleryMoveSelection { dx: -1, dy: 0 })
+                            }
+                            Keycode::Right => {
+                                out.push(SlideshowCmd::GalleryMoveSelection { dx: 1, dy: 0 })
+                            }
+                            Keycode::Up => out.push(SlideshowCmd::GalleryPage(-1)),
+                            Keycode::Down => out.push(SlideshowCmd::GalleryPage(1)),
                             Keycode::Return | Keycode::KpEnter | Keycode::Space => {
-                                out.push(SlideshowCmd::GalleryOpenVisible)
+                                out.push(SlideshowCmd::GalleryOpenSelected)
                             }
                             Keycode::M => out.push(SlideshowCmd::OpenMenu),
                             _ => {}
@@ -1093,8 +1099,20 @@ impl Renderer {
                     }
                 }
 
-                Event::MouseWheel { y, .. } if in_gallery && !menu_open => {
-                    out.push(SlideshowCmd::GalleryScroll(y * 40));
+                Event::MouseWheel { y, .. } if !menu_open && in_gallery => {
+                    if y < 0 {
+                        out.push(SlideshowCmd::GalleryPage(1));
+                    } else if y > 0 {
+                        out.push(SlideshowCmd::GalleryPage(-1));
+                    }
+                }
+
+                Event::MouseWheel { y, .. } if !menu_open && !in_gallery => {
+                    if y < 0 {
+                        out.push(SlideshowCmd::Next);
+                    } else if y > 0 {
+                        out.push(SlideshowCmd::Prev);
+                    }
                 }
 
                 // Hover only matters while the menu is up; ignored otherwise so
@@ -1432,8 +1450,17 @@ pub enum SlideshowCmd {
         x: i32,
         y: i32,
     },
-    /// Scroll the gallery grid (positive = up).
+    /// Scroll the gallery grid (positive = up). Legacy — prefer GalleryPage.
     GalleryScroll(i32),
+    /// Scroll the gallery by one full page (-1 = up, 1 = down).
+    GalleryPage(i32),
+    /// Move the gallery selection highlight.
+    GalleryMoveSelection {
+        dx: i32,
+        dy: i32,
+    },
+    /// Open the currently selected photo in the gallery grid.
+    GalleryOpenSelected,
     /// Open the first photo currently visible in the gallery viewport.
     GalleryOpenVisible,
 }
