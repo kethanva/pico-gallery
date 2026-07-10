@@ -10,7 +10,8 @@
 #   ./release.sh --prerelease 0.1.3-kva.1 "message"
 #   ./release.sh --no-wait ...           # push tag and exit (don't wait for CI)
 #
-# From a feature branch (e.g. kva-revamparchitecture):
+# From kva-revamparchitecture: every push auto-publishes vX.Y.Z-kva.N via CI.
+# Manual pre-release (optional — same result as pushing the branch):
 #   ./release.sh --prerelease
 #   # then on the Pi:
 #   sudo PICOGALLERY_VERSION=v0.1.3-kva.1 bash deploy.sh
@@ -61,15 +62,21 @@ if [[ $# -gt 0 && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
     shift
 elif [[ $PRERELEASE == "1" ]]; then
     BASE=$(grep -m 1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-    SUFFIX="${PRERELEASE_SUFFIX:-kva.1}"
-    # Auto-increment kva.N if tag already exists.
-    N=1
-    if [[ "$SUFFIX" =~ ^kva\.([0-9]+)$ ]]; then
+    MAX=0
+    while IFS= read -r t; do
+      n="${t##*-kva.}"
+      if [[ "$n" =~ ^[0-9]+$ ]] && (( n > MAX )); then
+        MAX=$n
+      fi
+    done < <(git tag -l "v${BASE}-kva.*")
+    if [[ -n "$PRERELEASE_SUFFIX" && "$PRERELEASE_SUFFIX" =~ ^kva\.([0-9]+)$ ]]; then
       N="${BASH_REMATCH[1]}"
+      while git tag -l | grep -qx "v${BASE}-kva.${N}"; do
+        N=$((N + 1))
+      done
+    else
+      N=$((MAX + 1))
     fi
-    while git tag -l | grep -qx "v${BASE}-kva.${N}"; do
-      N=$((N + 1))
-    done
     VERSION="${BASE}-kva.${N}"
     blue "Pre-release on branch $BRANCH → $VERSION"
 else
