@@ -129,12 +129,20 @@ impl GalleryGrid {
     }
 
     /// Move the selection by grid cells (dx = column, dy = row).
-    /// Returns true when a forward move (right/down) was blocked at the edge.
+    ///
+    /// Returns true only when the selection was already on the very last
+    /// loaded photo and a forward move (right/down) was requested — the
+    /// signal callers use to try fetching more photos. This is deliberately
+    /// narrower than "the move didn't change the selection": pressing Right
+    /// at the last column of *any* row also leaves `selected` unchanged (the
+    /// column clamps), but that is a normal grid-edge no-op, not "we've run
+    /// out of data" — conflating the two would fire a queue-extension fetch
+    /// on every such press throughout the whole gallery, not just at the end.
     pub fn move_selection(&mut self, dx: i32, dy: i32, count: usize) -> bool {
         if count == 0 || self.cols == 0 || (dx == 0 && dy == 0) {
             return false;
         }
-        let before = self.selected;
+        let at_last_item = self.selected >= count - 1;
         let cols = self.cols as i32;
         let row = (self.selected as i32 / cols) + dy;
         let col = (self.selected as i32 % cols) + dx;
@@ -142,7 +150,7 @@ impl GalleryGrid {
         let col = col.clamp(0, cols - 1);
         let idx = row as usize * self.cols as usize + col as usize;
         self.selected = idx.min(count - 1);
-        before == self.selected && (dx > 0 || dy > 0)
+        at_last_item && (dx > 0 || dy > 0)
     }
 
     /// True when the grid is scrolled to the bottom of `count` photos.
@@ -442,6 +450,35 @@ mod tests {
         g.set_selected(9, 10);
         assert!(g.move_selection(1, 0, 10));
         assert_eq!(g.selected, 9);
+    }
+
+    #[test]
+    fn move_selection_not_blocked_at_row_edge_mid_grid() {
+        // Pressing Right at the last column of an early row (nowhere near the
+        // last loaded photo) must not report "blocked" — that would trigger a
+        // wasted queue-extension fetch on every such press throughout the
+        // gallery, not just at the true end of the data.
+        let mut g = GalleryGrid::new(800);
+        let cols = g.cols as usize;
+        let count = cols * 20; // many rows below the current one
+        g.set_selected(cols - 1, count); // last column of row 0
+        assert!(!g.move_selection(1, 0, count));
+        assert_eq!(g.selected, cols - 1); // clamped in place, as before
+    }
+
+    #[test]
+    fn move_selection_not_blocked_moving_into_short_last_row() {
+        // Moving down into a short final row lands on a real existing item —
+        // that is a successful move, not a "ran out of data" signal.
+        let mut g = GalleryGrid::new(800);
+        let cols = g.cols as usize;
+        if cols < 2 {
+            return; // degenerate screen width — nothing to test
+        }
+        let count = cols + 1; // row 0 full, row 1 has exactly one item
+        g.set_selected(1, count); // row 0, col 1
+        assert!(!g.move_selection(0, 1, count));
+        assert_eq!(g.selected, cols); // snapped to the only item in row 1
     }
 
     #[test]

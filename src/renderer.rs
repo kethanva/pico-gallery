@@ -715,7 +715,7 @@ impl Renderer {
 
     /// Async so the frame-budget sleep yields to the runtime: on the
     /// current_thread executor a `std::thread::sleep` here would starve every
-    /// other task (HTTP remote, prefetch) for the whole transition. SDL stays
+    /// other tasks (e.g. the HTTP remote listener) for the whole transition. SDL stays
     /// on the main thread — the executor never migrates this future.
     pub async fn show_fade(
         &mut self,

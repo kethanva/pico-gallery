@@ -76,7 +76,7 @@ pub enum AuthStatus {
 ///
 /// # Thread safety
 /// Implementations must be `Send + Sync` because the engine may call them
-/// from different Tokio tasks (e.g. a background prefetch task).
+/// from async call sites on the single-threaded runtime (e.g. the HTTP remote listener).
 ///
 /// # Error handling
 /// Return `Err` for transient errors (network timeout, rate limit).  The
