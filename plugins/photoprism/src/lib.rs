@@ -119,17 +119,52 @@ const THUMB_SIZES: &[(&str, u32)] = &[
 
 // ── PhotoPrism API response shapes ────────────────────────────────────────────
 
+/// Pull the first non-empty string value for any of `keys` from a JSON object.
+fn json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Parse `POST /api/v1/session` without strict struct deserialization.
+/// PhotoPrism may return both `id` and `session_id`, plus a large `config`
+/// blob — serde rejects duplicate keys when field aliases overlap.
+fn parse_login_response(
+    body: &serde_json::Value,
+    header_sid: Option<String>,
+) -> Result<Session> {
+    let sid = json_str(body, &["session_id", "id"])
+        .or_else(|| json_str(body, &["accessToken", "access_token"]))
+        .or(header_sid)
+        .ok_or_else(|| anyhow!("photoprism: session response missing session id"))?;
+
+    let config = body.get("config");
+    let preview_token = json_str(body, &["previewToken", "preview_token"])
+        .or_else(|| config.and_then(|c| json_str(c, &["previewToken", "preview_token"])))
+        .unwrap_or_else(|| "public".to_string());
+    let download_token = json_str(body, &["downloadToken", "download_token"])
+        .or_else(|| config.and_then(|c| json_str(c, &["downloadToken", "download_token"])))
+        .unwrap_or_else(|| "public".to_string());
+
+    Ok(Session {
+        session_id: sid,
+        preview_token,
+        download_token,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionResponse {
-    #[serde(default, alias = "id", alias = "session_id")]
+    #[serde(default, alias = "id")]
     session_id: String,
     #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
-    // PhotoPrism serialises these as camelCase (`previewToken` / `downloadToken`);
-    // the snake_case aliases keep older/proxied payloads working too.
-    #[serde(default, rename = "previewToken", alias = "preview_token")]
+    #[serde(default, rename = "previewToken")]
     preview_token: Option<String>,
-    #[serde(default, rename = "downloadToken", alias = "download_token")]
+    #[serde(default, rename = "downloadToken")]
     download_token: Option<String>,
     #[serde(default)]
     config: Option<ServerConfig>,
@@ -140,22 +175,20 @@ struct SessionResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerConfig {
-    #[serde(default, alias = "preview_token")]
+    #[serde(default, rename = "previewToken")]
     preview_token: Option<String>,
-    #[serde(default, alias = "download_token")]
+    #[serde(default, rename = "downloadToken")]
     download_token: Option<String>,
 }
 
 /// `GET /api/v1/config` — runtime preview/download tokens (see
 /// `minimal-photo-app.js` `ensureRuntimeConfig()`, which reads `cfg.previewToken`).
-/// PhotoPrism's `ClientConfig` uses camelCase keys, so match that (with a
-/// snake_case alias as a defensive fallback).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigResponse {
-    #[serde(default, alias = "preview_token")]
+    #[serde(default, rename = "previewToken")]
     preview_token: Option<String>,
-    #[serde(default, alias = "download_token")]
+    #[serde(default, rename = "downloadToken")]
     download_token: Option<String>,
 }
 
@@ -571,50 +604,25 @@ impl PhotoPrismPlugin {
 
         // PhotoPrism returns the session id both in the JSON body and the
         // `X-Session-ID` header; grab whichever is present.
-        let header_sid = resp
-            .headers()
+        let headers = resp.headers().clone();
+        let header_sid = headers
             .get("X-Session-ID")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
 
-        let parsed: SessionResponse = resp
+        let body: serde_json::Value = resp
             .json()
             .await
             .context("parsing PhotoPrism session JSON")?;
 
-        let sid = if !parsed.session_id.is_empty() {
-            parsed.session_id
-        } else if let Some(at) = parsed.access_token {
-            at
-        } else if let Some(h) = header_sid {
-            h
-        } else {
-            return Err(anyhow!("photoprism: session response missing session id"));
-        };
-
-        let preview_token = parsed
-            .preview_token
-            .or_else(|| parsed.config.as_ref().and_then(|c| c.preview_token.clone()))
-            .unwrap_or_else(|| "public".to_string());
-        let download_token = parsed
-            .download_token
-            .or_else(|| {
-                parsed
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.download_token.clone())
-            })
-            .unwrap_or_else(|| "public".to_string());
+        let mut session = parse_login_response(&body, header_sid)?;
+        Self::apply_tokens_from_headers(&headers, &mut session);
 
         // chars() (not byte slicing) — a multibyte id must not panic the log line.
-        let sid_prefix: String = sid.chars().take(8).collect();
+        let sid_prefix: String = session.session_id.chars().take(8).collect();
         info!("PhotoPrism: logged in as {user} (session {sid_prefix}…)");
 
-        Ok(Session {
-            session_id: sid,
-            preview_token,
-            download_token,
-        })
+        Ok(session)
     }
 
     async fn ensure_session(&self, state: &mut State) -> Result<()> {
@@ -684,11 +692,11 @@ impl PhotoPrismPlugin {
 
         Self::apply_tokens_from_headers(resp.headers(), sess);
 
-        let cfg: ConfigResponse = resp.json().await.context("parsing /config JSON")?;
-        if let Some(t) = cfg.preview_token.filter(|t| !t.is_empty()) {
+        let body: serde_json::Value = resp.json().await.context("parsing /config JSON")?;
+        if let Some(t) = json_str(&body, &["previewToken", "preview_token"]) {
             sess.preview_token = t;
         }
-        if let Some(t) = cfg.download_token.filter(|t| !t.is_empty()) {
+        if let Some(t) = json_str(&body, &["downloadToken", "download_token"]) {
             sess.download_token = t;
         }
         Ok(())
@@ -1706,9 +1714,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_login_response_handles_id_and_session_id() {
+        let json = r#"{
+            "id": "from-id",
+            "session_id": "from-sid",
+            "config": {
+                "previewToken": "pv-live-tok",
+                "downloadToken": "dl-live-tok"
+            }
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let sess = parse_login_response(&body, None).unwrap();
+        assert_eq!(sess.session_id, "from-sid");
+        assert_eq!(sess.preview_token, "pv-live-tok");
+        assert_eq!(sess.download_token, "dl-live-tok");
+    }
+
+    #[test]
     fn session_response_parses_camelcase_tokens() {
-        // Shape a real PhotoPrism `POST /api/v1/session` returns: session id in
-        // `id`, tokens in camelCase inside the embedded `config` object.
         let json = r#"{
             "id": "sess-abc123",
             "config": {
@@ -1733,11 +1756,10 @@ mod tests {
     }
 
     #[test]
-    fn config_response_accepts_snakecase_alias() {
-        // Defensive: a proxy or older build emitting snake_case still parses.
+    fn config_json_accepts_snakecase_alias() {
         let json = r#"{ "preview_token": "pv", "download_token": "dl" }"#;
-        let parsed: ConfigResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.preview_token.as_deref(), Some("pv"));
-        assert_eq!(parsed.download_token.as_deref(), Some("dl"));
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(json_str(&body, &["previewToken", "preview_token"]).as_deref(), Some("pv"));
+        assert_eq!(json_str(&body, &["downloadToken", "download_token"]).as_deref(), Some("dl"));
     }
 }
