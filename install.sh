@@ -584,6 +584,10 @@ fill_screen         = false
 fps                 = 15
 gallery_mode        = true
 
+[targeting]
+# album = ""
+# favorites_only = false
+
 [cache]
 max_mb         = 256
 prefetch_count = 3
@@ -624,6 +628,10 @@ transition_ms       = 800
 fill_screen         = false
 fps                 = 15
 gallery_mode        = true
+
+[targeting]
+# album = ""
+# favorites_only = false
 
 [cache]
 max_mb         = 256

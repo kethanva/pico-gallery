@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
 use log::{debug, info, warn};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +58,8 @@ enum MenuOutcome {
     NewQueue(Vec<(usize, PhotoMeta)>),
     /// The photo source changed; install the new queue and close the menu.
     Switched(Vec<(usize, PhotoMeta)>),
+    /// Clear the no-repeat-shown memory without rebuilding the queue.
+    ResetShown,
 }
 
 impl Slideshow {
@@ -262,12 +264,23 @@ impl Slideshow {
         // or we just (re)entered it) so an idle grid costs no steady CPU/GPU.
         let mut gallery_dirty = true;
 
+        let no_repeat_shown = self.config.display.no_repeat_shown;
+        let mut shown_ids: HashSet<String> = HashSet::new();
+
         // Pre-warm the prefetch ring (fetch + decode the first N photos).
         let mut cursor = 0usize;
         if !in_gallery {
             for _ in 0..prefetch_n {
-                self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
-                    .await;
+                self.prefetch_one(
+                    &queue,
+                    &mut cursor,
+                    &mut prefetched,
+                    prefetch_n,
+                    renderer,
+                    no_repeat_shown,
+                    &shown_ids,
+                )
+                .await;
             }
         }
 
@@ -588,6 +601,8 @@ impl Slideshow {
                                 &mut prefetched,
                                 prefetch_n,
                                 renderer,
+                                no_repeat_shown,
+                                &shown_ids,
                             )
                             .await;
                         }
@@ -644,6 +659,7 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
+                            shown_ids.clear();
                             if let Some(grid) = gallery.as_mut() {
                                 grid.clear();
                             }
@@ -655,6 +671,7 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
+                            shown_ids.clear();
                             current_meta = None;
                             current_rgba = None;
                             menu.open = false;
@@ -662,8 +679,6 @@ impl Slideshow {
                                 grid.clear();
                             }
                             gallery_dirty = true;
-                            // If we were browsing the grid, stay there with the
-                            // new source; otherwise force an immediate slide.
                             if in_gallery {
                                 gallery_thumb_cursor = 0;
                             } else {
@@ -671,6 +686,10 @@ impl Slideshow {
                                     .checked_sub(slide_dur)
                                     .unwrap_or_else(Instant::now);
                             }
+                        }
+                        MenuOutcome::ResetShown => {
+                            shown_ids.clear();
+                            menu_dirty = true;
                         }
                     },
                 }
@@ -767,8 +786,16 @@ impl Slideshow {
             // a bad photo, etc.) try to refill before the advance path.
             if prefetched.is_empty() && !queue.is_empty() {
                 for _ in 0..prefetch_n {
-                    self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
-                        .await;
+                    self.prefetch_one(
+                        &queue,
+                        &mut cursor,
+                        &mut prefetched,
+                        prefetch_n,
+                        renderer,
+                        no_repeat_shown,
+                        &shown_ids,
+                    )
+                    .await;
                     if !prefetched.is_empty() {
                         break;
                     }
@@ -854,8 +881,16 @@ impl Slideshow {
             }
 
             if last_advance.elapsed() < current_slide_dur {
-                self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
-                    .await;
+                self.prefetch_one(
+                    &queue,
+                    &mut cursor,
+                    &mut prefetched,
+                    prefetch_n,
+                    renderer,
+                    no_repeat_shown,
+                    &shown_ids,
+                )
+                .await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -866,6 +901,16 @@ impl Slideshow {
             // transition itself.
             if let Some((q_idx, meta, mut rgba, exif_date)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
+                if no_repeat_shown {
+                    shown_ids.insert(photo_shown_key(queue[q_idx].0, &meta));
+                    if queue
+                        .iter()
+                        .all(|(pi, m)| shown_ids.contains(&photo_shown_key(*pi, m)))
+                    {
+                        shown_ids.clear();
+                        info!("All photos shown — starting a fresh no-repeat cycle");
+                    }
+                }
                 // Night window: dim + warm-shift the photo once per slide
                 // (single pixel pass — never per frame). Evaluated at *display*
                 // time, not prefetch time, so it tracks the wall clock. Applied
@@ -969,8 +1014,16 @@ impl Slideshow {
             // Top up again straight after the advance so a zero/short slide
             // duration (which never enters the idle branch above) still keeps
             // the buffer fed.
-            self.prefetch_one(&queue, &mut cursor, &mut prefetched, prefetch_n, renderer)
-                .await;
+            self.prefetch_one(
+                &queue,
+                &mut cursor,
+                &mut prefetched,
+                prefetch_n,
+                renderer,
+                no_repeat_shown,
+                &shown_ids,
+            )
+            .await;
         }
     }
 
@@ -1017,24 +1070,43 @@ impl Slideshow {
         prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
         prefetch_n: usize,
         renderer: &Renderer,
+        no_repeat: bool,
+        shown_ids: &HashSet<String>,
     ) {
-        if prefetched.len() >= prefetch_n || *cursor >= queue.len() {
+        if prefetched.len() >= prefetch_n || queue.is_empty() {
             return;
         }
-        let idx = *cursor;
-        let (pidx, meta) = &queue[idx];
-        *cursor += 1;
-        if *cursor >= queue.len() {
-            *cursor = 0;
-        }
+        let start = *cursor;
+        let mut attempts = 0usize;
+        while prefetched.len() < prefetch_n && attempts < queue.len() {
+            let idx = *cursor;
+            let (pidx, meta) = &queue[idx];
+            *cursor += 1;
+            if *cursor >= queue.len() {
+                *cursor = 0;
+            }
+            attempts += 1;
 
-        let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
-            return;
-        };
-        // Decode + scale here, during the idle window, so display is instant.
-        match renderer.decode_and_scale(&bytes) {
-            Ok((rgba, exif_date)) => prefetched.push_back((idx, meta.clone(), rgba, exif_date)),
-            Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+            if no_repeat && shown_ids.contains(&photo_shown_key(*pidx, meta)) {
+                continue;
+            }
+
+            let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
+                if *cursor == start {
+                    break;
+                }
+                continue;
+            };
+            match renderer.decode_and_scale(&bytes) {
+                Ok((rgba, exif_date)) => {
+                    prefetched.push_back((idx, meta.clone(), rgba, exif_date));
+                    return;
+                }
+                Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+            }
+            if *cursor == start {
+                break;
+            }
         }
     }
 
@@ -1109,14 +1181,28 @@ impl Slideshow {
         menu: &Menu,
         sources: &[(String, bool)],
     ) -> Vec<crate::menu::MenuRow> {
+        let targeting = self.targeting_menu_ctx();
         crate::menu::build_rows(&crate::menu::RowsCtx {
             display: &self.config.display,
             paused,
             sources,
             wifi: &self.config.wifi,
             photoprism: self.photoprism_fields(),
+            targeting: targeting.as_ref(),
             editing: menu.editing,
             buffer: &menu.buffer,
+        })
+    }
+
+    /// Targeting section for the menu when PhotoPrism or directory is active.
+    fn targeting_menu_ctx(&self) -> Option<crate::menu::TargetingMenuCtx<'_>> {
+        let entry = self.config.plugins.iter().find(|p| {
+            p.enabled && matches!(p.name.as_str(), "photoprism" | "directory")
+        })?;
+        Some(crate::menu::TargetingMenuCtx {
+            album_label: self.config.targeting.album_label(),
+            favorites_only: self.config.targeting.favorites_only,
+            show_favorites: entry.name == "photoprism",
         })
     }
 
@@ -1241,6 +1327,24 @@ impl Slideshow {
                     }
                 }
             }
+            MenuAction::ToggleNoRepeatShown => {
+                self.config.display.no_repeat_shown = !self.config.display.no_repeat_shown;
+                info!(
+                    "No-repeat-shown {}",
+                    if self.config.display.no_repeat_shown {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                if self.config.display.no_repeat_shown {
+                    MenuOutcome::ResetShown
+                } else {
+                    MenuOutcome::Stay
+                }
+            }
+            MenuAction::CycleAlbum => self.cycle_album_target().await,
+            MenuAction::ToggleFavoritesFilter => self.toggle_favorites_target().await,
             MenuAction::SwitchSource(idx) => self.switch_source(idx, renderer).await,
             // BeginEdit is intercepted by the caller (it needs the loop-local
             // menu state); reaching here means nothing to do.
@@ -1289,6 +1393,111 @@ impl Slideshow {
                 MenuOutcome::Stay
             }
             MenuAction::Exit => MenuOutcome::Quit,
+        }
+    }
+
+    async fn reload_plugins_after_targeting(&mut self) -> Result<()> {
+        for plugin in &mut self.plugins {
+            let pcfg = self
+                .config
+                .plugin_config(plugin.name())
+                .cloned()
+                .unwrap_or_default();
+            plugin.init(&pcfg).await?;
+            plugin.refresh_auth().await?;
+        }
+        Ok(())
+    }
+
+    async fn cycle_album_target(&mut self) -> MenuOutcome {
+        let plugin_name = match self
+            .config
+            .plugins
+            .iter()
+            .find(|p| p.enabled && matches!(p.name.as_str(), "photoprism" | "directory"))
+        {
+            Some(p) => p.name.clone(),
+            None => return MenuOutcome::Stay,
+        };
+        let Some(plugin_idx) = self.plugins.iter().position(|p| p.name() == plugin_name) else {
+            return MenuOutcome::Stay;
+        };
+        let albums = match self.plugins[plugin_idx].list_albums().await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Album list failed: {e}");
+                return MenuOutcome::Stay;
+            }
+        };
+        let mut options: Vec<Option<String>> = vec![None];
+        options.extend(albums.into_iter().map(|(id, _)| Some(id)));
+        let current = if self.config.targeting.album.is_empty() {
+            None
+        } else {
+            Some(self.config.targeting.album.clone())
+        };
+        let pos = options
+            .iter()
+            .position(|o| o.as_ref() == current.as_ref())
+            .unwrap_or(0);
+        let next = options[(pos + 1) % options.len()].clone();
+        self.config.targeting.album = next.unwrap_or_default();
+        self.config.apply_targeting();
+        if let Err(e) = self.reload_plugins_after_targeting().await {
+            warn!("Reload after album change failed: {e}");
+            return MenuOutcome::Stay;
+        }
+        match Self::build_queue_with(&self.plugins, &self.config.display).await {
+            Ok(q) if !q.is_empty() => {
+                info!("Album target: {}", self.config.targeting.album_label());
+                MenuOutcome::NewQueue(q)
+            }
+            Ok(_) => {
+                warn!("Album filter returned no photos");
+                MenuOutcome::Stay
+            }
+            Err(e) => {
+                warn!("Queue rebuild failed: {e}");
+                MenuOutcome::Stay
+            }
+        }
+    }
+
+    async fn toggle_favorites_target(&mut self) -> MenuOutcome {
+        if !self
+            .config
+            .plugins
+            .iter()
+            .any(|p| p.enabled && p.name == "photoprism")
+        {
+            return MenuOutcome::Stay;
+        }
+        self.config.targeting.favorites_only = !self.config.targeting.favorites_only;
+        self.config.apply_targeting();
+        if let Err(e) = self.reload_plugins_after_targeting().await {
+            warn!("Reload after favourites toggle failed: {e}");
+            return MenuOutcome::Stay;
+        }
+        match Self::build_queue_with(&self.plugins, &self.config.display).await {
+            Ok(q) if !q.is_empty() => {
+                info!(
+                    "Favourites-only {}",
+                    if self.config.targeting.favorites_only {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                MenuOutcome::NewQueue(q)
+            }
+            Ok(_) => {
+                warn!("Favourites filter returned no photos");
+                MenuOutcome::Stay
+            }
+            Err(e) => {
+                warn!("Queue rebuild failed: {e}");
+                MenuOutcome::Stay
+            }
         }
     }
 
@@ -1539,6 +1748,10 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
+
+fn photo_shown_key(plugin_idx: usize, meta: &PhotoMeta) -> String {
+    format!("{plugin_idx}:{}", meta.id)
+}
 
 fn shuffle<T>(v: &mut [T], seed: u64) {
     let mut s = seed;

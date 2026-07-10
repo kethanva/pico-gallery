@@ -53,6 +53,18 @@ resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | 
 #
 # gallery_mode = true
 
+# Skip photos already shown until the full queue has been displayed once.
+# no_repeat_shown = false
+
+# ── Album / favourites targeting ──────────────────────────────────────────────
+#
+# Applied to PhotoPrism (album slug/UID, favourites) or directory (sub-folder).
+# Also adjustable from the settings menu (right-click) while running.
+#
+# [targeting]
+# album = "january-2024"
+# favorites_only = false
+
 # ── Memory-safety limits ──────────────────────────────────────────────────────
 #
 # These two limits are checked BEFORE the image is decoded.  When a photo

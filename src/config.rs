@@ -187,6 +187,11 @@ pub struct DisplayConfig {
     /// Defaults to true so Escape/× return to the gallery instead of quitting.
     #[serde(default = "default_true")]
     pub gallery_mode: bool,
+
+    /// When true, skip photos already shown until every photo in the queue has
+    /// been displayed once, then start a fresh cycle.
+    #[serde(default)]
+    pub no_repeat_shown: bool,
 }
 
 impl Default for DisplayConfig {
@@ -215,6 +220,7 @@ impl Default for DisplayConfig {
             night_dim_percent: default_night_dim(),
             night_warmth: default_night_warmth(),
             gallery_mode: true,
+            no_repeat_shown: false,
         }
     }
 }
@@ -459,6 +465,33 @@ pub struct PluginEntry {
     pub config: PluginConfig,
 }
 
+// ── Targeting (album / favourites filters) ───────────────────────────────────
+
+/// Album and favourites filters applied to the active photo source at startup
+/// and when changed from the settings menu. Maps to PhotoPrism `album` /
+/// `favorites` or directory `allowed_albums`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetingConfig {
+    /// PhotoPrism album slug/UID or directory sub-folder name. Empty = all albums.
+    #[serde(default)]
+    pub album: String,
+
+    /// When true, only show favourited photos (PhotoPrism). Ignored by directory.
+    #[serde(default)]
+    pub favorites_only: bool,
+}
+
+impl TargetingConfig {
+    /// Human label for the settings menu.
+    pub fn album_label(&self) -> &str {
+        if self.album.is_empty() {
+            "all albums"
+        } else {
+            self.album.as_str()
+        }
+    }
+}
+
 // ── Root config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -476,6 +509,10 @@ pub struct Config {
     /// Optional Wi-Fi credentials applied to the host OS (Linux/Pi only).
     #[serde(default)]
     pub wifi: WifiConfig,
+
+    /// Album / favourites targeting for the active photo source.
+    #[serde(default)]
+    pub targeting: TargetingConfig,
 
     /// One entry per plugin.  Order determines display order when mixing sources.
     #[serde(default)]
@@ -525,6 +562,92 @@ impl Config {
             .iter()
             .find(|p| p.name == name && p.enabled)
             .map(|p| &p.config)
+    }
+
+    /// Copy `[targeting]` into the enabled PhotoPrism / directory plugin configs.
+    pub fn apply_targeting(&mut self) {
+        for entry in &mut self.plugins {
+            if !entry.enabled {
+                continue;
+            }
+            match entry.name.as_str() {
+                "photoprism" => {
+                    if self.targeting.album.is_empty() {
+                        entry.config.values.remove("album");
+                        entry.config.values.remove("albums");
+                    } else {
+                        entry.config.values.insert(
+                            "album".into(),
+                            serde_json::Value::String(self.targeting.album.clone()),
+                        );
+                        entry.config.values.remove("albums");
+                    }
+                    if self.targeting.favorites_only {
+                        entry
+                            .config
+                            .values
+                            .insert("favorites".into(), serde_json::Value::Bool(true));
+                    } else {
+                        entry.config.values.remove("favorites");
+                    }
+                }
+                "directory" => {
+                    if self.targeting.album.is_empty() {
+                        entry.config.values.remove("allowed_albums");
+                    } else {
+                        entry.config.values.insert(
+                            "allowed_albums".into(),
+                            serde_json::json!([self.targeting.album]),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Read album / favourites filter back from the active targeting-capable plugin.
+    pub fn sync_targeting_from_plugins(&mut self) {
+        let Some(entry) = self
+            .plugins
+            .iter()
+            .find(|p| p.enabled && matches!(p.name.as_str(), "photoprism" | "directory"))
+        else {
+            return;
+        };
+        match entry.name.as_str() {
+            "photoprism" => {
+                if self.targeting.album.is_empty() {
+                    self.targeting.album = entry
+                        .config
+                        .get_str("album")
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if !self.targeting.favorites_only {
+                    self.targeting.favorites_only = entry
+                        .config
+                        .values
+                        .get("favorites")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                }
+            }
+            "directory" => {
+                if self.targeting.album.is_empty() {
+                    self.targeting.album = entry
+                        .config
+                        .values
+                        .get("allowed_albums")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -656,5 +779,41 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.night_active_now());
+    }
+
+    #[test]
+    fn apply_targeting_syncs_photoprism_plugin() {
+        let mut cfg = Config::default();
+        cfg.plugins = vec![PluginEntry {
+            name: "photoprism".into(),
+            enabled: true,
+            config: PluginConfig::default(),
+        }];
+        cfg.targeting.album = "trip-2024".into();
+        cfg.targeting.favorites_only = true;
+        cfg.apply_targeting();
+        let pp = cfg.plugins.iter().find(|p| p.name == "photoprism").unwrap();
+        assert_eq!(pp.config.get_str("album"), Some("trip-2024"));
+        assert_eq!(
+            pp.config.values.get("favorites").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sync_targeting_reads_plugin_when_targeting_empty() {
+        let mut cfg = Config::default();
+        let mut pc = PluginConfig::default();
+        pc.values.insert(
+            "album".into(),
+            serde_json::Value::String("family".into()),
+        );
+        cfg.plugins = vec![PluginEntry {
+            name: "photoprism".into(),
+            enabled: true,
+            config: pc,
+        }];
+        cfg.sync_targeting_from_plugins();
+        assert_eq!(cfg.targeting.album, "family");
     }
 }

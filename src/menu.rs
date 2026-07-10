@@ -6,6 +6,13 @@
 
 use crate::config::{DisplayConfig, PhotoOrder, Transition, WifiConfig};
 
+/// Live album / favourites filter state for menu labels.
+pub struct TargetingMenuCtx<'a> {
+    pub album_label: &'a str,
+    pub favorites_only: bool,
+    pub show_favorites: bool,
+}
+
 /// A free-text field the menu can edit via the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
@@ -51,6 +58,9 @@ pub enum MenuAction {
     TogglePause,
     CycleTransition,
     CycleOrder,
+    ToggleNoRepeatShown,
+    CycleAlbum,
+    ToggleFavoritesFilter,
     ToggleFillScreen,
     ToggleLetterboxBlur,
     ToggleOsd,
@@ -163,6 +173,8 @@ pub struct RowsCtx<'a> {
     /// `None` hides the PhotoPrism rows. The password itself is never passed —
     /// only whether one is set.
     pub photoprism: Option<(&'a str, &'a str, bool)>,
+    /// Album / favourites targeting for the active PhotoPrism or directory source.
+    pub targeting: Option<&'a TargetingMenuCtx<'a>>,
     /// The field currently being edited (its row shows the live buffer).
     pub editing: Option<EditField>,
     /// Live keystroke buffer for the editing field.
@@ -196,6 +208,24 @@ pub fn build_rows(ctx: &RowsCtx) -> Vec<MenuRow> {
         format!("Order: {}", order_name(&d.order)),
         MenuAction::CycleOrder,
     ));
+    rows.push(MenuRow::new(
+        format!("No repeat shown: {}", on(d.no_repeat_shown)),
+        MenuAction::ToggleNoRepeatShown,
+    ));
+
+    if let Some(t) = ctx.targeting {
+        rows.push(MenuRow::header("TARGETING"));
+        rows.push(MenuRow::new(
+            format!("Album: {}", t.album_label),
+            MenuAction::CycleAlbum,
+        ));
+        if t.show_favorites {
+            rows.push(MenuRow::new(
+                format!("Favourites only: {}", on(t.favorites_only)),
+                MenuAction::ToggleFavoritesFilter,
+            ));
+        }
+    }
 
     // ── Display ──────────────────────────────────────────────────────────────
     rows.push(MenuRow::header("DISPLAY"));
@@ -339,6 +369,7 @@ mod tests {
             sources,
             wifi,
             photoprism: None,
+            targeting: None,
             editing: None,
             buffer: "",
         }
