@@ -1024,8 +1024,18 @@ impl Renderer {
                             Keycode::Right => {
                                 out.push(SlideshowCmd::GalleryMoveSelection { dx: 1, dy: 0 })
                             }
-                            Keycode::Up => out.push(SlideshowCmd::GalleryPage(-1)),
-                            Keycode::Down => out.push(SlideshowCmd::GalleryPage(1)),
+                            // Up/Down move the selection one row at a time (not a
+                            // full page) — GalleryMoveSelection's "blocked" signal
+                            // already handles reaching the last loaded row by
+                            // fetching more photos and retrying the move, and
+                            // ensure_selected_visible scrolls just enough to keep
+                            // the new selection on screen.
+                            Keycode::Up => {
+                                out.push(SlideshowCmd::GalleryMoveSelection { dx: 0, dy: -1 })
+                            }
+                            Keycode::Down => {
+                                out.push(SlideshowCmd::GalleryMoveSelection { dx: 0, dy: 1 })
+                            }
                             Keycode::Return | Keycode::KpEnter | Keycode::Space => {
                                 out.push(SlideshowCmd::GalleryOpenSelected)
                             }
@@ -1452,9 +1462,13 @@ pub enum SlideshowCmd {
     },
     /// Scroll the gallery grid (positive = up). Legacy — prefer GalleryPage.
     GalleryScroll(i32),
-    /// Scroll the gallery by one full page (-1 = up, 1 = down).
+    /// Scroll the gallery by one full page (-1 = up, 1 = down). Wheel only —
+    /// Up/Down keys move the selection one row at a time (`GalleryMoveSelection`).
     GalleryPage(i32),
-    /// Move the gallery selection highlight.
+    /// Move the gallery selection by grid cells (dx = column, dy = row).
+    /// Used for arrow keys: one photo at a time, not a full page. When the
+    /// move is blocked at the last loaded photo, the handler fetches more
+    /// and retries so navigation can continue past what's currently loaded.
     GalleryMoveSelection {
         dx: i32,
         dy: i32,
