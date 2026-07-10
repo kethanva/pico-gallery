@@ -266,6 +266,8 @@ impl Slideshow {
 
         let no_repeat_shown = self.config.display.no_repeat_shown;
         let mut shown_ids: HashSet<String> = HashSet::new();
+        // First frame after opening from the grid uses Cut (no fade from grid).
+        let mut open_cut_once = false;
 
         // Pre-warm the prefetch ring (fetch + decode the first N photos).
         let mut cursor = 0usize;
@@ -524,6 +526,13 @@ impl Slideshow {
                             current_rgba = None;
                             current_meta = None;
                             gallery_thumb_cursor = 0;
+                            if let Some(grid) = gallery.as_mut() {
+                                grid.set_selected(current_queue_idx, queue.len());
+                                grid.ensure_selected_visible(
+                                    renderer.height(),
+                                    queue.len(),
+                                );
+                            }
                             gallery_dirty = true;
                             info!("Returned to gallery grid.");
                         }
@@ -535,10 +544,32 @@ impl Slideshow {
                     }
                     SlideshowCmd::GalleryClick { x, y } => {
                         if gallery_mode && in_gallery {
-                            if let Some(grid) = gallery.as_ref() {
+                            if let Some(grid) = gallery.as_mut() {
                                 if let Some(idx) = grid.index_at(x, y, queue.len()) {
+                                    grid.set_selected(idx, queue.len());
                                     pending_open = Some(idx);
                                 }
+                            }
+                        }
+                    }
+                    SlideshowCmd::GalleryPage(dir) => {
+                        if in_gallery {
+                            if let Some(grid) = gallery.as_mut() {
+                                if grid.scroll_page(dir, queue.len(), renderer.height()) {
+                                    gallery_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    SlideshowCmd::GalleryMoveSelection { dx, dy } => {
+                        if in_gallery {
+                            if let Some(grid) = gallery.as_mut() {
+                                grid.move_selection(dx, dy, queue.len());
+                                grid.ensure_selected_visible(
+                                    renderer.height(),
+                                    queue.len(),
+                                );
+                                gallery_dirty = true;
                             }
                         }
                     }
@@ -553,17 +584,23 @@ impl Slideshow {
                             }
                         }
                     }
+                    SlideshowCmd::GalleryOpenSelected => {
+                        if gallery_mode && in_gallery && !queue.is_empty() {
+                            let idx = gallery
+                                .as_ref()
+                                .map(|g| g.selected)
+                                .unwrap_or(0)
+                                .min(queue.len() - 1);
+                            pending_open = Some(idx);
+                        }
+                    }
                     SlideshowCmd::GalleryOpenVisible => {
                         if gallery_mode && in_gallery && !queue.is_empty() {
                             let idx = gallery
                                 .as_ref()
-                                .map(|g| {
-                                    g.visible_indices(renderer.height(), queue.len())
-                                        .into_iter()
-                                        .next()
-                                        .unwrap_or(0)
-                                })
-                                .unwrap_or(0);
+                                .map(|g| g.selected)
+                                .unwrap_or(0)
+                                .min(queue.len() - 1);
                             pending_open = Some(idx);
                         }
                     }
@@ -593,6 +630,7 @@ impl Slideshow {
                         paused = false;
                         current_queue_idx = idx;
                         cursor = (idx + 1) % queue.len();
+                        open_cut_once = true;
                         // Top up the rest of the ring from the following photos.
                         for _ in 0..prefetch_n.saturating_sub(1) {
                             self.prefetch_one(
@@ -740,6 +778,20 @@ impl Slideshow {
             if in_gallery {
                 if let Some(grid) = gallery.as_mut() {
                     grid.clamp_scroll(queue.len(), renderer.height());
+                    let sel = grid.selected.min(queue.len().saturating_sub(1));
+                    // Always load the selected thumb first so it is visible.
+                    if !queue.is_empty() && grid.thumb(sel).is_none() {
+                        let (pidx, meta) = &queue[sel];
+                        let thumb_px = grid.cell;
+                        if let Some(bytes) =
+                            self.fetch_photo_thumb(*pidx, meta, thumb_px, renderer).await
+                        {
+                            if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
+                                grid.insert_thumb(sel, img);
+                                gallery_dirty = true;
+                            }
+                        }
+                    }
                     // Load missing thumbs for visible cells (batched per tick).
                     let visible = grid.visible_indices(renderer.height(), queue.len());
                     if !visible.is_empty() {
@@ -968,7 +1020,13 @@ impl Slideshow {
                     let now = chrono::Local::now().format("%H:%M").to_string();
                     crate::osd::draw_clock(&mut frame, &now);
                 }
-                let result = match self.config.display.transition {
+                let transition = if open_cut_once {
+                    open_cut_once = false;
+                    Transition::Cut
+                } else {
+                    self.config.display.transition.clone()
+                };
+                let result = match transition {
                     Transition::Cut => renderer.show_cut(&frame),
                     Transition::Fade => {
                         renderer

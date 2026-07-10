@@ -15,6 +15,8 @@ pub struct GalleryGrid {
     pub scroll_y: i32,
     pub cols: u32,
     pub cell: u32,
+    /// Keyboard / click selection — opened with Enter or double-tap click.
+    pub selected: usize,
     thumbs: HashMap<usize, RgbaImage>,
 }
 
@@ -26,6 +28,7 @@ impl GalleryGrid {
             scroll_y: 0,
             cols,
             cell,
+            selected: 0,
             thumbs: HashMap::new(),
         }
     }
@@ -116,6 +119,75 @@ impl GalleryGrid {
     pub fn clear(&mut self) {
         self.thumbs.clear();
         self.scroll_y = 0;
+        self.selected = 0;
+    }
+
+    pub fn set_selected(&mut self, index: usize, count: usize) {
+        if count > 0 {
+            self.selected = index.min(count - 1);
+        }
+    }
+
+    /// Move the selection by grid cells (dx = column, dy = row).
+    pub fn move_selection(&mut self, dx: i32, dy: i32, count: usize) {
+        if count == 0 || self.cols == 0 {
+            return;
+        }
+        let cols = self.cols as i32;
+        let row = (self.selected as i32 / cols) + dy;
+        let col = (self.selected as i32 % cols) + dx;
+        let row = row.max(0);
+        let col = col.clamp(0, cols - 1);
+        let idx = row as usize * self.cols as usize + col as usize;
+        self.selected = idx.min(count - 1);
+    }
+
+    /// Scroll the minimum amount to bring the selected cell into the viewport.
+    pub fn ensure_selected_visible(&mut self, screen_h: u32, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let (_, y) = self.cell_origin(self.selected);
+        let bottom = y + self.cell as i32;
+        let top = HEADER_H as i32;
+        if y < top {
+            self.scroll_y += y - top;
+        } else if bottom > screen_h as i32 {
+            self.scroll_y += bottom - screen_h as i32;
+        }
+        self.clamp_scroll(count, screen_h);
+    }
+
+    /// Full rows visible below the header — one "page" of the grid.
+    pub fn rows_per_page(&self, screen_h: u32) -> i32 {
+        let body = screen_h.saturating_sub(HEADER_H);
+        let pitch = self.cell + GAP;
+        ((body / pitch).max(1)) as i32
+    }
+
+    /// Scroll by one page (`direction` 1 = next/down, -1 = previous/up).
+    pub fn scroll_page(&mut self, direction: i32, count: usize, screen_h: u32) -> bool {
+        if count == 0 || direction == 0 {
+            return false;
+        }
+        let before = self.scroll_y;
+        let pitch = (self.cell + GAP) as i32;
+        self.scroll_y += direction.signum() * self.rows_per_page(screen_h) * pitch;
+        self.clamp_scroll(count, screen_h);
+        if self.scroll_y == before {
+            return false;
+        }
+        let visible = self.visible_indices(screen_h, count);
+        if !visible.contains(&self.selected) {
+            if direction > 0 {
+                if let Some(&last) = visible.last() {
+                    self.selected = last;
+                }
+            } else if let Some(&first) = visible.first() {
+                self.selected = first;
+            }
+        }
+        true
     }
 
     pub fn scroll_by(&mut self, delta_y: i32, count: usize, screen_h: u32) {
@@ -156,19 +228,48 @@ impl GalleryGrid {
             if draw_h == 0 {
                 continue;
             }
-            fill_rect(
-                &mut frame,
-                x,
-                dst_y,
-                self.cell,
-                draw_h,
-                Rgba([28, 28, 28, 255]),
-            );
+            let bg = if i == self.selected {
+                Rgba([36, 48, 72, 255])
+            } else {
+                Rgba([28, 28, 28, 255])
+            };
+            fill_rect(&mut frame, x, dst_y, self.cell, draw_h, bg);
             if let Some(thumb) = self.thumb(i) {
                 blit_thumb_clipped(&mut frame, thumb, x, dst_y, self.cell, draw_h, src_y0);
             }
+            if i == self.selected {
+                draw_selection_ring(&mut frame, x, dst_y, self.cell, draw_h);
+            }
         }
         frame
+    }
+}
+
+const SEL_BORDER: u32 = 3;
+const SEL_COLOR: Rgba<u8> = Rgba([100, 180, 255, 255]);
+
+/// Highlight ring around the selected thumbnail.
+fn draw_selection_ring(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
+    let (iw, ih) = img.dimensions();
+    let right = (x + w).min(iw);
+    let bottom = (y + h).min(ih);
+    for t in 0..SEL_BORDER {
+        for px in x..right {
+            if y + t < ih {
+                img.put_pixel(px, y + t, SEL_COLOR);
+            }
+            if bottom > t {
+                img.put_pixel(px, bottom - 1 - t, SEL_COLOR);
+            }
+        }
+        for py in y..bottom {
+            if x + t < iw {
+                img.put_pixel(x + t, py, SEL_COLOR);
+            }
+            if right > t {
+                img.put_pixel(right - 1 - t, py, SEL_COLOR);
+            }
+        }
     }
 }
 
@@ -299,5 +400,27 @@ mod tests {
         assert!(g.scroll_y >= 0);
         g.scroll_by(10_000, 3, 300);
         assert_eq!(g.scroll_y, 0);
+    }
+
+    #[test]
+    fn scroll_page_moves_by_full_rows() {
+        let mut g = GalleryGrid::new(400);
+        let count = 40;
+        let h = 300;
+        let before = g.scroll_y;
+        assert!(g.scroll_page(1, count, h));
+        assert!(g.scroll_y > before);
+        let page = g.rows_per_page(h) * (g.cell + GAP) as i32;
+        assert_eq!(g.scroll_y - before, page);
+    }
+
+    #[test]
+    fn move_selection_wraps_columns() {
+        let mut g = GalleryGrid::new(800);
+        g.set_selected(0, 20);
+        g.move_selection(1, 0, 20);
+        assert_eq!(g.selected, 1);
+        g.move_selection(0, 1, 20);
+        assert_eq!(g.selected, 1 + g.cols as usize);
     }
 }
