@@ -482,6 +482,43 @@ mod tests {
     }
 
     #[test]
+    fn move_selection_blocked_moving_down_from_last_item() {
+        // The Down arrow key (one row at a time, not a full page) must also
+        // report "blocked" at the true last photo, same as Right — this is
+        // the signal that triggers fetching more photos.
+        let mut g = GalleryGrid::new(800);
+        g.set_selected(9, 10);
+        assert!(g.move_selection(0, 1, 10));
+        assert_eq!(g.selected, 9); // stays put; caller retries after loading more
+    }
+
+    #[test]
+    fn move_selection_up_from_first_row_does_not_trigger_extend() {
+        // Moving Up when already at the top must never report "blocked" —
+        // there's nothing to load by going backwards.
+        let mut g = GalleryGrid::new(800);
+        g.set_selected(0, 100);
+        assert!(!g.move_selection(0, -1, 100));
+        assert_eq!(g.selected, 0);
+    }
+
+    #[test]
+    fn ensure_selected_visible_scrolls_by_one_row_when_moving_down() {
+        // Moving the selection down one row at a time should bring it into
+        // view with the minimum scroll needed — not jump by a full page.
+        let mut g = GalleryGrid::new(400);
+        let count = g.cols as usize * 20;
+        let h = 300;
+        let rows_visible = g.rows_per_page(h) as usize;
+        // Land the selection just below the current viewport.
+        g.set_selected((rows_visible + 1) * g.cols as usize, count);
+        g.ensure_selected_visible(h, count);
+        let (_, y) = g.cell_origin(g.selected);
+        assert!(y >= HEADER_H as i32);
+        assert!(y + g.cell as i32 <= h as i32);
+    }
+
+    #[test]
     fn at_scroll_bottom_when_fully_scrolled() {
         let mut g = GalleryGrid::new(400);
         let count = 40;
