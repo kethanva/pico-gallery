@@ -43,8 +43,8 @@ section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 # The PICOGALLERY_* env vars (see header) still work; these flags override them
-# and add one-shot PhotoPrism provisioning, so a single command installs and
-# points the frame at a server:
+# and add one-shot PhotoPrism provisioning. With the default download mode the
+# pre-built release binary is installed — no on-device Rust compile:
 #
 #   sudo ./install.sh --mode all -y \
 #     --photoprism-url http://192.168.68.71:2342 \
@@ -55,6 +55,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE_FLAG=""            # download | build | all
 ASSUME_YES=0
 USER_FLAG=""
+VERSION_FLAG=""
 PP_URL=""
 PP_USER=""
 PP_PASS=""
@@ -75,11 +76,15 @@ Options:
   --photoprism-user <name>       PhotoPrism username (default: admin).
   --photoprism-pass <pass>       PhotoPrism password.
   --photoprism-app-password <p>  PhotoPrism app password (alternative to --photoprism-pass).
+  --version <tag>                pin a GitHub release tag (e.g. v0.1.3 or v0.1.3-kva.1).
   -y, --yes                      non-interactive; assume yes.
   -h, --help                     show this help and exit.
 
 Env vars (PICOGALLERY_VERSION / _BUILD / _FEATURES / _PROFILE / _RESET_CONFIG)
 still apply; explicit flags win.
+
+PhotoPrism provisioning (--photoprism-url) writes config only. With --mode download
+(the default) the pre-built release binary is used — no on-device Rust compile.
 USAGE
 }
 
@@ -97,6 +102,8 @@ while [[ $# -gt 0 ]]; do
     --photoprism-pass=*)          PP_PASS="${1#*=}"; shift ;;
     --photoprism-app-password)    PP_APP_PASS="${2:-}"; shift 2 ;;
     --photoprism-app-password=*)  PP_APP_PASS="${1#*=}"; shift ;;
+    --version)                    VERSION_FLAG="${2:-}"; shift 2 ;;
+    --version=*)                  VERSION_FLAG="${1#*=}"; shift ;;
     -y|--yes)                     ASSUME_YES=1; shift ;;
     -h|--help)                    print_usage; exit 0 ;;
     *) die "Unknown option: $1  (run with --help)" ;;
@@ -112,10 +119,13 @@ case "$MODE_FLAG" in
   *) die "Invalid --mode '$MODE_FLAG'  (want: download | build | all)" ;;
 esac
 
-# PhotoPrism provisioning needs the plugin compiled in — force a source build.
-if [[ -n "$PP_URL" ]]; then
-  INSTALL_MODE="build"
+# Pin a release tag from the CLI flag.
+if [[ -n "$VERSION_FLAG" ]]; then
+  PICOGALLERY_VERSION="$VERSION_FLAG"
 fi
+
+# Pre-built GitHub releases include plugin-photoprism, so --photoprism-url only
+# provisions config when --mode download (default). Use --mode build|all to compile.
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 

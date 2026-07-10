@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
 # ============================================================
-# PicoGallery — deploy / update from source (PhotoPrism mode)
+# PicoGallery — deploy pre-built release (PhotoPrism mode)
 # ============================================================
-# Pulls a branch, builds from the local checkout, provisions the PhotoPrism
-# plugin, clears caches, and restarts the slideshow service.
+# Downloads a GitHub Release binary (no Rust compile on the Pi), provisions
+# the PhotoPrism plugin config, clears caches, and restarts the service.
 #
-# First-time setup on the Pi (clone + deploy):
-#   sudo git clone --branch kva-revamparchitecture --single-branch \
-#     https://github.com/kethanva/pico-gallery.git /opt/picogallery
-#   sudo bash /opt/picogallery/deploy.sh
+# First deploy on the Pi:
+#   sudo PICOGALLERY_VERSION=v0.1.3-kva.1 bash deploy.sh
 #
-# Re-deploy after pushing changes:
-#   sudo bash /opt/picogallery/deploy.sh
+# Re-deploy after a new release is published:
+#   sudo PICOGALLERY_VERSION=v0.1.3-kva.2 bash deploy.sh
 #
 # Override settings inline:
-#   sudo PHOTOPRISM_PASS='s3cret' KIOSK_USER=pi bash deploy.sh
+#   sudo PICOGALLERY_VERSION=v0.1.3-kva.1 PHOTOPRISM_PASS='s3cret' bash deploy.sh
 #
-# Copy-paste one-liner (matches the pico-gallery-photoprism deploy flow):
+# Copy-paste one-liner (no on-device build):
 #
 #   sudo bash -c '
 #   set -euo pipefail
-#   REPO=/opt/picogallery
+#   VERSION=v0.1.3-kva.1
 #   BRANCH=kva-revamparchitecture
 #   KIOSK=picokiosk
 #   systemctl stop picogallery 2>/dev/null || true
-#   #rm -rf "$REPO"
-#   #git clone --branch "$BRANCH" --single-branch https://github.com/kethanva/pico-gallery.git "$REPO"
-#   cd "$REPO"
+#   curl -fsSL -o /tmp/picogallery-install.sh \
+#     https://raw.githubusercontent.com/kethanva/pico-gallery/${BRANCH}/install.sh
+#   chmod +x /tmp/picogallery-install.sh
 #   rm -f "/home/${KIOSK}/.config/picogallery/config.toml"
-#   git checkout "$BRANCH"
-#   git pull
-#   ./install.sh --mode all -y --user "$KIOSK" \
+#   PICOGALLERY_VERSION="$VERSION" /tmp/picogallery-install.sh --mode download -y --user "$KIOSK" \
 #     --photoprism-url http://192.168.68.71:2342 \
 #     --photoprism-user admin \
 #     --photoprism-pass Password
@@ -41,13 +37,14 @@
 
 set -euo pipefail
 
-BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RESET='\033[0m'
+BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; RESET='\033[0m'
 info() { echo -e "${GREEN}[+]${RESET} $*"; }
 warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
+die()  { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
 
 # ── Settings (edit or override via env) ──────────────────────────────────────
-REPO_DIR="${REPO_DIR:-/opt/picogallery}"
-REPO_URL="${REPO_URL:-https://github.com/kethanva/pico-gallery.git}"
+REPO_SLUG="${REPO_SLUG:-kethanva/pico-gallery}"
+REPO_URL="${REPO_URL:-https://github.com/${REPO_SLUG}.git}"
 BRANCH="${BRANCH:-kva-revamparchitecture}"
 KIOSK_USER="${KIOSK_USER:-picokiosk}"
 
@@ -55,13 +52,17 @@ PHOTOPRISM_URL="${PHOTOPRISM_URL:-http://192.168.68.71:2342}"
 PHOTOPRISM_USER="${PHOTOPRISM_USER:-admin}"
 PHOTOPRISM_PASS="${PHOTOPRISM_PASS:-Password}"
 
-# Drop stale config / user caches before install (set to 0 to keep them).
+# Required: GitHub release tag with pre-built ARM binaries for this branch.
+PICOGALLERY_VERSION="${PICOGALLERY_VERSION:-}"
+
 RESET_CONFIG="${RESET_CONFIG:-1}"
 CLEAR_USER_CACHE="${CLEAR_USER_CACHE:-1}"
+INSTALL_SCRIPT="${INSTALL_SCRIPT:-/tmp/picogallery-install.sh}"
 
 # ── Pre-flight ───────────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] || { echo "Run as root:  sudo bash deploy.sh" >&2; exit 1; }
-id "$KIOSK_USER" &>/dev/null || { echo "User '$KIOSK_USER' does not exist (set KIOSK_USER)." >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "Run as root:  sudo bash deploy.sh"
+id "$KIOSK_USER" &>/dev/null || die "User '$KIOSK_USER' does not exist (set KIOSK_USER)."
+[[ -n "$PICOGALLERY_VERSION" ]] || die "Set PICOGALLERY_VERSION to a GitHub release tag (e.g. v0.1.3-kva.1). Run ./release.sh --prerelease on your dev machine first."
 
 CONFIG_FILE="/home/${KIOSK_USER}/.config/picogallery/config.toml"
 
@@ -69,35 +70,28 @@ CONFIG_FILE="/home/${KIOSK_USER}/.config/picogallery/config.toml"
 info "Stopping picogallery service"
 systemctl stop picogallery 2>/dev/null || true
 
-# ── Fetch the branch (clone on first run, pull on subsequent deploys) ────────
-if [[ -d "$REPO_DIR/.git" ]]; then
-  info "Updating $REPO_DIR (branch $BRANCH)"
-  git -C "$REPO_DIR" fetch origin
-  git -C "$REPO_DIR" checkout "$BRANCH"
-  git -C "$REPO_DIR" pull origin "$BRANCH"
-else
-  warn "No git checkout at $REPO_DIR — cloning"
-  rm -rf "$REPO_DIR"
-  git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$REPO_DIR"
-fi
+# ── Fetch install.sh from the branch (lightweight — no full repo clone) ──────
+info "Fetching install.sh from ${REPO_SLUG}@${BRANCH}"
+curl -fsSL -o "$INSTALL_SCRIPT" \
+  "https://raw.githubusercontent.com/${REPO_SLUG}/${BRANCH}/install.sh"
+chmod +x "$INSTALL_SCRIPT"
 
-# ── Fresh config (install.sh also rewrites when PhotoPrism flags are passed) ─
+# ── Fresh config ─────────────────────────────────────────────────────────────
 if [[ "$RESET_CONFIG" == "1" && -f "$CONFIG_FILE" ]]; then
   info "Removing $CONFIG_FILE"
   rm -f "$CONFIG_FILE"
 fi
 
-# ── Build + install + provision PhotoPrism ───────────────────────────────────
-cd "$REPO_DIR"
-chmod +x install.sh uninstall.sh
-info "Running install.sh (source build + PhotoPrism provisioning)"
-./install.sh --mode all -y \
+# ── Install pre-built binary + provision PhotoPrism (no compile on Pi) ───────
+info "Installing release $PICOGALLERY_VERSION (download mode — no local build)"
+PICOGALLERY_VERSION="$PICOGALLERY_VERSION" "$INSTALL_SCRIPT" --mode download -y \
   --user "$KIOSK_USER" \
+  --version "$PICOGALLERY_VERSION" \
   --photoprism-url  "$PHOTOPRISM_URL" \
   --photoprism-user "$PHOTOPRISM_USER" \
   --photoprism-pass "$PHOTOPRISM_PASS"
 
-# ── Clear regenerable caches so refreshed tokens / thumbnails take effect ────
+# ── Clear regenerable caches ─────────────────────────────────────────────────
 if [[ "$CLEAR_USER_CACHE" == "1" ]]; then
   info "Clearing $KIOSK_USER caches"
   rm -rf "/home/${KIOSK_USER}/.cache" "/home/${KIOSK_USER}/.local"
@@ -110,5 +104,5 @@ sleep 1
 systemctl --no-pager status picogallery | head -n 12
 
 echo
-echo -e "${BOLD}Deployed${RESET} branch '$BRANCH' → PhotoPrism $PHOTOPRISM_URL (user: $PHOTOPRISM_USER)"
+echo -e "${BOLD}Deployed${RESET} $PICOGALLERY_VERSION → PhotoPrism $PHOTOPRISM_URL (user: $PHOTOPRISM_USER)"
 echo "Logs:  journalctl -u picogallery -f"
