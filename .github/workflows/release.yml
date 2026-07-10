@@ -2,9 +2,10 @@
 # PicoGallery — Build & Release for Raspberry Pi
 # ============================================================
 # Triggers:
-#   - Push a tag like v0.1.0  → full release with GitHub Release
-#   - Push to main            → build-only (artifact upload, no release)
-#   - Manual dispatch         → build any branch; optionally create a release
+#   - Push to kva-revamparchitecture → auto pre-release (vX.Y.Z-kva.N++)
+#   - Push a stable tag like v0.1.0   → full release with GitHub Release
+#   - Push to main                    → build-only (artifact upload, no release)
+#   - Manual dispatch                 → build any branch; optionally create a release
 #
 # Cross-compilation uses `cross` with per-target Docker images (see Cross.toml).
 #
@@ -21,6 +22,7 @@ on:
       - "v*"
     branches:
       - main
+      - kva-revamparchitecture
   workflow_dispatch:
     inputs:
       branch:
@@ -43,12 +45,87 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    # kva pre-releases are published from branch pushes; skip duplicate tag-triggered runs.
+    if: >-
+      github.ref_type != 'tag' ||
+      !contains(github.ref_name, '-kva.')
+    outputs:
+      label: ${{ steps.ver.outputs.label }}
+      release_tag: ${{ steps.ver.outputs.release_tag }}
+      create_release: ${{ steps.ver.outputs.create_release }}
+      is_prerelease: ${{ steps.ver.outputs.is_prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref }}
+
+      - name: Resolve version label
+        id: ver
+        run: |
+          CREATE=false
+          PRERELEASE=false
+          RELEASE_TAG=""
+          LABEL=""
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+              RELEASE_TAG="${{ github.event.inputs.tag }}"
+              LABEL="${RELEASE_TAG#v}"
+              CREATE=true
+              [[ "$RELEASE_TAG" == *-* ]] && PRERELEASE=true
+            else
+              SHORT_SHA="${GITHUB_SHA::7}"
+              LABEL="${{ github.event.inputs.branch }}-${SHORT_SHA}"
+            fi
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            LABEL="${GITHUB_REF_NAME#v}"
+            CREATE=true
+            [[ "$RELEASE_TAG" == *-* ]] && PRERELEASE=true
+          elif [[ "${{ github.ref_name }}" == "kva-revamparchitecture" ]]; then
+            BASE=$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            MAX=0
+            for t in $(git tag -l "v${BASE}-kva.*"); do
+              n="${t##*-kva.}"
+              if [[ "$n" =~ ^[0-9]+$ ]] && (( n > MAX )); then
+                MAX=$n
+              fi
+            done
+            NEXT=$((MAX + 1))
+            RELEASE_TAG="v${BASE}-kva.${NEXT}"
+            LABEL="${BASE}-kva.${NEXT}"
+            CREATE=true
+            PRERELEASE=true
+            echo "Auto pre-release for kva-revamparchitecture → ${RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            SHORT_SHA="${GITHUB_SHA::7}"
+            LABEL="${GITHUB_REF_NAME}-${SHORT_SHA}"
+          fi
+
+          echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "create_release=${CREATE}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare
+    if: >-
+      github.ref_type != 'tag' ||
+      !contains(github.ref_name, '-kva.')
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -69,19 +146,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref }}
-
-      - name: Resolve version label
-        id: ver
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
-            echo "label=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "label=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            SHORT_SHA="${GITHUB_SHA::7}"
-            BRANCH="${GITHUB_REF_NAME}"
-            echo "label=${BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -118,7 +182,7 @@ jobs:
       - name: Prepare artifact
         run: |
           BINARY="target/${{ matrix.target }}/release/picogallery"
-          VERSION="${{ steps.ver.outputs.label }}"
+          VERSION="${{ needs.prepare.outputs.label }}"
 
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu binutils-arm-linux-gnueabihf
@@ -162,25 +226,16 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [prepare, build]
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.event.inputs.create_release == 'true' &&
-       github.event.inputs.tag != '')
+      needs.prepare.outputs.create_release == 'true' && (
+        github.ref_type != 'tag' ||
+        !contains(github.ref_name, '-kva.')
+      )
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -201,11 +256,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
-          prerelease: >-
-            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease ||
-                contains(steps.tag.outputs.name, '-') }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.release_tag }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           files: release-files/*
           body: |
@@ -214,9 +268,9 @@ jobs:
             Download the pre-built binary for your Pi architecture, or install with:
 
             ```bash
-            PICOGALLERY_VERSION=${{ steps.tag.outputs.name }} \
+            PICOGALLERY_VERSION=${{ needs.prepare.outputs.release_tag }} \
               curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/kva-revamparchitecture/install.sh | sudo bash -s -- \
-              --mode download -y --version ${{ steps.tag.outputs.name }} \
+              --mode download -y --version ${{ needs.prepare.outputs.release_tag }} \
               --photoprism-url http://YOUR_PHOTOPRISM:2342 \
               --photoprism-user admin \
               --photoprism-pass YOUR_PASSWORD
@@ -225,7 +279,7 @@ jobs:
             Or use `deploy.sh` from the repo (also download-only):
 
             ```bash
-            sudo PICOGALLERY_VERSION=${{ steps.tag.outputs.name }} bash deploy.sh
+            sudo PICOGALLERY_VERSION=${{ needs.prepare.outputs.release_tag }} bash deploy.sh
             ```
 
             ### Supported Platforms
