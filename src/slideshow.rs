@@ -22,6 +22,8 @@ use crate::renderer::{Renderer, SlideshowCmd};
 use tokio::sync::mpsc::Receiver;
 
 const PAGE_SIZE: usize = 50; // photos fetched per API page
+/// Thumbnails decoded per gallery tick — balances Pi Zero CPU with fast fill.
+const GALLERY_THUMBS_PER_TICK: usize = 4;
 
 /// Settings-menu title. Used both to render the panel and to compute its
 /// geometry for click/hover hit-testing, so the two must use the same string.
@@ -719,13 +721,15 @@ impl Slideshow {
             if in_gallery {
                 if let Some(grid) = gallery.as_mut() {
                     grid.clamp_scroll(queue.len(), renderer.height());
-                    // Load one missing thumb per tick for a visible cell so the
-                    // Pi Zero stays responsive while scrolling; a newly-loaded
-                    // thumb marks the grid dirty so it repaints once.
+                    // Load missing thumbs for visible cells (batched per tick).
                     let visible = grid.visible_indices(renderer.height(), queue.len());
                     if !visible.is_empty() {
                         let start = gallery_thumb_cursor % visible.len();
+                        let mut loaded = 0usize;
                         for offset in 0..visible.len() {
+                            if loaded >= GALLERY_THUMBS_PER_TICK {
+                                break;
+                            }
                             let pick = visible[(start + offset) % visible.len()];
                             if grid.thumb(pick).is_some() {
                                 continue;
@@ -739,9 +743,9 @@ impl Slideshow {
                                 if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
                                     grid.insert_thumb(pick, img);
                                     gallery_dirty = true;
+                                    loaded += 1;
                                 }
                             }
-                            break;
                         }
                     }
                     // Only repaint when something changed — an idle, fully
