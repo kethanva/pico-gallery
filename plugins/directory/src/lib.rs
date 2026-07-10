@@ -296,7 +296,8 @@ impl PhotoPlugin for DirectoryPlugin {
         "0.1.0"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self.cfg = config.clone();
         // Resolve and validate the root path. Expand a leading `~` to $HOME
         // so that configs written on one user's system still work for another.
         let path_str = self
@@ -350,7 +351,28 @@ impl PhotoPlugin for DirectoryPlugin {
         Ok(AuthStatus::Authenticated)
     }
     async fn refresh_auth(&mut self) -> Result<()> {
+        let photos = self.build_photo_list().await;
+        *self.photos.write().await = photos;
         Ok(())
+    }
+
+    async fn list_albums(&self) -> Result<Vec<(String, String)>> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut rd = fs::read_dir(root).await?;
+        let mut albums = Vec::new();
+        while let Some(entry) = rd.next_entry().await? {
+            let ft = entry.file_type().await?;
+            if ft.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with('.') {
+                    albums.push((name.clone(), name));
+                }
+            }
+        }
+        albums.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(albums)
     }
 
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {

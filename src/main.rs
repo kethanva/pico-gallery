@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
     // ── Normal startup ────────────────────────────────────────────────────────
     info!("Loading config from {}", config_path.display());
 
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         Config::from_file(&config_path)?
     } else {
         // No config found — write a default and exit with instructions.
@@ -161,6 +161,9 @@ async fn main() -> Result<()> {
         // (no cache, no SDL, no plugin state) — a plain exit is fine here.
         std::process::exit(1);
     };
+
+    config.sync_targeting_from_plugins();
+    config.apply_targeting();
 
     config.ensure_dirs()?;
 

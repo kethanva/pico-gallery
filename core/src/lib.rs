@@ -134,6 +134,11 @@ pub trait PhotoPlugin: Send + Sync {
         display_height: u32,
     ) -> Result<Vec<u8>>;
 
+    /// Return browseable albums as `(id, title)` pairs. Empty when unsupported.
+    async fn list_albums(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Mark a photo as a favourite in the source (or clear the mark).
     ///
     /// Takes `&self` (not `&mut self`) so the engine can call it from the

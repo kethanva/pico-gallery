@@ -1042,7 +1042,8 @@ impl PhotoPlugin for PhotoPrismPlugin {
         "0.1.0"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self.cfg = config.clone();
         let skip_tls = self
             .cfg
             .values
@@ -1087,7 +1088,29 @@ impl PhotoPlugin for PhotoPrismPlugin {
         state.cached = Vec::new();
         state.next_page = 0;
         state.exhausted = false;
+        state.albums_loaded = false;
+        state.albums.clear();
         Ok(())
+    }
+
+    async fn list_albums(&self) -> Result<Vec<(String, String)>> {
+        let mut state = self.state.lock().await;
+        self.ensure_session(&mut state).await?;
+        let sid = state
+            .session
+            .as_ref()
+            .map(|s| s.session_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("photoprism: not authenticated"))?;
+        let map = self.fetch_albums(&sid).await?;
+        let mut seen_titles = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (id, title) in map {
+            if seen_titles.insert(title.clone()) {
+                out.push((id, title));
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(out)
     }
 
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
