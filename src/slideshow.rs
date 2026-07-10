@@ -89,8 +89,11 @@ impl Slideshow {
         // 2. Build the play queue (all photos from all plugins, shuffled).
         let queue = self.build_queue().await?;
         if queue.is_empty() {
-            error!("No photos found across all plugins. Check your config.");
-            return Ok(());
+            anyhow::bail!(
+                "No photos found across all plugins. Check your config and photo source \
+                 (PhotoPrism URL/credentials, or add images to the directory plugin path). \
+                 Run: journalctl -u picogallery -n 50"
+            );
         }
         info!("Play queue: {} photos", queue.len());
 

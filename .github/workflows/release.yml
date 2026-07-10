@@ -215,8 +215,8 @@ jobs:
 
             ```bash
             PICOGALLERY_VERSION=${{ steps.tag.outputs.name }} \
-              curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash -s -- \
-              --mode download -y \
+              curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/kva-revamparchitecture/install.sh | sudo bash -s -- \
+              --mode download -y --version ${{ steps.tag.outputs.name }} \
               --photoprism-url http://YOUR_PHOTOPRISM:2342 \
               --photoprism-user admin \
               --photoprism-pass YOUR_PASSWORD

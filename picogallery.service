@@ -9,6 +9,8 @@ User=pi
 Group=video
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info
+RuntimeDirectory=picogallery
+Environment=XDG_RUNTIME_DIR=/run/picogallery
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/picogallery
 Restart=on-failure
