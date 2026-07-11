@@ -387,7 +387,7 @@ impl Slideshow {
         let mut gallery_thumb_cursor = 0usize;
 
         let no_repeat_shown = self.config.display.no_repeat_shown;
-        let mut shown_ids: HashSet<String> = HashSet::new();
+        let mut shown_ids: HashSet<(usize, String)> = HashSet::new();
         // First frame after opening from the grid uses Cut (no fade from grid).
         let mut open_cut_once = false;
 
@@ -1142,10 +1142,10 @@ impl Slideshow {
             if let Some((q_idx, meta, mut rgba, exif_date)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
                 if no_repeat_shown {
-                    shown_ids.insert(photo_shown_key(queue[q_idx].0, &meta));
+                    shown_ids.insert((queue[q_idx].0, meta.id.clone()));
                     if queue
                         .iter()
-                        .all(|(pi, m)| shown_ids.contains(&photo_shown_key(*pi, m)))
+                        .all(|(pi, m)| shown_ids.contains(&(*pi, m.id.clone())))
                     {
                         shown_ids.clear();
                         info!("All photos shown — starting a fresh no-repeat cycle");
@@ -1313,7 +1313,7 @@ impl Slideshow {
         prefetch_n: usize,
         renderer: &Renderer,
         no_repeat: bool,
-        shown_ids: &HashSet<String>,
+        shown_ids: &HashSet<(usize, String)>,
     ) {
         if prefetched.len() >= prefetch_n || queue.is_empty() {
             return;
@@ -1329,7 +1329,7 @@ impl Slideshow {
             }
             attempts += 1;
 
-            if no_repeat && shown_ids.contains(&photo_shown_key(*pidx, meta)) {
+            if no_repeat && shown_ids.contains(&(*pidx, meta.id.clone())) {
                 continue;
             }
 
@@ -2006,10 +2006,6 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
-
-fn photo_shown_key(plugin_idx: usize, meta: &PhotoMeta) -> String {
-    format!("{plugin_idx}:{}", meta.id)
-}
 
 fn shuffle<T>(v: &mut [T], seed: u64) {
     let mut s = seed;

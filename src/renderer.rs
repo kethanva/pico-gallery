@@ -607,25 +607,31 @@ impl ImageProcessor {
         Ok((img, None))
     }
 
-    /// Decode and downscale a photo for gallery thumbnails.
+    /// Decode and cover-crop a photo to an exact `max_px×max_px` square.
     ///
-    /// Scales so the *shorter* side is at least `max_px` (cover-oriented). The
-    /// gallery then centre-crops once via [`crate::compose::cover_square`],
-    /// avoiding a contain-fit followed by a second upscale.
+    /// Single resize + centre crop after EXIF orientation, so gallery insert
+    /// does not need a second `cover_square` pass.
     pub fn decode_thumbnail(&self, bytes: &[u8], max_px: u32) -> Result<RgbaImage> {
         // Fast zune-jpeg decode path (shared with decode_and_scale). Thumbnails
         // don't colour-correct, so the ICC profile is ignored.
         let (img, _icc) = self.decode_dynamic(bytes)?;
         let orientation = crate::exif_util::read_exif(bytes).orientation;
-        let max_px = max_px.max(1);
-        let (sw, sh) = (img.width().max(1), img.height().max(1));
-        let scale = f32::max(max_px as f32 / sw as f32, max_px as f32 / sh as f32);
-        let nw = ((sw as f32 * scale) as u32).max(1);
-        let nh = ((sh as f32 * scale) as u32).max(1);
-        let rgba = img
-            .resize_exact(nw, nh, image::imageops::FilterType::Triangle)
-            .to_rgba8();
-        Ok(crate::exif_util::apply_orientation_rgba(rgba, orientation))
+        let size = max_px.max(1);
+
+        // Orient first so the cover crop matches what the gallery displays.
+        let rgba = crate::exif_util::apply_orientation_rgba(img.to_rgba8(), orientation);
+        let (sw, sh) = (rgba.width().max(1), rgba.height().max(1));
+        if sw == size && sh == size {
+            return Ok(rgba);
+        }
+        let scale = f32::max(size as f32 / sw as f32, size as f32 / sh as f32);
+        let nw = ((sw as f32 * scale).ceil() as u32).max(1);
+        let nh = ((sh as f32 * scale).ceil() as u32).max(1);
+        let scaled =
+            image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
+        let ox = scaled.width().saturating_sub(size) / 2;
+        let oy = scaled.height().saturating_sub(size) / 2;
+        Ok(image::imageops::crop_imm(&scaled, ox, oy, size, size).to_image())
     }
 
     // scale_image is kept for any future callers that don't need orientation.
@@ -1539,12 +1545,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_thumbnail_cover_fits_shorter_side() {
+    fn decode_thumbnail_produces_exact_square() {
         let proc = test_processor(800, 480);
         let jpeg = tiny_jpeg(64, 40);
         let thumb = proc.decode_thumbnail(&jpeg, 24).expect("decode thumbnail");
-        // Cover-oriented: the shorter side is scaled up to at least max_px.
-        assert!(thumb.width().min(thumb.height()) >= 24);
+        assert_eq!(thumb.dimensions(), (24, 24));
     }
 
     #[test]
