@@ -232,6 +232,11 @@ impl PhotoPlugin for AmazonPhotosPlugin {
     }
 
     async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+        // Drop any accumulated page walk so a re-init (targeting or credential
+        // reload on a live instance) serves a fresh library rather than the
+        // previous filter's cached photos. `get_mut` avoids a lock — `init`
+        // holds `&mut self`.
+        *self.page_cache.get_mut() = PageCache::default();
         self.load_token().await;
         Ok(())
     }
@@ -504,4 +509,42 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn init_clears_stale_page_cache() {
+        let mut plugin = AmazonPhotosPlugin::new(PluginConfig::default());
+        // Seed a prior library walk, as a live instance accumulates over time.
+        {
+            let cache = plugin.page_cache.get_mut();
+            cache.photos.push(PhotoMeta {
+                id: "stale-1".into(),
+                filename: "stale.jpg".into(),
+                width: 0,
+                height: 0,
+                taken_at: None,
+                download_url: None,
+                album: None,
+                title: None,
+                location: None,
+                is_favorite: false,
+                extra: Default::default(),
+            });
+            cache.next_token = Some("page-token".into());
+            cache.exhausted = true;
+        }
+
+        // Re-init (the targeting / credential reload path on a live instance)
+        // must start from a clean slate, not serve the previous filter's photos.
+        plugin.init(&PluginConfig::default()).await.unwrap();
+
+        let cache = plugin.page_cache.get_mut();
+        assert!(cache.photos.is_empty(), "stale photos must be cleared");
+        assert!(cache.next_token.is_none(), "page token must be cleared");
+        assert!(!cache.exhausted, "exhaustion flag must reset");
+    }
 }

@@ -88,11 +88,34 @@ impl GalleryGrid {
 
     pub fn visible_indices(&self, screen_h: u32, count: usize) -> Vec<usize> {
         let mut out = Vec::new();
-        for i in 0..count {
-            let (_, y) = self.cell_origin(i);
-            let y_end = y + self.cell as i32;
-            if y_end > HEADER_H as i32 && y < screen_h as i32 {
-                out.push(i);
+        if count == 0 || self.cols == 0 {
+            return out;
+        }
+        // Visibility (`y_end > HEADER_H && y < screen_h`) depends only on the
+        // row, so visible cells form one contiguous band of rows. Compute the
+        // first visible row directly instead of scanning all `count` cells,
+        // then walk rows until one falls below the viewport. O(visible), not
+        // O(count) — this runs every gallery tick.
+        let pitch = (self.cell + GAP) as i32;
+        let rows = self.rows_for_count(count);
+        // Smallest row whose bottom edge clears the header:
+        //   y(r) + cell > HEADER_H  ⟺  r*pitch > scroll_y - cell
+        let numer = self.scroll_y - self.cell as i32;
+        let first_row = if numer < 0 { 0 } else { numer / pitch + 1 };
+        let first_row = (first_row as u32).min(rows);
+        let cols = self.cols as usize;
+        for row in first_row..rows {
+            let y = HEADER_H as i32 + row as i32 * pitch - self.scroll_y;
+            if y >= screen_h as i32 {
+                break; // this row and every later one is below the viewport
+            }
+            let base = row as usize * cols;
+            for col in 0..cols {
+                let idx = base + col;
+                if idx >= count {
+                    break;
+                }
+                out.push(idx);
             }
         }
         out
@@ -269,29 +292,17 @@ impl GalleryGrid {
 const SEL_BORDER: u32 = 3;
 const SEL_COLOR: Rgba<u8> = Rgba([100, 180, 255, 255]);
 
-/// Highlight ring around the selected thumbnail.
+/// Highlight ring around the selected thumbnail. Four inset bars via the
+/// row-copy `fill_rect` instead of per-pixel `put_pixel`.
 fn draw_selection_ring(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
-    let (iw, ih) = img.dimensions();
-    let right = (x + w).min(iw);
-    let bottom = (y + h).min(ih);
-    for t in 0..SEL_BORDER {
-        for px in x..right {
-            if y + t < ih {
-                img.put_pixel(px, y + t, SEL_COLOR);
-            }
-            if bottom > t {
-                img.put_pixel(px, bottom - 1 - t, SEL_COLOR);
-            }
-        }
-        for py in y..bottom {
-            if x + t < iw {
-                img.put_pixel(x + t, py, SEL_COLOR);
-            }
-            if right > t {
-                img.put_pixel(right - 1 - t, py, SEL_COLOR);
-            }
-        }
+    if w == 0 || h == 0 {
+        return;
     }
+    let b = SEL_BORDER.min(w).min(h);
+    fill_rect(img, x, y, w, b, SEL_COLOR); // top
+    fill_rect(img, x, y + h - b, w, b, SEL_COLOR); // bottom
+    fill_rect(img, x, y, b, h, SEL_COLOR); // left
+    fill_rect(img, x + w - b, y, b, h, SEL_COLOR); // right
 }
 
 fn draw_text_line(img: &mut RgbaImage, text: &str, x: i32, y: i32) {
@@ -459,5 +470,39 @@ mod tests {
         let h = 300;
         while g.scroll_page(1, count, h) {}
         assert!(g.at_scroll_bottom(count, h));
+    }
+
+    /// Reference implementation: the original O(count) predicate.
+    fn naive_visible(g: &GalleryGrid, screen_h: u32, count: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            let (_, y) = g.cell_origin(i);
+            let y_end = y + g.cell as i32;
+            if y_end > HEADER_H as i32 && y < screen_h as i32 {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn visible_indices_matches_bruteforce_across_scrolls() {
+        let mut g = GalleryGrid::new(400);
+        let count = g.cols as usize * 30;
+        let h = 300;
+        let max = g.content_height(count) as i32;
+        for sy in (0..=max).step_by(7) {
+            g.scroll_y = sy;
+            assert_eq!(
+                g.visible_indices(h, count),
+                naive_visible(&g, h, count),
+                "mismatch at scroll_y={sy}"
+            );
+        }
+        // Degenerate counts must also match.
+        for c in [0usize, 1, g.cols as usize, g.cols as usize + 1] {
+            g.scroll_y = 0;
+            assert_eq!(g.visible_indices(h, c), naive_visible(&g, h, c));
+        }
     }
 }

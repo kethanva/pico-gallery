@@ -17,6 +17,7 @@ use sdl2::{
     EventPump, Sdl,
 };
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::DisplayConfig;
@@ -173,7 +174,9 @@ pub struct Renderer {
     /// (the LUT precompute is the costly part) and reused for every photo —
     /// only the per-image *input* profile is rebuilt. Saves rebuilding the
     /// sRGB lookup tables on each slide, which matters on a Pi Zero.
-    srgb_profile: Box<qcms::Profile>,
+    /// Shared into each [`ImageProcessor`] snapshot via `Arc` so the costly LUT
+    /// precompute is done once, not per decode thread.
+    srgb_profile: Arc<qcms::Profile>,
 }
 
 impl Renderer {
@@ -407,7 +410,7 @@ impl Renderer {
             config,
             text_input,
             text_input_active: false,
-            srgb_profile,
+            srgb_profile: Arc::from(srgb_profile),
         })
     }
 
@@ -426,6 +429,32 @@ impl Renderer {
         self.config = config;
     }
 
+    /// Build a `Send`/`Sync` snapshot of the current decode settings for use on
+    /// a blocking thread. Cheap: clones the small `DisplayConfig` and shares the
+    /// precomputed sRGB profile via `Arc` (no LUT rebuild). Call it right before
+    /// each decode so runtime config changes (menu) are picked up.
+    pub fn image_processor(&self) -> Arc<ImageProcessor> {
+        Arc::new(ImageProcessor {
+            config: self.config.clone(),
+            width: self.width,
+            height: self.height,
+            srgb_profile: Arc::clone(&self.srgb_profile),
+        })
+    }
+}
+
+/// SDL-free image decode + scale pipeline. Moved onto a blocking thread via
+/// `spawn_blocking` so a slow full-resolution decode never stalls the
+/// single-threaded async runtime (input events, the HTTP remote, gallery
+/// thumbnail loading). Built per decode by [`Renderer::image_processor`].
+pub struct ImageProcessor {
+    config: DisplayConfig,
+    width: u32,
+    height: u32,
+    srgb_profile: Arc<qcms::Profile>,
+}
+
+impl ImageProcessor {
     // ── Image decode & scale ─────────────────────────────────────────────────
 
     /// Decode, EXIF-correct, and scale an image in one pass.
@@ -455,84 +484,9 @@ impl Renderer {
     /// - `max_image_mb`   — raw file size gate (default 50 MB)
     /// - `max_megapixels` — decoded pixel count gate (0 = built-in 24 MP backstop)
     pub fn decode_and_scale(&self, bytes: &[u8]) -> Result<(RgbaImage, Option<String>)> {
-        // ── Raw-size gate ──────────────────────────────────────────────────────
-        let max_bytes = if self.config.max_image_mb > 0 {
-            self.config.max_image_mb as usize * 1_048_576
-        } else {
-            50 * 1_048_576 // default 50 MB
-        };
-        if bytes.len() > max_bytes {
-            return Err(anyhow::anyhow!(
-                "image file {} MB exceeds max_image_mb={} — skipping \
-                 (set a higher limit or resize photos before uploading)",
-                bytes.len() / 1_048_576,
-                max_bytes / 1_048_576,
-            ));
-        }
-
-        let is_jpeg = bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
-
-        let mut icc_profile = None;
-        let mut decoded_img = None;
-
-        if is_jpeg {
-            let cursor = Cursor::new(bytes);
-            let options = zune_core::options::DecoderOptions::default()
-                .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
-
-            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
-            if decoder.decode_headers().is_ok() {
-                if let Some(info) = decoder.info() {
-                    let w = info.width;
-                    let h = info.height;
-
-                    // ── Hard dimension ceiling (OOM guard) ─────────────────────────
-                    if w > 16_000 || h > 16_000 {
-                        return Err(anyhow::anyhow!(
-                            "image {}×{} px exceeds the 16 000-px dimension safety limit",
-                            w,
-                            h
-                        ));
-                    }
-
-                    // ── Megapixel gate (configured value or built-in backstop) ──────
-                    check_megapixels(self.config.max_megapixels, w as u32, h as u32)?;
-
-                    match decoder.decode() {
-                        Ok(pixels) => {
-                            icc_profile = decoder.icc_profile();
-                            if let Some(rgb_img) =
-                                image::RgbImage::from_raw(w as u32, h as u32, pixels)
-                            {
-                                decoded_img = Some(image::DynamicImage::ImageRgb8(rgb_img));
-                            }
-                        }
-                        Err(e) => {
-                            warn!("zune-jpeg failed to decode jpeg body: {:?}, falling back to image crate", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        let img = if let Some(d_img) = decoded_img {
-            d_img
-        } else {
-            let img = image::load_from_memory(bytes).context("decoding image")?;
-
-            // ── Hard dimension ceiling (OOM guard) ─────────────────────────────────
-            if img.width() > 16_000 || img.height() > 16_000 {
-                return Err(anyhow::anyhow!(
-                    "image {}×{} px exceeds the 16 000-px dimension safety limit",
-                    img.width(),
-                    img.height()
-                ));
-            }
-
-            // ── Megapixel gate (configured value or built-in backstop) ──────────────
-            check_megapixels(self.config.max_megapixels, img.width(), img.height())?;
-            img
-        };
+        // Decode with the fast zune-jpeg path (+ image-crate fallback) and all
+        // safety gates; keep any embedded ICC profile for colour-correct scaling.
+        let (img, icc_profile) = self.decode_dynamic(bytes)?;
 
         // ── EXIF (single parse) ────────────────────────────────────────────────
         // Reads orientation + capture date in one Reader::read_from_container
@@ -571,22 +525,97 @@ impl Renderer {
         Ok((final_img, exif_date))
     }
 
+    /// Decode `bytes` into a `DynamicImage`, preferring the fast zune-jpeg
+    /// decoder and falling back to the `image` crate for non-JPEG input or on
+    /// zune failure. Enforces the raw-size, 16 000-px dimension, and megapixel
+    /// safety gates before allocating the full-resolution buffer. Returns any
+    /// embedded ICC profile (JPEG fast path only; `None` otherwise) for the
+    /// caller's colour correction.
+    ///
+    /// Shared by [`Self::decode_and_scale`] and [`Self::decode_thumbnail`] so
+    /// gallery thumbnails get the same fast decode path as full slides.
+    fn decode_dynamic(&self, bytes: &[u8]) -> Result<(image::DynamicImage, Option<Vec<u8>>)> {
+        // ── Raw-size gate ──────────────────────────────────────────────────────
+        let max_bytes = if self.config.max_image_mb > 0 {
+            self.config.max_image_mb as usize * 1_048_576
+        } else {
+            50 * 1_048_576 // default 50 MB
+        };
+        if bytes.len() > max_bytes {
+            return Err(anyhow::anyhow!(
+                "image file {} MB exceeds max_image_mb={} — skipping \
+                 (set a higher limit or resize photos before uploading)",
+                bytes.len() / 1_048_576,
+                max_bytes / 1_048_576,
+            ));
+        }
+
+        let is_jpeg = bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
+        if is_jpeg {
+            let cursor = Cursor::new(bytes);
+            let options = zune_core::options::DecoderOptions::default()
+                .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
+
+            let mut decoder = zune_jpeg::JpegDecoder::new_with_options(cursor, options);
+            if decoder.decode_headers().is_ok() {
+                if let Some(info) = decoder.info() {
+                    let w = info.width;
+                    let h = info.height;
+
+                    // ── Hard dimension ceiling (OOM guard) ─────────────────────────
+                    if w > 16_000 || h > 16_000 {
+                        return Err(anyhow::anyhow!(
+                            "image {}×{} px exceeds the 16 000-px dimension safety limit",
+                            w,
+                            h
+                        ));
+                    }
+
+                    // ── Megapixel gate (configured value or built-in backstop) ──────
+                    check_megapixels(self.config.max_megapixels, w as u32, h as u32)?;
+
+                    match decoder.decode() {
+                        Ok(pixels) => {
+                            let icc_profile = decoder.icc_profile();
+                            if let Some(rgb_img) =
+                                image::RgbImage::from_raw(w as u32, h as u32, pixels)
+                            {
+                                return Ok((image::DynamicImage::ImageRgb8(rgb_img), icc_profile));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("zune-jpeg failed to decode jpeg body: {:?}, falling back to image crate", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let img = image::load_from_memory(bytes).context("decoding image")?;
+
+        // ── Hard dimension ceiling (OOM guard) ─────────────────────────────────
+        if img.width() > 16_000 || img.height() > 16_000 {
+            return Err(anyhow::anyhow!(
+                "image {}×{} px exceeds the 16 000-px dimension safety limit",
+                img.width(),
+                img.height()
+            ));
+        }
+
+        // ── Megapixel gate (configured value or built-in backstop) ──────────────
+        check_megapixels(self.config.max_megapixels, img.width(), img.height())?;
+        Ok((img, None))
+    }
+
     /// Decode and downscale a photo for gallery thumbnails.
     ///
     /// Scales so the *shorter* side is at least `max_px` (cover-oriented). The
     /// gallery then centre-crops once via [`crate::compose::cover_square`],
     /// avoiding a contain-fit followed by a second upscale.
     pub fn decode_thumbnail(&self, bytes: &[u8], max_px: u32) -> Result<RgbaImage> {
-        let max_bytes = if self.config.max_image_mb > 0 {
-            self.config.max_image_mb as usize * 1_048_576
-        } else {
-            50 * 1_048_576
-        };
-        if bytes.len() > max_bytes {
-            return Err(anyhow::anyhow!("thumbnail source too large"));
-        }
-        let img = image::load_from_memory(bytes).context("decoding thumbnail")?;
-        check_megapixels(self.config.max_megapixels, img.width(), img.height())?;
+        // Fast zune-jpeg decode path (shared with decode_and_scale). Thumbnails
+        // don't colour-correct, so the ICC profile is ignored.
+        let (img, _icc) = self.decode_dynamic(bytes)?;
         let orientation = crate::exif_util::read_exif(bytes).orientation;
         let max_px = max_px.max(1);
         let (sw, sh) = (img.width().max(1), img.height().max(1));
@@ -695,7 +724,9 @@ impl Renderer {
 
         Ok(DynamicImage::ImageRgb8(rgb).into_rgba8())
     }
+}
 
+impl Renderer {
     // ── Display methods ──────────────────────────────────────────────────────
 
     pub fn show_cut(&mut self, rgba: &RgbaImage) -> Result<()> {
@@ -1481,6 +1512,56 @@ pub enum SlideshowCmd {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// Build an `ImageProcessor` directly (no SDL) for decode-path tests.
+    fn test_processor(width: u32, height: u32) -> ImageProcessor {
+        let mut srgb = qcms::Profile::new_sRGB();
+        srgb.precache_output_transform();
+        ImageProcessor {
+            config: DisplayConfig::default(),
+            width,
+            height,
+            srgb_profile: Arc::from(srgb),
+        }
+    }
+
+    /// Encode a solid-colour RGB image to in-memory JPEG bytes.
+    fn tiny_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([120, 60, 30]),
+        ));
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("encode test jpeg");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn decode_thumbnail_cover_fits_shorter_side() {
+        let proc = test_processor(800, 480);
+        let jpeg = tiny_jpeg(64, 40);
+        let thumb = proc.decode_thumbnail(&jpeg, 24).expect("decode thumbnail");
+        // Cover-oriented: the shorter side is scaled up to at least max_px.
+        assert!(thumb.width().min(thumb.height()) >= 24);
+    }
+
+    #[test]
+    fn decode_and_scale_fits_within_display() {
+        let proc = test_processor(320, 240);
+        let jpeg = tiny_jpeg(200, 120);
+        let (rgba, _date) = proc.decode_and_scale(&jpeg).expect("decode and scale");
+        // Letterbox (default): result fits inside the display, never larger.
+        assert!(rgba.width() <= 320 && rgba.height() <= 240);
+        assert!(rgba.width() > 0 && rgba.height() > 0);
+    }
+
+    #[test]
+    fn decode_rejects_non_image_bytes() {
+        let proc = test_processor(320, 240);
+        assert!(proc.decode_and_scale(b"not an image at all").is_err());
+    }
 
     #[test]
     fn megapixel_backstop_applies_when_unset() {

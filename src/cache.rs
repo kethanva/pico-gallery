@@ -3,10 +3,15 @@
 /// Images are stored as `<cache_dir>/<sanitised_key>-<fnv1a_hash>.jpg`.
 /// An LRU index is maintained in memory and serialised to `<cache_dir>/index.json`.
 /// On startup we scan the directory so the index survives restarts.
+///
+/// The LRU is an intrusive doubly-linked list over a slab (`nodes`) with a
+/// `HashMap<key, slab-index>` for lookup, so `get`, `put`, and `contains` are
+/// all O(1) — no per-access linear scan of the queue. `head` is the
+/// least-recently-used end (evicted first); `tail` is most-recently-used.
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -18,6 +23,8 @@ const MAX_ENTRY_BYTES: u64 = 20 * 1024 * 1024; // never cache a single item > 20
 /// they'll be picked up by the next index-rewrite cycle.
 const PUTS_PER_INDEX_SAVE: u32 = 8;
 
+/// Persisted per-entry record. The on-disk `index.json` is a JSON array of
+/// these in LRU order (head → tail), unchanged from earlier versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     key: String,
@@ -25,11 +32,24 @@ struct CacheEntry {
     size_bytes: u64,
 }
 
+/// Intrusive LRU node held in the `nodes` slab. Slab indices are stable while
+/// a node lives, so `map` can point at them; freed slots are recycled via
+/// `free`.
+struct Node {
+    entry: CacheEntry,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
 pub struct ImageCache {
     dir: PathBuf,
     max_bytes: u64,
     used_bytes: u64,
-    lru: VecDeque<CacheEntry>,
+    nodes: Vec<Node>,
+    free: Vec<usize>,
+    map: HashMap<String, usize>,
+    head: Option<usize>, // least-recently-used — evicted first
+    tail: Option<usize>, // most-recently-used
     puts_since_save: u32,
 }
 
@@ -57,7 +77,11 @@ impl ImageCache {
             dir: dir.to_path_buf(),
             max_bytes,
             used_bytes: 0,
-            lru: VecDeque::new(),
+            nodes: Vec::new(),
+            free: Vec::new(),
+            map: HashMap::new(),
+            head: None,
+            tail: None,
             puts_since_save: 0,
         };
 
@@ -74,17 +98,21 @@ impl ImageCache {
 
     /// Returns cached bytes if available.
     pub async fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-        let idx = self.lru.iter().position(|e| e.key == key)?;
-        let entry = self.lru.remove(idx).unwrap();
-        match fs::read(&entry.path).await {
+        let idx = *self.map.get(key)?;
+        let path = self.nodes[idx].entry.path.clone();
+        match fs::read(&path).await {
             Ok(bytes) => {
-                self.lru.push_back(entry); // refresh LRU position
+                // Promote to most-recently-used.
+                self.unlink(idx);
+                self.push_tail(idx);
                 debug!("Cache HIT: {}", key);
                 Some(bytes)
             }
             Err(e) => {
                 warn!("Cache entry unreadable ({}): {}", key, e);
-                self.used_bytes = self.used_bytes.saturating_sub(entry.size_bytes);
+                let size = self.nodes[idx].entry.size_bytes;
+                self.remove_node(idx);
+                self.used_bytes = self.used_bytes.saturating_sub(size);
                 // Persist the removal — otherwise a restart reloads the stale
                 // entry from index.json and trips over it again.
                 self.save_index().await;
@@ -116,17 +144,19 @@ impl ImageCache {
 
         // Replace any existing entry for this key — a duplicate would
         // double-count used_bytes and let eviction of the old entry delete
-        // the file the new entry still points at.
-        if let Some(idx) = self.lru.iter().position(|e| e.key == key) {
-            let old = self.lru.remove(idx).unwrap();
-            self.used_bytes = self.used_bytes.saturating_sub(old.size_bytes);
+        // the file the new entry still points at. Same path_for(key), so the
+        // fs::write below overwrites the same file.
+        if let Some(&idx) = self.map.get(key) {
+            let old = self.nodes[idx].entry.size_bytes;
+            self.remove_node(idx);
+            self.used_bytes = self.used_bytes.saturating_sub(old);
         }
 
         // Evict until there's room. If eviction succeeds but the write below
         // fails, the evicted entries are gone for good (re-downloaded on next
         // showing) — acceptable on this single-user device; not worth the
         // complexity of a two-phase evict.
-        while self.used_bytes + size > self.max_bytes && !self.lru.is_empty() {
+        while self.used_bytes + size > self.max_bytes && self.head.is_some() {
             self.evict_oldest().await;
         }
 
@@ -138,11 +168,13 @@ impl ImageCache {
             .await
             .with_context(|| format!("writing cache entry {}", path.display()))?;
 
-        self.lru.push_back(CacheEntry {
+        let idx = self.alloc_node(CacheEntry {
             key: key.to_owned(),
             path,
             size_bytes: size,
         });
+        self.map.insert(key.to_owned(), idx);
+        self.push_tail(idx);
         self.used_bytes += size;
         debug!("Cache PUT: {} ({} KB)", key, size / 1024);
 
@@ -166,7 +198,60 @@ impl ImageCache {
 
     /// True if the key is present (without promoting in LRU).
     pub fn contains(&self, key: &str) -> bool {
-        self.lru.iter().any(|e| e.key == key)
+        self.map.contains_key(key)
+    }
+
+    // ── Intrusive LRU list helpers (all O(1)) ────────────────────────────────
+
+    /// Take a slot from the free list (or grow the slab) and store `entry`.
+    fn alloc_node(&mut self, entry: CacheEntry) -> usize {
+        let node = Node {
+            entry,
+            prev: None,
+            next: None,
+        };
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = node;
+            idx
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        }
+    }
+
+    /// Detach `idx` from the linked list (leaves `map`/`free` untouched).
+    fn unlink(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        match prev {
+            Some(p) => self.nodes[p].next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => self.nodes[n].prev = prev,
+            None => self.tail = prev,
+        }
+        self.nodes[idx].prev = None;
+        self.nodes[idx].next = None;
+    }
+
+    /// Append `idx` at the tail (most-recently-used end).
+    fn push_tail(&mut self, idx: usize) {
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = None;
+        match self.tail {
+            Some(t) => self.nodes[t].next = Some(idx),
+            None => self.head = Some(idx),
+        }
+        self.tail = Some(idx);
+    }
+
+    /// Fully remove `idx`: unlink, drop from `map`, recycle the slot.
+    fn remove_node(&mut self, idx: usize) {
+        self.unlink(idx);
+        let key = std::mem::take(&mut self.nodes[idx].entry.key);
+        self.map.remove(&key);
+        self.free.push(idx);
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────
@@ -191,16 +276,27 @@ impl ImageCache {
     }
 
     async fn evict_oldest(&mut self) {
-        if let Some(entry) = self.lru.pop_front() {
-            debug!("Cache evict: {}", entry.key);
-            let _ = fs::remove_file(&entry.path).await;
-            self.used_bytes = self.used_bytes.saturating_sub(entry.size_bytes);
+        if let Some(idx) = self.head {
+            let path = self.nodes[idx].entry.path.clone();
+            let size = self.nodes[idx].entry.size_bytes;
+            debug!("Cache evict: {}", self.nodes[idx].entry.key);
+            self.remove_node(idx);
+            let _ = fs::remove_file(&path).await;
+            self.used_bytes = self.used_bytes.saturating_sub(size);
         }
     }
 
     async fn save_index(&self) {
+        // Walk head → tail so the persisted order is LRU-first, matching the
+        // historical VecDeque layout (a plain JSON array of CacheEntry).
+        let mut ordered: Vec<&CacheEntry> = Vec::with_capacity(self.map.len());
+        let mut cur = self.head;
+        while let Some(idx) = cur {
+            ordered.push(&self.nodes[idx].entry);
+            cur = self.nodes[idx].next;
+        }
         let index_path = self.dir.join(INDEX_FILE);
-        match serde_json::to_vec(&self.lru) {
+        match serde_json::to_vec(&ordered) {
             Ok(data) => {
                 let _ = fs::write(&index_path, data).await;
             }
@@ -214,7 +310,7 @@ impl ImageCache {
             Ok(d) => d,
             Err(_) => return, // first run
         };
-        let entries: VecDeque<CacheEntry> = match serde_json::from_slice(&data) {
+        let entries: Vec<CacheEntry> = match serde_json::from_slice(&data) {
             Ok(e) => e,
             Err(e) => {
                 warn!("Cache index corrupt, rebuilding: {}", e);
@@ -230,7 +326,7 @@ impl ImageCache {
         // stalled at startup.
         let result = tokio::task::spawn_blocking(move || {
             let mut used = 0u64;
-            let valid: VecDeque<_> = entries
+            let valid: Vec<CacheEntry> = entries
                 .into_iter()
                 .filter_map(|mut e| {
                     let len = std::fs::metadata(&e.path).map(|m| m.len()).ok()?;
@@ -246,7 +342,13 @@ impl ImageCache {
         match result {
             Ok((valid, used)) => {
                 self.used_bytes = used;
-                self.lru = valid;
+                // Rebuild the list in persisted order (head = LRU end).
+                for entry in valid {
+                    let key = entry.key.clone();
+                    let idx = self.alloc_node(entry);
+                    self.map.insert(key, idx);
+                    self.push_tail(idx);
+                }
             }
             Err(e) => warn!("Cache index validation task failed: {}", e),
         }
@@ -322,5 +424,72 @@ mod tests {
         cache.put("k/x", &[1u8; 1024]).await.unwrap();
         assert!(!cache.contains("k/x"));
         assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn get_returns_stored_bytes() {
+        let tmp = TempDir::new("roundtrip");
+        let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        let data = vec![7u8; 1024];
+        cache.put("k/a", &data).await.unwrap();
+        assert_eq!(cache.get("k/a").await, Some(data));
+        assert_eq!(cache.get("k/missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn evicts_least_recently_used_first() {
+        let tmp = TempDir::new("lru-evict");
+        let mut cache = ImageCache::open(&tmp.0, 1).await.unwrap(); // 1 MB
+        let blob = vec![0u8; 400 * 1024]; // 400 KB each; three won't fit
+        cache.put("k/a", &blob).await.unwrap();
+        cache.put("k/b", &blob).await.unwrap();
+        cache.put("k/c", &blob).await.unwrap(); // evicts oldest (a)
+        assert!(!cache.contains("k/a"), "oldest entry must be evicted");
+        assert!(cache.contains("k/b"));
+        assert!(cache.contains("k/c"));
+        assert!(cache.used_bytes <= cache.max_bytes);
+    }
+
+    #[tokio::test]
+    async fn get_promotes_recency_and_protects_from_eviction() {
+        let tmp = TempDir::new("lru-promote");
+        let mut cache = ImageCache::open(&tmp.0, 1).await.unwrap();
+        let blob = vec![0u8; 400 * 1024];
+        cache.put("k/a", &blob).await.unwrap();
+        cache.put("k/b", &blob).await.unwrap();
+        // Touch a → now b is the least-recently-used.
+        assert!(cache.get("k/a").await.is_some());
+        cache.put("k/c", &blob).await.unwrap(); // should evict b, not a
+        assert!(cache.contains("k/a"), "recently-read entry must survive");
+        assert!(!cache.contains("k/b"), "untouched entry evicted first");
+        assert!(cache.contains("k/c"));
+    }
+
+    #[tokio::test]
+    async fn replacing_key_updates_size_without_duplicating() {
+        let tmp = TempDir::new("replace");
+        let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        cache.put("k/x", &vec![0u8; 256 * 1024]).await.unwrap();
+        cache.put("k/x", &vec![0u8; 512 * 1024]).await.unwrap();
+        assert!(cache.contains("k/x"));
+        assert_eq!(cache.used_bytes, 512 * 1024, "size must reflect newest put");
+        assert_eq!(cache.map.len(), 1, "no duplicate key in the index");
+    }
+
+    #[tokio::test]
+    async fn index_survives_reopen() {
+        let tmp = TempDir::new("persist");
+        {
+            let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+            cache.put("k/a", &vec![1u8; 256 * 1024]).await.unwrap();
+            cache.put("k/b", &vec![2u8; 256 * 1024]).await.unwrap();
+            cache.flush().await;
+        }
+        let mut reopened = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert!(reopened.contains("k/a"));
+        assert!(reopened.contains("k/b"));
+        assert_eq!(reopened.used_bytes, 512 * 1024);
+        // Freed-slot reuse path still resolves correctly after a reload.
+        assert_eq!(reopened.get("k/a").await, Some(vec![1u8; 256 * 1024]));
     }
 }

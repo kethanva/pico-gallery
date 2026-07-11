@@ -1,33 +1,18 @@
-//! Fullscreen viewer controller — current photo, return-to-gallery index.
+//! Fullscreen viewer controller — pending open-at-index request.
+//!
+//! The live viewer state (current queue index + on-screen photo metadata) is
+//! owned by the display loop; this type only carries the deferred "open this
+//! exact index next" request raised from gallery input.
 
-use crate::mode::Mode;
-use picogallery_core::PhotoMeta;
-
-/// Fullscreen slideshow / viewer state shared with the display loop.
+/// Fullscreen open request shared with the display loop.
 pub struct FullscreenController {
-    pub current_queue_idx: usize,
-    pub current_meta: Option<(usize, PhotoMeta)>,
-    /// When set, the next advance should open this exact queue index (cut).
+    /// When set, the display loop should open this exact queue index next (cut).
     pub pending_open: Option<usize>,
 }
 
 impl FullscreenController {
     pub fn new() -> Self {
-        Self {
-            current_queue_idx: 0,
-            current_meta: None,
-            pending_open: None,
-        }
-    }
-
-    pub fn open_at(&mut self, queue_idx: usize) -> Mode {
-        self.pending_open = Some(queue_idx);
-        Mode::Fullscreen
-    }
-
-    pub fn return_to_gallery(&mut self) -> Mode {
-        self.pending_open = None;
-        Mode::Gallery
+        Self { pending_open: None }
     }
 }
 
