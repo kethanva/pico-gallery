@@ -44,13 +44,18 @@ struct Args {
 // Plugins are conditionally compiled via Cargo features.
 // At runtime, only plugins with `enabled = true` in [[plugins]] are loaded.
 
-fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
+/// Build the enabled plugin set from `cfg`. `log` gates the per-plugin
+/// "Registering plugin" info lines so the capability-probe build (which runs
+/// before the real one) doesn't emit a duplicate set at startup.
+fn build_plugins(cfg: &Config, log: bool) -> Vec<BoxedPlugin> {
     let mut plugins: Vec<BoxedPlugin> = Vec::new();
 
     #[cfg(feature = "plugin-directory")]
     {
         if let Some(pcfg) = cfg.plugin_config("directory") {
-            info!("Registering plugin: directory");
+            if log {
+                info!("Registering plugin: directory");
+            }
             plugins.push(Box::new(picogallery_directory::DirectoryPlugin::new(
                 pcfg.clone(),
             )));
@@ -60,7 +65,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-local")]
     {
         if let Some(pcfg) = cfg.plugin_config("local") {
-            info!("Registering plugin: local");
+            if log {
+                info!("Registering plugin: local");
+            }
             plugins.push(Box::new(picogallery_local::LocalPlugin::new(pcfg.clone())));
         }
     }
@@ -68,7 +75,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-google-photos")]
     {
         if let Some(pcfg) = cfg.plugin_config("google-photos") {
-            info!("Registering plugin: google-photos");
+            if log {
+                info!("Registering plugin: google-photos");
+            }
             plugins.push(Box::new(
                 picogallery_google_photos::GooglePhotosPlugin::new(pcfg.clone()),
             ));
@@ -78,7 +87,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-amazon-photos")]
     {
         if let Some(pcfg) = cfg.plugin_config("amazon-photos") {
-            info!("Registering plugin: amazon-photos");
+            if log {
+                info!("Registering plugin: amazon-photos");
+            }
             plugins.push(Box::new(
                 picogallery_amazon_photos::AmazonPhotosPlugin::new(pcfg.clone()),
             ));
@@ -88,7 +99,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-webdav")]
     {
         if let Some(pcfg) = cfg.plugin_config("webdav") {
-            info!("Registering plugin: webdav");
+            if log {
+                info!("Registering plugin: webdav");
+            }
             plugins.push(Box::new(picogallery_webdav::WebDavPlugin::new(
                 pcfg.clone(),
             )));
@@ -98,7 +111,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-photoprism")]
     {
         if let Some(pcfg) = cfg.plugin_config("photoprism") {
-            info!("Registering plugin: photoprism");
+            if log {
+                info!("Registering plugin: photoprism");
+            }
             plugins.push(Box::new(picogallery_photoprism::PhotoPrismPlugin::new(
                 pcfg.clone(),
             )));
@@ -108,7 +123,9 @@ fn build_plugins(cfg: &Config) -> Vec<BoxedPlugin> {
     #[cfg(feature = "plugin-usb")]
     {
         if let Some(pcfg) = cfg.plugin_config("usb") {
-            info!("Registering plugin: usb");
+            if log {
+                info!("Registering plugin: usb");
+            }
             plugins.push(Box::new(picogallery_usb::UsbPlugin::new(pcfg.clone())));
         }
     }
@@ -184,7 +201,7 @@ async fn main() -> Result<()> {
     // Probe once for targeting adapters, sync/apply into plugin configs, then
     // rebuild so each plugin's `new()` sees the filtered config.
     {
-        let probe = build_plugins(&config);
+        let probe = build_plugins(&config, false);
         let adapters: Vec<_> = probe
             .iter()
             .map(|p| (p.name(), p.capabilities().targeting))
@@ -192,7 +209,7 @@ async fn main() -> Result<()> {
         config.sync_targeting_from_plugins(&adapters);
         config.apply_targeting(&adapters);
     }
-    let mut plugins = build_plugins(&config);
+    let mut plugins = build_plugins(&config, true);
 
     // Warn about plugins enabled in config that never registered — otherwise a
     // compiled-out Cargo feature (e.g. amazon-photos is not in the default
@@ -243,7 +260,13 @@ async fn main() -> Result<()> {
     // Run the slideshow. The plugin factory lets the engine rebuild its photo
     // sources at runtime when the user switches source from the on-screen menu,
     // without the slideshow needing to know which plugins were compiled in.
-    let slideshow = Slideshow::new(config, plugins, config_path, Box::new(build_plugins)).await?;
+    let slideshow = Slideshow::new(
+        config,
+        plugins,
+        config_path,
+        Box::new(|c: &Config| build_plugins(c, true)),
+    )
+    .await?;
     slideshow.run(remote_rx, remote_status).await
 }
 

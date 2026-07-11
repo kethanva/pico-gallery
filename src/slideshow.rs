@@ -382,7 +382,7 @@ impl Slideshow {
         let mut gallery_ctl = GalleryController::new(renderer.width());
         let mut fullscreen_ctl = FullscreenController::new();
         if mode.is_gallery() {
-            gallery_ctl.enter(0);
+            gallery_ctl.enter();
         }
         let mut gallery_thumb_cursor = 0usize;
 
@@ -651,7 +651,7 @@ impl Slideshow {
                     SlideshowCmd::BackToGallery => {
                         if gallery_mode && mode.is_fullscreen() {
                             mode = Mode::Gallery;
-                            gallery_ctl.enter(queue.len());
+                            gallery_ctl.enter();
                             gallery_ctl.mark_dirty();
                             paused = false;
                             prefetched.clear();
@@ -761,7 +761,7 @@ impl Slideshow {
                         // Keep the user on the grid rather than advancing to a
                         // different photo they did not click.
                         mode = Mode::Gallery;
-                        gallery_ctl.enter(queue.len());
+                        gallery_ctl.enter();
                         gallery_ctl.mark_dirty();
                         gallery_ctl.dirty = true;
                         warn!(
@@ -945,7 +945,12 @@ impl Slideshow {
                             .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
                             .await
                         {
-                            if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
+                            let processor = renderer.image_processor();
+                            let decoded = tokio::task::spawn_blocking(move || {
+                                processor.decode_thumbnail(&bytes, thumb_px)
+                            })
+                            .await;
+                            if let Ok(Ok(img)) = decoded {
                                 grid.insert_thumb(sel, img);
                                 gallery_ctl.dirty = true;
                             }
@@ -971,7 +976,12 @@ impl Slideshow {
                                 .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
                                 .await
                             {
-                                if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
+                                let processor = renderer.image_processor();
+                                let decoded = tokio::task::spawn_blocking(move || {
+                                    processor.decode_thumbnail(&bytes, thumb_px)
+                                })
+                                .await;
+                                if let Ok(Ok(img)) = decoded {
                                     grid.insert_thumb(pick, img);
                                     gallery_ctl.dirty = true;
                                     loaded += 1;
@@ -1281,11 +1291,16 @@ impl Slideshow {
         let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
             return;
         };
-        match renderer.decode_and_scale(&bytes) {
-            Ok((rgba, exif_date)) => {
+        // Decode off the async runtime — a full-res decode is CPU-heavy and
+        // would otherwise stall events, the HTTP remote, and gallery loading
+        // on the single-threaded executor.
+        let processor = renderer.image_processor();
+        match tokio::task::spawn_blocking(move || processor.decode_and_scale(&bytes)).await {
+            Ok(Ok((rgba, exif_date))) => {
                 prefetched.push_front((idx, meta.clone(), rgba, exif_date));
             }
-            Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+            Ok(Err(e)) => warn!("Decode error ({}): {}", meta.filename, e),
+            Err(e) => warn!("Decode task failed ({}): {}", meta.filename, e),
         }
     }
 
@@ -1324,12 +1339,15 @@ impl Slideshow {
                 }
                 continue;
             };
-            match renderer.decode_and_scale(&bytes) {
-                Ok((rgba, exif_date)) => {
+            // Decode on a blocking thread (see load_photo_into_prefetch).
+            let processor = renderer.image_processor();
+            match tokio::task::spawn_blocking(move || processor.decode_and_scale(&bytes)).await {
+                Ok(Ok((rgba, exif_date))) => {
                     prefetched.push_back((idx, meta.clone(), rgba, exif_date));
                     return;
                 }
-                Err(e) => warn!("Decode error ({}): {}", meta.filename, e),
+                Ok(Err(e)) => warn!("Decode error ({}): {}", meta.filename, e),
+                Err(e) => warn!("Decode task failed ({}): {}", meta.filename, e),
             }
             if *cursor == start {
                 break;
@@ -1355,6 +1373,16 @@ impl Slideshow {
             debug!("Favourite toggle ignored — no photo on screen yet");
             return;
         };
+        // Skip sources that don't advertise a per-photo favourite toggle —
+        // calling set_favorite would just hit the trait's "unsupported" default
+        // and log a misleading failure warning for e.g. directory / WebDAV.
+        if !self.plugins[*plugin_idx].capabilities().favorite_toggle {
+            debug!(
+                "Favourite toggle ignored — source '{}' has no favourite support",
+                self.plugins[*plugin_idx].name()
+            );
+            return;
+        }
         let currently = meta.is_favorite;
         let target = !currently;
 

@@ -33,12 +33,27 @@ pub fn blit_center(dst: &mut RgbaImage, src: &RgbaImage) {
 }
 
 /// Fill a rectangle with a solid RGBA colour (clipped to image bounds).
+///
+/// Pre-fills one row of the colour pattern, then `copy_from_slice`s it into
+/// each scanline — a memcpy per row instead of a bounds-checked `put_pixel`
+/// per pixel (the difference is felt on a Pi Zero for every grid cell).
 pub fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
     let (iw, ih) = img.dimensions();
-    for py in y..(y + h).min(ih) {
-        for px in x..(x + w).min(iw) {
-            img.put_pixel(px, py, color);
-        }
+    let x_end = (x + w).min(iw);
+    let y_end = (y + h).min(ih);
+    if x >= x_end || y >= y_end {
+        return;
+    }
+    let row_bytes = (x_end - x) as usize * 4;
+    let stride = iw as usize * 4;
+    let mut row = vec![0u8; row_bytes];
+    for px in row.chunks_exact_mut(4) {
+        px.copy_from_slice(&color.0);
+    }
+    let buf = img.as_mut();
+    for py in y..y_end {
+        let start = py as usize * stride + x as usize * 4;
+        buf[start..start + row_bytes].copy_from_slice(&row);
     }
 }
 
