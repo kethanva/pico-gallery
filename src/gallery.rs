@@ -130,8 +130,13 @@ impl GalleryGrid {
                 self.thumbs.remove(&k);
             }
         }
-        // Cover-crop to the cell once at insert time so render never resizes.
-        let square = cover_square(img, self.cell);
+        // Prefer an already cover-cropped cell from decode_thumbnail; fall
+        // back to cover_square only for legacy/mismatched sizes.
+        let square = if img.width() == self.cell && img.height() == self.cell {
+            img
+        } else {
+            cover_square(img, self.cell)
+        };
         self.thumbs.insert(index, square);
     }
 

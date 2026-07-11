@@ -22,7 +22,8 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::RwLock;
 
@@ -105,8 +106,10 @@ pub struct DirectoryPlugin {
     cfg: PluginConfig,
     /// Canonicalized root directory; set by `init`.
     root: Option<PathBuf>,
-    /// Sorted/shuffled list of photos, refreshed by `init` (and future rescans).
-    photos: RwLock<Vec<ScannedPhoto>>,
+    /// Sorted/shuffled list of photos, refreshed by `init` and the rescan task.
+    photos: Arc<RwLock<Vec<ScannedPhoto>>>,
+    /// Abort handle for the background rescan task (cancelled on re-init).
+    rescan_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl DirectoryPlugin {
@@ -114,19 +117,12 @@ impl DirectoryPlugin {
         Self {
             cfg,
             root: None,
-            photos: RwLock::new(Vec::new()),
+            photos: Arc::new(RwLock::new(Vec::new())),
+            rescan_abort: None,
         }
     }
 
     // ── Config helpers ────────────────────────────────────────────────────────
-
-    fn recursive(&self) -> bool {
-        self.cfg
-            .values
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
-    }
 
     fn rescan_interval_secs(&self) -> u64 {
         self.cfg
@@ -136,20 +132,6 @@ impl DirectoryPlugin {
             .unwrap_or(0)
     }
 
-    /// Returns the album allowlist, or an empty vec meaning "all albums".
-    fn allowed_albums(&self) -> Vec<String> {
-        self.cfg
-            .values
-            .get("allowed_albums")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     // ── Scanning ──────────────────────────────────────────────────────────────
 
     /// Walk `dir` recursively, collecting image files into `out`.
@@ -157,7 +139,7 @@ impl DirectoryPlugin {
     /// `album` is the name of the first-level sub-directory under root — that
     /// becomes the "album" label for every photo beneath it.
     async fn scan_dir(
-        &self,
+        recursive: bool,
         root: &Path,
         dir: &Path,
         album: Option<&str>,
@@ -206,7 +188,7 @@ impl DirectoryPlugin {
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
             if is_dir {
-                if !self.recursive() {
+                if !recursive {
                     continue;
                 }
 
@@ -232,7 +214,7 @@ impl DirectoryPlugin {
                     album
                 };
 
-                Box::pin(self.scan_dir(root, &canonical, new_album, allowed, visited, out)).await;
+                Box::pin(Self::scan_dir(recursive, root, &canonical, new_album, allowed, visited, out)).await;
             } else if is_image(&canonical) {
                 let modified_secs = fs::metadata(&canonical)
                     .await
@@ -252,18 +234,35 @@ impl DirectoryPlugin {
     }
 
     async fn build_photo_list(&self) -> Vec<ScannedPhoto> {
-        let root = match &self.root {
-            Some(r) => r.clone(),
-            None => return vec![],
+        let Some(root) = self.root.as_ref() else {
+            return vec![];
         };
+        Self::build_photo_list_at(root, &self.cfg).await
+    }
 
-        let allowed = self.allowed_albums();
+    /// Scan + order photos for `root` using `cfg` (callable from the rescan task).
+    async fn build_photo_list_at(root: &Path, cfg: &PluginConfig) -> Vec<ScannedPhoto> {
+        let recursive = cfg
+            .values
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let allowed: Vec<String> = cfg
+            .values
+            .get("allowed_albums")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut photos = Vec::new();
         let mut visited = HashSet::new();
-        self.scan_dir(&root, &root, None, &allowed, &mut visited, &mut photos)
-            .await;
+        Self::scan_dir(recursive, root, root, None, &allowed, &mut visited, &mut photos).await;
 
-        let order = Order::from_cfg(&self.cfg);
+        let order = Order::from_cfg(cfg);
         match order {
             Order::Alphabetical => {
                 photos.sort_by(|a, b| a.path.cmp(&b.path));
@@ -347,18 +346,37 @@ impl PhotoPlugin for DirectoryPlugin {
         }
 
         info!("Directory plugin: root = {}", canonical.display());
-        self.root = Some(canonical);
+        self.root = Some(canonical.clone());
 
         // Initial scan.
         let photos = self.build_photo_list().await;
         *self.photos.write().await = photos;
 
+        // Cancel any previous rescan task (re-init / targeting reload).
+        if let Some(h) = self.rescan_abort.take() {
+            h.abort();
+        }
+
         let interval = self.rescan_interval_secs();
         if interval > 0 {
-            info!(
-                "Directory plugin: rescan_interval_secs = {interval} \
-                 (restart the app to pick up new photos in this version)"
-            );
+            let photos = Arc::clone(&self.photos);
+            let root = canonical;
+            let cfg = self.cfg.clone();
+            let handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip the immediate first tick — we just scanned above.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let list = DirectoryPlugin::build_photo_list_at(&root, &cfg).await;
+                    let n = list.len();
+                    *photos.write().await = list;
+                    info!("Directory plugin: background rescan complete ({n} photos)");
+                }
+            });
+            self.rescan_abort = Some(handle.abort_handle());
+            info!("Directory plugin: rescanning every {interval}s in the background");
         }
 
         Ok(())

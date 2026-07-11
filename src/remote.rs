@@ -87,22 +87,46 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
     Ok(rx)
 }
 
+
+/// Index just past the first CRLF-CRLF in `buf`, if present.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == [b'\r', b'\n', b'\r', b'\n'])
+        .map(|i| i + 4)
+}
+
 async fn handle_conn(
     mut stream: tokio::net::TcpStream,
     tx: Sender<SlideshowCmd>,
     status: SharedStatus,
 ) -> Result<()> {
-    // One small read is enough — requests are tiny GET/POSTs with no body.
-    // The request line for every served endpoint is ASCII and well under
-    // 100 bytes, so even if the kernel splits the request across reads the
-    // worst case is a truncated method/path falling through to the 404 arm —
-    // never a panic or a misrouted command.
-    let mut buf = [0u8; 2048];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .context("remote: read timeout")??;
+    // Read until end-of-headers or the buffer fills. A single `read` can
+    // return a partial request when TCP fragments; looping keeps large
+    // browser headers and split packets from becoming spurious 404s.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if buf.len() >= 8192 {
+            break;
+        }
+        let mut chunk = [0u8; 1024];
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow::anyhow!("remote: read timeout"));
+        }
+        let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+            .await
+            .context("remote: read timeout")??;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if find_header_end(&buf).is_some() {
+            break;
+        }
+    }
 
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&buf);
     let mut parts = req.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
@@ -219,3 +243,20 @@ poll(); setInterval(poll, 2000);
 </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_header_end_detects_crlf_crlf() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(find_header_end(buf), Some(buf.len()));
+    }
+
+    #[test]
+    fn find_header_end_none_when_incomplete() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n";
+        assert_eq!(find_header_end(buf), None);
+    }
+}
