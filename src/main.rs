@@ -162,9 +162,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     };
 
-    config.sync_targeting_from_plugins();
-    config.apply_targeting();
-
     config.ensure_dirs()?;
 
     // ── Wi-Fi (Linux / Raspberry Pi only) ─────────────────────────────────────
@@ -184,6 +181,17 @@ async fn main() -> Result<()> {
     }
 
     // ── Plugins ───────────────────────────────────────────────────────────────
+    // Probe once for targeting adapters, sync/apply into plugin configs, then
+    // rebuild so each plugin's `new()` sees the filtered config.
+    {
+        let probe = build_plugins(&config);
+        let adapters: Vec<_> = probe
+            .iter()
+            .map(|p| (p.name(), p.capabilities().targeting))
+            .collect();
+        config.sync_targeting_from_plugins(&adapters);
+        config.apply_targeting(&adapters);
+    }
     let mut plugins = build_plugins(&config);
 
     // Warn about plugins enabled in config that never registered — otherwise a

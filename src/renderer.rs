@@ -571,10 +571,11 @@ impl Renderer {
         Ok((final_img, exif_date))
     }
 
-    /// Decode and scale a photo to fit within `max_px` (for gallery thumbnails).
+    /// Decode and downscale a photo for gallery thumbnails.
     ///
-    /// Always contain-fits into a square (ignores `fill_screen`) so grid cells
-    /// stay consistent regardless of slideshow crop settings.
+    /// Scales so the *shorter* side is at least `max_px` (cover-oriented). The
+    /// gallery then centre-crops once via [`crate::compose::cover_square`],
+    /// avoiding a contain-fit followed by a second upscale.
     pub fn decode_thumbnail(&self, bytes: &[u8], max_px: u32) -> Result<RgbaImage> {
         let max_bytes = if self.config.max_image_mb > 0 {
             self.config.max_image_mb as usize * 1_048_576
@@ -589,7 +590,7 @@ impl Renderer {
         let orientation = crate::exif_util::read_exif(bytes).orientation;
         let max_px = max_px.max(1);
         let (sw, sh) = (img.width().max(1), img.height().max(1));
-        let scale = f32::min(max_px as f32 / sw as f32, max_px as f32 / sh as f32);
+        let scale = f32::max(max_px as f32 / sw as f32, max_px as f32 / sh as f32);
         let nw = ((sw as f32 * scale) as u32).max(1);
         let nh = ((sh as f32 * scale) as u32).max(1);
         let rgba = img
@@ -1094,13 +1095,7 @@ impl Renderer {
                 } if !menu_open
                     && (in_gallery
                         || (gallery_mode
-                            && !in_gallery
-                            && crate::osd::close_button_hit(
-                                x,
-                                y,
-                                self.width,
-                                self.height,
-                            ))) =>
+                            && crate::osd::close_button_hit(x, y, self.width, self.height))) =>
                 {
                     if in_gallery {
                         out.push(SlideshowCmd::GalleryClick { x, y });
@@ -1149,6 +1144,7 @@ impl Renderer {
 }
 
 /// Map a mouse button press to slideshow commands.
+#[allow(clippy::too_many_arguments)] // input-state fan-out; a struct would only add ceremony
 fn push_pointer_action(
     out: &mut Vec<SlideshowCmd>,
     mouse_btn: MouseButton,

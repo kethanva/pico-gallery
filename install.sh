@@ -196,6 +196,7 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
     HTTP_CODE=$(echo "$RELEASE_JSON" | tail -1)
     RELEASE_BODY=$(echo "$RELEASE_JSON" | sed '$d')
 
+    VERSION=""
     if [[ "$HTTP_CODE" == "200" ]]; then
       VERSION=$(echo "$RELEASE_BODY" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
     fi

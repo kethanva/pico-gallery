@@ -3,6 +3,7 @@
 //! Shows all loaded photos in a scrollable grid. Clicking a thumbnail opens the
 //! fullscreen slideshow; Escape or the close control returns here.
 
+use crate::compose::{blit_clipped, cover_square, fill_rect};
 use image::{Rgba, RgbaImage};
 use std::collections::HashMap;
 
@@ -255,7 +256,7 @@ impl GalleryGrid {
             };
             fill_rect(&mut frame, x, dst_y, self.cell, draw_h, bg);
             if let Some(thumb) = self.thumb(i) {
-                blit_thumb_clipped(&mut frame, thumb, x, dst_y, self.cell, draw_h, src_y0);
+                blit_clipped(&mut frame, thumb, x, dst_y, self.cell, draw_h, src_y0);
             }
             if i == self.selected {
                 draw_selection_ring(&mut frame, x, dst_y, self.cell, draw_h);
@@ -290,73 +291,6 @@ fn draw_selection_ring(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32) {
                 img.put_pixel(right - 1 - t, py, SEL_COLOR);
             }
         }
-    }
-}
-
-fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
-    let (iw, ih) = img.dimensions();
-    for py in y..(y + h).min(ih) {
-        for px in x..(x + w).min(iw) {
-            img.put_pixel(px, py, color);
-        }
-    }
-}
-
-/// Cover-crop `src` into a `size×size` square (done once at thumb insert).
-fn cover_square(src: RgbaImage, size: u32) -> RgbaImage {
-    let size = size.max(1);
-    let (sw, sh) = src.dimensions();
-    if sw == 0 || sh == 0 {
-        return RgbaImage::from_pixel(size, size, Rgba([28, 28, 28, 255]));
-    }
-    if sw == size && sh == size {
-        return src;
-    }
-    let scale = (size as f32 / sw as f32).max(size as f32 / sh as f32);
-    let tw = ((sw as f32 * scale).ceil() as u32).max(1);
-    let th = ((sh as f32 * scale).ceil() as u32).max(1);
-    let scaled = image::imageops::resize(&src, tw, th, image::imageops::FilterType::Triangle);
-    let ox = scaled.width().saturating_sub(size) / 2;
-    let oy = scaled.height().saturating_sub(size) / 2;
-    image::imageops::crop_imm(&scaled, ox, oy, size, size).to_image()
-}
-
-/// Blit a cell-sized square thumb, optionally skipping `src_y0` rows (scroll clip).
-fn blit_thumb_clipped(
-    dst: &mut RgbaImage,
-    src: &RgbaImage,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    src_y0: u32,
-) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    let (sw, sh) = src.dimensions();
-    let (iw, ih) = dst.dimensions();
-    let dstride = dst.width() as usize * 4;
-    let sstride = sw as usize * 4;
-    let dbuf = dst.as_mut();
-    let sbuf = src.as_raw();
-    let copy_w = w.min(sw);
-    for row in 0..h {
-        let dy = y + row;
-        if dy >= ih {
-            break;
-        }
-        let sy = src_y0 + row;
-        if sy >= sh {
-            continue;
-        }
-        let cols = copy_w.min(iw.saturating_sub(x));
-        if cols == 0 {
-            continue;
-        }
-        let d = dy as usize * dstride + x as usize * 4;
-        let s = sy as usize * sstride;
-        dbuf[d..d + cols as usize * 4].copy_from_slice(&sbuf[s..s + cols as usize * 4]);
     }
 }
 

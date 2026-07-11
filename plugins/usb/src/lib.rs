@@ -74,7 +74,8 @@ async fn get_partitions() -> Vec<String> {
             if tokens.len() == 4 {
                 let name = tokens[3];
                 // Match partition names like sda1, sdb2, sdc1 (sd[a-z][0-9]+)
-                if name.starts_with("sd") && name.chars().nth(3).is_some_and(|c| c.is_ascii_digit()) {
+                if name.starts_with("sd") && name.chars().nth(3).is_some_and(|c| c.is_ascii_digit())
+                {
                     parts.push(name.to_string());
                 }
             }
@@ -85,9 +86,9 @@ async fn get_partitions() -> Vec<String> {
 
 fn unescape_fstab(s: &str) -> String {
     s.replace("\\040", " ")
-     .replace("\\011", "\t")
-     .replace("\\012", "\n")
-     .replace("\\134", "\\")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 async fn get_existing_mount(partition: &str) -> Option<PathBuf> {
@@ -123,7 +124,12 @@ async fn mount_partition(partition: &str) -> Option<PathBuf> {
     let mount_dir = PathBuf::from(format!("/media/picogallery-usb-{}", partition));
     let _ = fs::create_dir_all(&mount_dir).await;
     let output = tokio::process::Command::new("mount")
-        .args(["-o", "ro", &format!("/dev/{}", partition), &mount_dir.to_string_lossy()])
+        .args([
+            "-o",
+            "ro",
+            &format!("/dev/{}", partition),
+            &mount_dir.to_string_lossy(),
+        ])
         .output()
         .await;
     if let Ok(out) = output {
@@ -165,7 +171,11 @@ async fn run_usb_poller(
         let mut list_changed = false;
         for key in &removed {
             if let Some((path, mounted_by_us)) = mounts.remove(key) {
-                info!("USB partition removed: {} (from path: {})", key, path.display());
+                info!(
+                    "USB partition removed: {} (from path: {})",
+                    key,
+                    path.display()
+                );
                 if mounted_by_us {
                     unmount_partition(key).await;
                 }
@@ -178,11 +188,19 @@ async fn run_usb_poller(
             if !mounts.contains_key(part) {
                 info!("New USB partition detected: {}", part);
                 if let Some(existing) = get_existing_mount(part).await {
-                    info!("USB partition {} is already mounted at: {}", part, existing.display());
+                    info!(
+                        "USB partition {} is already mounted at: {}",
+                        part,
+                        existing.display()
+                    );
                     mounts.insert(part.clone(), (existing, false));
                     list_changed = true;
                 } else if let Some(new_mount) = mount_partition(part).await {
-                    info!("Successfully mounted USB partition {} at: {}", part, new_mount.display());
+                    info!(
+                        "Successfully mounted USB partition {} at: {}",
+                        part,
+                        new_mount.display()
+                    );
                     mounts.insert(part.clone(), (new_mount, true));
                     list_changed = true;
                 } else {
@@ -248,13 +266,24 @@ impl PhotoPlugin for UsbPlugin {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
+                let taken_at = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
+                    });
                 PhotoMeta {
                     id,
                     filename,
                     width: 0,
                     height: 0,
-                    taken_at: None,
+                    taken_at,
                     download_url: None, // read directly from disk
+                    album: None,
+                    title: None,
+                    location: None,
+                    is_favorite: false,
                     extra: Default::default(),
                 }
             })
@@ -268,7 +297,35 @@ impl PhotoPlugin for UsbPlugin {
         _display_width: u32,
         _display_height: u32,
     ) -> Result<Vec<u8>> {
-        let bytes = fs::read(&meta.id).await?;
+        const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+        let path = PathBuf::from(&meta.id);
+        let canonical = fs::canonicalize(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolving path {}: {}", path.display(), e))?;
+
+        let mounts = self.active_mounts.lock().await;
+        let allowed = mounts.values().any(|(root, _)| canonical.starts_with(root));
+        if !allowed {
+            return Err(anyhow::anyhow!(
+                "security: {} is outside active USB mounts",
+                canonical.display()
+            ));
+        }
+        drop(mounts);
+
+        let file_meta = fs::metadata(&canonical).await?;
+        if file_meta.len() > MAX_IMAGE_BYTES {
+            return Err(anyhow::anyhow!(
+                "image too large ({} MB): {}",
+                file_meta.len() / 1_048_576,
+                meta.filename
+            ));
+        }
+
+        let bytes = fs::read(&canonical).await?;
+        if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
+            return Err(anyhow::anyhow!("not a JPEG (bad magic): {}", meta.filename));
+        }
         Ok(bytes)
     }
 }

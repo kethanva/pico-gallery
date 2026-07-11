@@ -13,9 +13,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::cache::ImageCache;
+use crate::compose::blit_center;
 use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
-use crate::gallery::GalleryGrid;
+use crate::fullscreen_controller::FullscreenController;
+use crate::gallery_controller::GalleryController;
 use crate::menu::{EditField, Menu, MenuAction};
+use crate::mode::Mode;
 use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
 use crate::remote::SharedStatus;
 use crate::renderer::{Renderer, SlideshowCmd};
@@ -268,8 +271,7 @@ impl Slideshow {
                     let n = page.len();
                     loader.plugin_offsets[plugin_idx] += n;
                     batch.extend(page.into_iter().map(|m| (plugin_idx, m)));
-                    if n < PAGE_SIZE || loader.plugin_offsets[plugin_idx] >= MAX_PHOTOS_PER_PLUGIN
-                    {
+                    if n < PAGE_SIZE || loader.plugin_offsets[plugin_idx] >= MAX_PHOTOS_PER_PLUGIN {
                         loader.plugin_exhausted[plugin_idx] = true;
                     }
                 }
@@ -372,12 +374,17 @@ impl Slideshow {
         let mut menu_dirty = false;
 
         let gallery_mode = self.config.display.gallery_mode;
-        let mut in_gallery = gallery_mode;
-        let mut gallery = gallery_mode.then(|| GalleryGrid::new(renderer.width()));
+        let mut mode = if gallery_mode {
+            Mode::Gallery
+        } else {
+            Mode::Fullscreen
+        };
+        let mut gallery_ctl = GalleryController::new(renderer.width());
+        let mut fullscreen_ctl = FullscreenController::new();
+        if mode.is_gallery() {
+            gallery_ctl.enter(0);
+        }
         let mut gallery_thumb_cursor = 0usize;
-        // Repaint the grid only when something changed (scroll, a thumb loaded,
-        // or we just (re)entered it) so an idle grid costs no steady CPU/GPU.
-        let mut gallery_dirty = true;
 
         let no_repeat_shown = self.config.display.no_repeat_shown;
         let mut shown_ids: HashSet<String> = HashSet::new();
@@ -386,7 +393,7 @@ impl Slideshow {
 
         // Pre-warm the prefetch ring (fetch + decode the first N photos).
         let mut cursor = 0usize;
-        if !in_gallery {
+        if mode.is_fullscreen() {
             for _ in 0..prefetch_n {
                 self.prefetch_one(
                     &queue,
@@ -430,7 +437,7 @@ impl Slideshow {
                 menu.open,
                 menu.editing.is_some(),
                 gallery_mode,
-                in_gallery,
+                mode.is_gallery(),
             );
             if let Some(rx) = remote_rx.as_mut() {
                 while let Ok(cmd) = rx.try_recv() {
@@ -461,7 +468,7 @@ impl Slideshow {
             // of the per-command match.
             let mut pending_activate = false;
             // Deferred so we can await the selected-photo fetch outside the match.
-            let mut pending_open: Option<usize> = None;
+            // pending open lives on fullscreen_ctl
 
             for cmd in cmds {
                 match cmd {
@@ -478,9 +485,9 @@ impl Slideshow {
                     SlideshowCmd::CloseMenu => {
                         if menu.open {
                             menu.open = false;
-                            if in_gallery {
+                            if mode.is_gallery() {
                                 // Grid repaints on the next tick to cover the menu.
-                                gallery_dirty = true;
+                                gallery_ctl.dirty = true;
                             } else if let Some(img) = &current_rgba {
                                 // Repaint the photo underneath so the menu vanishes.
                                 let _ = renderer.show_cut(img);
@@ -545,8 +552,8 @@ impl Slideshow {
                                 // Click outside the panel dismisses the menu.
                                 None => {
                                     menu.open = false;
-                                    if in_gallery {
-                                        gallery_dirty = true;
+                                    if mode.is_gallery() {
+                                        gallery_ctl.dirty = true;
                                     } else if let Some(img) = &current_rgba {
                                         let _ = renderer.show_cut(img);
                                     }
@@ -565,7 +572,7 @@ impl Slideshow {
                     // Normal slideshow commands are ignored while the menu is
                     // up (the photo behind it isn't advancing anyway).
                     SlideshowCmd::TogglePause => {
-                        if !menu.open && !in_gallery {
+                        if !menu.open && mode.is_fullscreen() {
                             paused = !paused;
                             info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                             last_advance = Instant::now();
@@ -575,7 +582,7 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::Next => {
-                        if !menu.open && !in_gallery {
+                        if !menu.open && mode.is_fullscreen() {
                             if current_queue_idx + 1 >= queue.len() {
                                 self.try_extend_queue_force(
                                     &mut queue,
@@ -590,7 +597,7 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::Prev => {
-                        if !menu.open && !in_gallery {
+                        if !menu.open && mode.is_fullscreen() {
                             current_queue_idx = if current_queue_idx == 0 {
                                 queue.len().saturating_sub(1)
                             } else {
@@ -604,7 +611,7 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::ToggleFavorite => {
-                        if !menu.open && !in_gallery {
+                        if !menu.open && mode.is_fullscreen() {
                             self.toggle_favorite(&mut current_meta, &remote_status)
                                 .await;
                         }
@@ -642,121 +649,101 @@ impl Slideshow {
                         }
                     }
                     SlideshowCmd::BackToGallery => {
-                        if gallery_mode && !in_gallery {
-                            in_gallery = true;
+                        if gallery_mode && mode.is_fullscreen() {
+                            mode = Mode::Gallery;
+                            gallery_ctl.enter(queue.len());
+                            gallery_ctl.mark_dirty();
                             paused = false;
                             prefetched.clear();
                             current_rgba = None;
                             current_meta = None;
                             gallery_thumb_cursor = 0;
-                            if let Some(grid) = gallery.as_mut() {
+                            if gallery_mode {
+                                let grid = &mut gallery_ctl.grid;
                                 grid.set_selected(current_queue_idx, queue.len());
-                                grid.ensure_selected_visible(
-                                    renderer.height(),
-                                    queue.len(),
-                                );
+                                grid.ensure_selected_visible(renderer.height(), queue.len());
                             }
-                            gallery_dirty = true;
+                            gallery_ctl.dirty = true;
                             info!("Returned to gallery grid.");
                         }
                     }
                     SlideshowCmd::OpenSlideshow(idx) => {
                         if gallery_mode && idx < queue.len() {
-                            pending_open = Some(idx);
+                            fullscreen_ctl.pending_open = Some(idx);
                         }
                     }
                     SlideshowCmd::GalleryClick { x, y } => {
-                        if gallery_mode && in_gallery {
-                            if let Some(grid) = gallery.as_mut() {
-                                if let Some(idx) = grid.index_at(x, y, queue.len()) {
-                                    grid.set_selected(idx, queue.len());
-                                    pending_open = Some(idx);
-                                }
+                        if gallery_mode && mode.is_gallery() {
+                            let grid = &mut gallery_ctl.grid;
+                            if let Some(idx) = grid.index_at(x, y, queue.len()) {
+                                grid.set_selected(idx, queue.len());
+                                fullscreen_ctl.pending_open = Some(idx);
                             }
                         }
                     }
                     SlideshowCmd::GalleryPage(dir) => {
-                        if in_gallery {
-                            if let Some(grid) = gallery.as_mut() {
-                                let mut scrolled =
+                        if mode.is_gallery() && gallery_mode {
+                            let grid = &mut gallery_ctl.grid;
+                            let mut scrolled =
+                                grid.scroll_page(dir, queue.len(), renderer.height());
+                            if !scrolled
+                                && dir > 0
+                                && grid.at_scroll_bottom(queue.len(), renderer.height())
+                                && self
+                                    .try_extend_queue_force(
+                                        &mut queue,
+                                        &mut queue_loader,
+                                        &remote_status,
+                                    )
+                                    .await
+                            {
+                                scrolled =
                                     grid.scroll_page(dir, queue.len(), renderer.height());
-                                if !scrolled
-                                    && dir > 0
-                                    && grid.at_scroll_bottom(queue.len(), renderer.height())
-                                {
-                                    if self
-                                        .try_extend_queue_force(
-                                            &mut queue,
-                                            &mut queue_loader,
-                                            &remote_status,
-                                        )
-                                        .await
-                                    {
-                                        scrolled = grid.scroll_page(
-                                            dir,
-                                            queue.len(),
-                                            renderer.height(),
-                                        );
-                                    }
-                                }
-                                if scrolled {
-                                    gallery_dirty = true;
-                                }
+                            }
+                            if scrolled {
+                                gallery_ctl.dirty = true;
                             }
                         }
                     }
                     SlideshowCmd::GalleryMoveSelection { dx, dy } => {
-                        if in_gallery {
-                            if let Some(grid) = gallery.as_mut() {
-                                let blocked = grid.move_selection(dx, dy, queue.len());
-                                if blocked
-                                    && self
-                                        .try_extend_queue_force(
-                                            &mut queue,
-                                            &mut queue_loader,
-                                            &remote_status,
-                                        )
-                                        .await
-                                {
-                                    let _ = grid.move_selection(dx, dy, queue.len());
-                                }
-                                grid.ensure_selected_visible(
-                                    renderer.height(),
-                                    queue.len(),
-                                );
-                                gallery_dirty = true;
+                        if mode.is_gallery() && gallery_mode {
+                            let grid = &mut gallery_ctl.grid;
+                            let blocked = grid.move_selection(dx, dy, queue.len());
+                            if blocked
+                                && self
+                                    .try_extend_queue_force(
+                                        &mut queue,
+                                        &mut queue_loader,
+                                        &remote_status,
+                                    )
+                                    .await
+                            {
+                                let _ = grid.move_selection(dx, dy, queue.len());
                             }
+                            grid.ensure_selected_visible(renderer.height(), queue.len());
+                            gallery_ctl.dirty = true;
                         }
                     }
                     SlideshowCmd::GalleryScroll(delta) => {
-                        if in_gallery {
-                            if let Some(grid) = gallery.as_mut() {
-                                let before = grid.scroll_y;
-                                grid.scroll_by(delta, queue.len(), renderer.height());
-                                if grid.scroll_y != before {
-                                    gallery_dirty = true;
-                                }
+                        if mode.is_gallery() && gallery_mode {
+                            let grid = &mut gallery_ctl.grid;
+                            let before = grid.scroll_y;
+                            grid.scroll_by(delta, queue.len(), renderer.height());
+                            if grid.scroll_y != before {
+                                gallery_ctl.dirty = true;
                             }
                         }
                     }
                     SlideshowCmd::GalleryOpenSelected => {
-                        if gallery_mode && in_gallery && !queue.is_empty() {
-                            let idx = gallery
-                                .as_ref()
-                                .map(|g| g.selected)
-                                .unwrap_or(0)
-                                .min(queue.len() - 1);
-                            pending_open = Some(idx);
+                        if gallery_mode && mode.is_gallery() && !queue.is_empty() {
+                            let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
+                            fullscreen_ctl.pending_open = Some(idx);
                         }
                     }
                     SlideshowCmd::GalleryOpenVisible => {
-                        if gallery_mode && in_gallery && !queue.is_empty() {
-                            let idx = gallery
-                                .as_ref()
-                                .map(|g| g.selected)
-                                .unwrap_or(0)
-                                .min(queue.len() - 1);
-                            pending_open = Some(idx);
+                        if gallery_mode && mode.is_gallery() && !queue.is_empty() {
+                            let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
+                            fullscreen_ctl.pending_open = Some(idx);
                         }
                     }
                 }
@@ -764,7 +751,7 @@ impl Slideshow {
 
             // Open the selected photo: load THAT index into the prefetch ring
             // first so a decode failure on it cannot silently show a neighbour.
-            if let Some(idx) = pending_open {
+            if let Some(idx) = fullscreen_ctl.pending_open.take() {
                 if idx < queue.len() {
                     prefetched.clear();
                     current_rgba = None;
@@ -773,15 +760,17 @@ impl Slideshow {
                     if prefetched.is_empty() {
                         // Keep the user on the grid rather than advancing to a
                         // different photo they did not click.
-                        in_gallery = true;
-                        gallery_dirty = true;
+                        mode = Mode::Gallery;
+                        gallery_ctl.enter(queue.len());
+                        gallery_ctl.mark_dirty();
+                        gallery_ctl.dirty = true;
                         warn!(
                             "Could not open photo {} ({}) — staying in gallery",
                             idx + 1,
                             queue[idx].1.filename
                         );
                     } else {
-                        in_gallery = false;
+                        mode = Mode::Fullscreen;
                         paused = false;
                         current_queue_idx = idx;
                         cursor = (idx + 1) % queue.len();
@@ -841,10 +830,11 @@ impl Slideshow {
                             if !queue.is_empty() {
                                 cursor = (current_queue_idx + 1) % queue.len();
                             }
-                            if let Some(grid) = gallery.as_mut() {
+                            if gallery_mode {
+                                let grid = &mut gallery_ctl.grid;
                                 grid.clear();
                             }
-                            gallery_dirty = true;
+                            gallery_ctl.dirty = true;
                             menu_dirty = true;
                         }
                         MenuOutcome::NewQueue(q) => {
@@ -855,10 +845,11 @@ impl Slideshow {
                             current_queue_idx = 0;
                             prefetched.clear();
                             shown_ids.clear();
-                            if let Some(grid) = gallery.as_mut() {
+                            if gallery_mode {
+                                let grid = &mut gallery_ctl.grid;
                                 grid.clear();
                             }
-                            gallery_dirty = true;
+                            gallery_ctl.dirty = true;
                             menu_dirty = true;
                         }
                         MenuOutcome::Switched(q) => {
@@ -872,11 +863,12 @@ impl Slideshow {
                             current_meta = None;
                             current_rgba = None;
                             menu.open = false;
-                            if let Some(grid) = gallery.as_mut() {
+                            if gallery_mode {
+                                let grid = &mut gallery_ctl.grid;
                                 grid.clear();
                             }
-                            gallery_dirty = true;
-                            if in_gallery {
+                            gallery_ctl.dirty = true;
+                            if mode.is_gallery() {
                                 gallery_thumb_cursor = 0;
                             } else {
                                 last_advance = Instant::now()
@@ -934,31 +926,28 @@ impl Slideshow {
             }
 
             // ── Gallery grid ───────────────────────────────────────────────
-            if in_gallery {
-                if let Some(grid) = gallery.as_mut() {
+            if mode.is_gallery() {
+                if gallery_mode {
+                    let grid = &mut gallery_ctl.grid;
                     grid.clamp_scroll(queue.len(), renderer.height());
                     let sel = grid.selected.min(queue.len().saturating_sub(1));
                     if self
-                        .try_extend_queue(
-                            &mut queue,
-                            &mut queue_loader,
-                            sel,
-                            &remote_status,
-                        )
+                        .try_extend_queue(&mut queue, &mut queue_loader, sel, &remote_status)
                         .await
                     {
-                        gallery_dirty = true;
+                        gallery_ctl.dirty = true;
                     }
                     // Always load the selected thumb first so it is visible.
                     if !queue.is_empty() && grid.thumb(sel).is_none() {
                         let (pidx, meta) = &queue[sel];
                         let thumb_px = grid.cell;
-                        if let Some(bytes) =
-                            self.fetch_photo_thumb(*pidx, meta, thumb_px, renderer).await
+                        if let Some(bytes) = self
+                            .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
+                            .await
                         {
                             if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
                                 grid.insert_thumb(sel, img);
-                                gallery_dirty = true;
+                                gallery_ctl.dirty = true;
                             }
                         }
                     }
@@ -978,12 +967,13 @@ impl Slideshow {
                             gallery_thumb_cursor = (start + offset + 1) % visible.len();
                             let (pidx, meta) = &queue[pick];
                             let thumb_px = grid.cell;
-                            if let Some(bytes) =
-                                self.fetch_photo_thumb(*pidx, meta, thumb_px, renderer).await
+                            if let Some(bytes) = self
+                                .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
+                                .await
                             {
                                 if let Ok(img) = renderer.decode_thumbnail(&bytes, thumb_px) {
                                     grid.insert_thumb(pick, img);
-                                    gallery_dirty = true;
+                                    gallery_ctl.dirty = true;
                                     loaded += 1;
                                 }
                             }
@@ -991,13 +981,12 @@ impl Slideshow {
                     }
                     // Only repaint when something changed — an idle, fully
                     // loaded grid does no render or blit work.
-                    if gallery_dirty {
-                        let frame =
-                            grid.render(renderer.width(), renderer.height(), queue.len());
+                    if gallery_ctl.dirty {
+                        let frame = grid.render(renderer.width(), renderer.height(), queue.len());
                         if let Err(e) = renderer.show_cut(&frame) {
                             warn!("gallery render error: {e}");
                         }
-                        gallery_dirty = false;
+                        gallery_ctl.dirty = false;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1089,14 +1078,20 @@ impl Slideshow {
             if last_temp_check.is_none_or(|t| t.elapsed() >= TEMP_POLL_INTERVAL) {
                 cached_temp = read_cpu_temp();
                 last_temp_check = Some(Instant::now());
-                
+
                 if let Some(temp) = cached_temp {
                     if temp >= 80.0 {
                         warn!("CPU temperature is extremely high ({:.1}°C) — throttling slide interval to cool down", temp);
                     } else if temp >= 75.0 {
-                        warn!("CPU temperature is high ({:.1}°C) — throttling slide interval", temp);
+                        warn!(
+                            "CPU temperature is high ({:.1}°C) — throttling slide interval",
+                            temp
+                        );
                     } else if temp >= 70.0 {
-                        warn!("CPU temperature is warm ({:.1}°C) — throttling slide interval", temp);
+                        warn!(
+                            "CPU temperature is warm ({:.1}°C) — throttling slide interval",
+                            temp
+                        );
                     }
                 }
             }
@@ -1113,13 +1108,8 @@ impl Slideshow {
 
             if last_advance.elapsed() < current_slide_dur {
                 if queue_loader.near_end(cursor, queue.len()) {
-                    self.try_extend_queue(
-                        &mut queue,
-                        &mut queue_loader,
-                        cursor,
-                        &remote_status,
-                    )
-                    .await;
+                    self.try_extend_queue(&mut queue, &mut queue_loader, cursor, &remote_status)
+                        .await;
                 }
                 self.prefetch_one(
                     &queue,
@@ -1187,12 +1177,7 @@ impl Slideshow {
                     crate::osd::draw_photo_info(&mut frame, &meta, exif_date.as_deref());
                     crate::osd::draw_nav_arrows(&mut frame);
                     // Mark already-favourited photos with a ♥ in the corner.
-                    if meta
-                        .extra
-                        .get("favorite")
-                        .map(|v| v == "true")
-                        .unwrap_or(false)
-                    {
+                    if meta.is_favorite {
                         crate::osd::draw_favorite(&mut frame);
                     }
                 }
@@ -1239,11 +1224,6 @@ impl Slideshow {
                 current_rgba = Some(frame);
                 // Remember the source plugin + metadata for the favourite toggle.
                 let plugin_idx = queue[q_idx].0;
-                let favorite = meta
-                    .extra
-                    .get("favorite")
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
                 current_meta = Some((plugin_idx, meta.clone()));
                 last_advance = Instant::now();
                 // Reflect the newly displayed photo in the remote's status endpoint.
@@ -1252,8 +1232,8 @@ impl Slideshow {
                     s.index = q_idx;
                     s.total = queue.len();
                     s.filename = meta.filename.clone();
-                    s.album = meta.extra.get("album").cloned().unwrap_or_default();
-                    s.favorite = favorite;
+                    s.album = meta.album.clone().unwrap_or_default();
+                    s.favorite = meta.is_favorite;
                 }
             }
 
@@ -1309,6 +1289,7 @@ impl Slideshow {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // prefetch-ring state fan-out; a struct would only add ceremony
     async fn prefetch_one(
         &self,
         queue: &[(usize, PhotoMeta)],
@@ -1374,20 +1355,12 @@ impl Slideshow {
             debug!("Favourite toggle ignored — no photo on screen yet");
             return;
         };
-        let currently = meta
-            .extra
-            .get("favorite")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let currently = meta.is_favorite;
         let target = !currently;
 
         match self.plugins[*plugin_idx].set_favorite(&*meta, target).await {
             Ok(()) => {
-                if target {
-                    meta.extra.insert("favorite".into(), "true".into());
-                } else {
-                    meta.extra.remove("favorite");
-                }
+                meta.is_favorite = target;
                 info!(
                     "{} photo: {}",
                     if target {
@@ -1428,58 +1401,80 @@ impl Slideshow {
         sources: &[(String, bool)],
     ) -> Vec<crate::menu::MenuRow> {
         let targeting = self.targeting_menu_ctx();
+        let connections = self.connection_menu_ctx();
         crate::menu::build_rows(&crate::menu::RowsCtx {
             display: &self.config.display,
             paused,
             sources,
             wifi: &self.config.wifi,
-            photoprism: self.photoprism_fields(),
+            connections: &connections,
             targeting: targeting.as_ref(),
             editing: menu.editing,
             buffer: &menu.buffer,
         })
     }
 
-    /// Targeting section for the menu when PhotoPrism or directory is active.
+    /// Targeting adapters from live plugins (capability-driven, no name checks).
+    fn targeting_adapters(&self) -> Vec<(String, picogallery_core::TargetingAdapter)> {
+        self.plugins
+            .iter()
+            .map(|p| (p.name().to_string(), p.capabilities().targeting))
+            .collect()
+    }
+
+    fn apply_targeting_now(&mut self) {
+        let adapters = self.targeting_adapters();
+        let refs: Vec<_> = adapters.iter().map(|(n, a)| (n.as_str(), *a)).collect();
+        self.config.apply_targeting(&refs);
+    }
+
+    /// Targeting section for the menu when any active plugin supports it.
     fn targeting_menu_ctx(&self) -> Option<crate::menu::TargetingMenuCtx<'_>> {
-        let entry = self.config.plugins.iter().find(|p| {
-            p.enabled && matches!(p.name.as_str(), "photoprism" | "directory")
+        let plugin = self.plugins.iter().find(|p| {
+            let caps = p.capabilities();
+            self.config
+                .plugins
+                .iter()
+                .any(|e| e.enabled && e.name == p.name())
+                && caps.supports_targeting()
         })?;
+        let caps = plugin.capabilities();
         Some(crate::menu::TargetingMenuCtx {
             album_label: self.config.targeting.album_label(),
             favorites_only: self.config.targeting.favorites_only,
-            show_favorites: entry.name == "photoprism",
+            show_favorites: caps.targeting.supports_favorites_filter(),
         })
     }
 
-    /// `(url, username, has_password)` for the configured PhotoPrism source, or
-    /// `None` if there is no `photoprism` entry. Never returns the password —
-    /// only whether one is set — so it can't leak into a menu label.
-    fn photoprism_fields(&self) -> Option<(&str, &str, bool)> {
-        let entry = self
-            .config
-            .plugins
-            .iter()
-            .find(|p| p.name == "photoprism")?;
-        let url = entry.config.get_str("url").unwrap_or("");
-        let user = entry.config.get_str("username").unwrap_or("");
-        let has_pw = entry
-            .config
-            .get_str("password")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        Some((url, user, has_pw))
-    }
-
-    /// Current value of a PhotoPrism config key (empty string if absent).
-    fn photoprism_value(&self, key: &str) -> String {
-        self.config
-            .plugins
-            .iter()
-            .find(|p| p.name == "photoprism")
-            .and_then(|e| e.config.get_str(key))
-            .unwrap_or("")
-            .to_string()
+    /// Connection menu sections from plugins that advertise connection UI.
+    fn connection_menu_ctx(&self) -> Vec<crate::menu::ConnectionMenuCtx> {
+        let mut out = Vec::new();
+        for (plugin_idx, plugin) in self.plugins.iter().enumerate() {
+            let caps = plugin.capabilities();
+            if !caps.has_connection_ui() {
+                continue;
+            }
+            let Some(entry) = self.config.plugins.iter().find(|e| e.name == plugin.name()) else {
+                continue;
+            };
+            let fields = caps
+                .connection_fields
+                .iter()
+                .map(|f| crate::menu::ConnectionMenuField {
+                    key: f.key.to_string(),
+                    label: f.label.to_string(),
+                    secret: f.secret,
+                    value: entry.config.get_str(f.key).unwrap_or("").to_string(),
+                })
+                .collect();
+            out.push(crate::menu::ConnectionMenuCtx {
+                plugin_idx,
+                header: plugin.display_name().to_uppercase(),
+                fields,
+                reconnect_label: caps.reconnect_label.map(str::to_string),
+            });
+        }
+        out
     }
 
     /// Initial buffer when a field starts being edited. Secrets start empty so
@@ -1489,9 +1484,28 @@ impl Slideshow {
         match field {
             EditField::WifiSsid => self.config.wifi.ssid.clone(),
             EditField::WifiPassword => String::new(),
-            EditField::PhotoPrismUrl => self.photoprism_value("url"),
-            EditField::PhotoPrismUser => self.photoprism_value("username"),
-            EditField::PhotoPrismPassword => String::new(),
+            EditField::Connection {
+                plugin_idx,
+                field_idx,
+            } => {
+                let Some(plugin) = self.plugins.get(plugin_idx) else {
+                    return String::new();
+                };
+                let caps = plugin.capabilities();
+                let Some(desc) = caps.connection_fields.get(field_idx) else {
+                    return String::new();
+                };
+                if desc.secret {
+                    return String::new();
+                }
+                self.config
+                    .plugins
+                    .iter()
+                    .find(|e| e.name == plugin.name())
+                    .and_then(|e| e.config.get_str(desc.key))
+                    .unwrap_or("")
+                    .to_string()
+            }
         }
     }
 
@@ -1501,24 +1515,26 @@ impl Slideshow {
         match field {
             EditField::WifiSsid => self.config.wifi.ssid = value,
             EditField::WifiPassword => self.config.wifi.password = value,
-            EditField::PhotoPrismUrl => self.set_photoprism_value("url", value),
-            EditField::PhotoPrismUser => self.set_photoprism_value("username", value),
-            EditField::PhotoPrismPassword => self.set_photoprism_value("password", value),
-        }
-    }
-
-    /// Set a key in the PhotoPrism plugin's config (no-op if the entry is gone).
-    fn set_photoprism_value(&mut self, key: &str, value: String) {
-        if let Some(entry) = self
-            .config
-            .plugins
-            .iter_mut()
-            .find(|p| p.name == "photoprism")
-        {
-            entry
-                .config
-                .values
-                .insert(key.to_string(), serde_json::Value::String(value));
+            EditField::Connection {
+                plugin_idx,
+                field_idx,
+            } => {
+                let Some(plugin) = self.plugins.get(plugin_idx) else {
+                    return;
+                };
+                let name = plugin.name().to_string();
+                let caps = plugin.capabilities();
+                let Some(desc) = caps.connection_fields.get(field_idx) else {
+                    return;
+                };
+                let key = desc.key.to_string();
+                if let Some(entry) = self.config.plugins.iter_mut().find(|e| e.name == name) {
+                    entry
+                        .config
+                        .values
+                        .insert(key, serde_json::Value::String(value));
+                }
+            }
         }
     }
 
@@ -1614,19 +1630,16 @@ impl Slideshow {
                 }
                 MenuOutcome::Stay
             }
-            MenuAction::ConnectPhotoPrism => {
-                match self
-                    .config
-                    .plugins
-                    .iter()
-                    .position(|p| p.name == "photoprism")
-                {
-                    // Reconnect = switch to the (re-configured) photoprism source,
-                    // reusing the full rebuild + re-auth + re-queue path with
-                    // rollback on failure.
-                    Some(idx) => self.switch_source(idx, renderer).await,
+            MenuAction::ReconnectPlugin(plugin_idx) => {
+                // Map live plugin index → config.plugins index for switch_source.
+                let Some(plugin) = self.plugins.get(plugin_idx) else {
+                    return MenuOutcome::Stay;
+                };
+                let name = plugin.name().to_string();
+                match self.config.plugins.iter().position(|p| p.name == name) {
+                    Some(cfg_idx) => self.switch_source(cfg_idx, renderer).await,
                     None => {
-                        warn!("Connect PhotoPrism: no photoprism source configured");
+                        warn!("Reconnect: no config entry for source '{name}'");
                         MenuOutcome::Stay
                     }
                 }
@@ -1656,16 +1669,14 @@ impl Slideshow {
     }
 
     async fn cycle_album_target(&mut self) -> MenuOutcome {
-        let plugin_name = match self
-            .config
-            .plugins
-            .iter()
-            .find(|p| p.enabled && matches!(p.name.as_str(), "photoprism" | "directory"))
-        {
-            Some(p) => p.name.clone(),
-            None => return MenuOutcome::Stay,
-        };
-        let Some(plugin_idx) = self.plugins.iter().position(|p| p.name() == plugin_name) else {
+        let Some(plugin_idx) = self.plugins.iter().position(|p| {
+            p.capabilities().targeting.supports_albums()
+                && self
+                    .config
+                    .plugins
+                    .iter()
+                    .any(|e| e.enabled && e.name == p.name())
+        }) else {
             return MenuOutcome::Stay;
         };
         let albums = match self.plugins[plugin_idx].list_albums().await {
@@ -1688,7 +1699,7 @@ impl Slideshow {
             .unwrap_or(0);
         let next = options[(pos + 1) % options.len()].clone();
         self.config.targeting.album = next.unwrap_or_default();
-        self.config.apply_targeting();
+        self.apply_targeting_now();
         if let Err(e) = self.reload_plugins_after_targeting().await {
             warn!("Reload after album change failed: {e}");
             return MenuOutcome::Stay;
@@ -1710,16 +1721,18 @@ impl Slideshow {
     }
 
     async fn toggle_favorites_target(&mut self) -> MenuOutcome {
-        if !self
-            .config
-            .plugins
-            .iter()
-            .any(|p| p.enabled && p.name == "photoprism")
-        {
+        if !self.plugins.iter().any(|p| {
+            p.capabilities().targeting.supports_favorites_filter()
+                && self
+                    .config
+                    .plugins
+                    .iter()
+                    .any(|e| e.enabled && e.name == p.name())
+        }) {
             return MenuOutcome::Stay;
         }
         self.config.targeting.favorites_only = !self.config.targeting.favorites_only;
-        self.config.apply_targeting();
+        self.apply_targeting_now();
         if let Err(e) = self.reload_plugins_after_targeting().await {
             warn!("Reload after favourites toggle failed: {e}");
             return MenuOutcome::Stay;
@@ -1901,36 +1914,6 @@ impl Slideshow {
     }
 }
 
-/// Copy `src` into the centre of `dst`, clipped on every edge. Handles `src`
-/// both smaller than `dst` (letterbox — centred with a border) and larger
-/// (fill crop — centre region copied). Straight row memcpy, no blending.
-fn blit_center(dst: &mut RgbaImage, src: &RgbaImage) {
-    let (dw, dh) = dst.dimensions();
-    let (sw, sh) = src.dimensions();
-    let ox = (dw as i32 - sw as i32) / 2;
-    let oy = (dh as i32 - sh as i32) / 2;
-    let dstride = dw as usize * 4;
-    let sstride = sw as usize * 4;
-    let dbuf = dst.as_mut();
-    let sbuf = src.as_raw();
-    for sy in 0..sh as i32 {
-        let dy = oy + sy;
-        if dy < 0 || dy >= dh as i32 {
-            continue;
-        }
-        let dx0 = ox.max(0);
-        let sx0 = dx0 - ox; // ≥ 0 by construction
-        let copy_w = (sw as i32 - sx0).min(dw as i32 - dx0);
-        if copy_w <= 0 {
-            continue;
-        }
-        let d = dy as usize * dstride + dx0 as usize * 4;
-        let s = sy as usize * sstride + sx0 as usize * 4;
-        let n = copy_w as usize * 4;
-        dbuf[d..d + n].copy_from_slice(&sbuf[s..s + n]);
-    }
-}
-
 // ── Menu value cyclers ───────────────────────────────────────────────────────
 
 fn next_transition(t: &Transition) -> Transition {
@@ -2020,11 +2003,7 @@ fn shuffle_seed_now() -> u64 {
         .unwrap_or(42)
 }
 
-fn apply_order(
-    queue: &mut Vec<(usize, PhotoMeta)>,
-    display: &DisplayConfig,
-    seed: u64,
-) {
+fn apply_order(queue: &mut Vec<(usize, PhotoMeta)>, display: &DisplayConfig, seed: u64) {
     match display.order {
         PhotoOrder::Shuffle => {
             shuffle(queue, seed);
@@ -2050,7 +2029,7 @@ fn apply_order(
 /// into the existing queue (a full re-sort on every extension would be costly
 /// on a Pi Zero). `on_this_day_boost` is not re-run for tail segments.
 fn apply_order_tail(
-    queue: &mut Vec<(usize, PhotoMeta)>,
+    queue: &mut [(usize, PhotoMeta)],
     from: usize,
     display: &DisplayConfig,
     seed: u64,
@@ -2140,7 +2119,7 @@ fn date_cluster_order(all: Vec<(usize, PhotoMeta)>, seed: u64) -> Vec<(usize, Ph
             .1
             .taken_at
             .map(|t| t.format("%Y-%m-%d").to_string())
-            .or_else(|| item.1.extra.get("album").cloned())
+            .or_else(|| item.1.album.clone())
             .unwrap_or_default();
         groups.entry(key).or_default().push(item);
     }
@@ -2220,6 +2199,10 @@ mod tests {
             height: 0,
             taken_at: None,
             download_url: None,
+            album: None,
+            title: None,
+            location: None,
+            is_favorite: false,
             extra: Default::default(),
         }
     }
@@ -2229,7 +2212,9 @@ mod tests {
         // Plugin 0 returned only 10 items (< PAGE_SIZE) in the single initial
         // round — it must be treated as exhausted so navigation near the end
         // doesn't waste a round-trip re-discovering that.
-        let queue: Vec<_> = (0..10).map(|i| (0usize, meta_for(&format!("p{i}")))).collect();
+        let queue: Vec<_> = (0..10)
+            .map(|i| (0usize, meta_for(&format!("p{i}"))))
+            .collect();
         let mut loader = QueueLoader::new(1);
         loader.sync_counts(&queue);
         assert!(loader.all_exhausted());
@@ -2266,23 +2251,5 @@ mod tests {
         let loader = QueueLoader::new(1);
         assert!(loader.near_end(9, 10));
         assert!(!loader.near_end(0, 1000));
-    }
-
-    #[test]
-    fn blit_center_centres_smaller_source_without_overflow() {
-        let mut dst = RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255]));
-        let src = RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255]));
-        blit_center(&mut dst, &src);
-        // Centre pixel comes from src (red); a corner stays black.
-        assert_eq!(dst.get_pixel(5, 5)[0], 255);
-        assert_eq!(dst.get_pixel(0, 0)[0], 0);
-    }
-
-    #[test]
-    fn blit_center_crops_larger_source_without_panicking() {
-        let mut dst = RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]));
-        let src = RgbaImage::from_pixel(10, 10, Rgba([0, 255, 0, 255]));
-        blit_center(&mut dst, &src); // must not panic; fills with src
-        assert_eq!(dst.get_pixel(2, 2)[1], 255);
     }
 }

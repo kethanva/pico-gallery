@@ -63,8 +63,7 @@ struct LwaToken {
 #[derive(Deserialize)]
 struct NodeList {
     data: Vec<Node>,
-    /// Opaque continuation token. Unused until token-based paging is wired up.
-    #[allow(dead_code)]
+    /// Opaque continuation token for the next page.
     #[serde(rename = "nextToken")]
     next_token: Option<String>,
 }
@@ -100,12 +99,21 @@ struct PendingAuth {
     interval: u64,
 }
 
+/// Cached Drive API pages so offset paging can walk `nextToken` without a 200 cap.
+#[derive(Default)]
+struct PageCache {
+    photos: Vec<PhotoMeta>,
+    next_token: Option<String>,
+    exhausted: bool,
+}
+
 pub struct AmazonPhotosPlugin {
     cfg: PluginConfig,
     client: reqwest::Client,
     token: Option<StoredToken>,
     token_dir: PathBuf,
     pending: Option<PendingAuth>,
+    page_cache: tokio::sync::Mutex<PageCache>,
 }
 
 impl AmazonPhotosPlugin {
@@ -121,6 +129,7 @@ impl AmazonPhotosPlugin {
             token: None,
             token_dir: dirs::config_dir().unwrap_or_default().join("picogallery"),
             pending: None,
+            page_cache: tokio::sync::Mutex::new(PageCache::default()),
         }
     }
 
@@ -355,42 +364,38 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         Ok(())
     }
 
-    /// Emulates offset paging over the Drive API's token-based paging by
-    /// over-fetching a single page. NOTE: this silently caps the library at
-    /// `API_MAX_LIMIT` (200) photos total — offsets at or past the cap return
-    /// an empty page so the engine stops paging.
+    /// Offset paging over the Drive API's token pages. Accumulates nodes in
+    /// `page_cache` so callers can walk past the first API page without a hard cap.
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
-        // The Drive API pages with an opaque nextToken, not a numeric offset.
-        // To honour `offset` statelessly, request `offset + limit` items in one
-        // call (capped at the API maximum of 200) and skip the first `offset`.
-        // Past the cap we report exhaustion so the engine stops paging instead
-        // of receiving the same first page forever.
-        const API_MAX_LIMIT: usize = 200;
-        let want = offset.saturating_add(limit).min(API_MAX_LIMIT);
-        if offset >= want {
+        if limit == 0 {
             return Ok(vec![]);
         }
 
-        let url = format!(
-            "{}/nodes?filters=kind:PHOTOS&limit={}&asset=ALL&tempLink=true",
-            DRIVE_API, want
-        );
+        let mut cache = self.page_cache.lock().await;
+        // A fresh walk from offset 0 after exhaustion still serves the cache;
+        // only fetch more when the requested window is past what we have.
+        while cache.photos.len() < offset.saturating_add(limit) && !cache.exhausted {
+            const PAGE_SIZE: usize = 200;
+            let mut url = format!(
+                "{}/nodes?filters=kind:PHOTOS&limit={}&asset=ALL&tempLink=true",
+                DRIVE_API, PAGE_SIZE
+            );
+            if let Some(token) = cache.next_token.as_deref() {
+                url.push_str(&format!("&startToken={}", urlencoding_encode(token)));
+            }
 
-        let res = self
-            .client
-            .get(&url)
-            .bearer_auth(self.access_token()?)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<NodeList>()
-            .await?;
+            let res = self
+                .client
+                .get(&url)
+                .bearer_auth(self.access_token()?)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<NodeList>()
+                .await?;
 
-        let photos = res
-            .data
-            .into_iter()
-            .skip(offset)
-            .map(|node| {
+            let batch_len = res.data.len();
+            for node in res.data {
                 let (w, h, taken) = node
                     .content
                     .as_ref()
@@ -407,30 +412,49 @@ impl PhotoPlugin for AmazonPhotosPlugin {
                     })
                     .unwrap_or((0, 0, None));
 
-                PhotoMeta {
+                cache.photos.push(PhotoMeta {
                     id: node.id.clone(),
                     filename: node.name,
                     width: w,
                     height: h,
                     taken_at: taken,
                     download_url: Some(format!("{}/nodes/{}/content", DRIVE_API, node.id)),
+                    album: None,
+                    title: None,
+                    location: None,
+                    is_favorite: false,
                     extra: Default::default(),
-                }
-            })
-            .collect();
+                });
+            }
 
-        Ok(photos)
+            cache.next_token = res.next_token;
+            if cache.next_token.is_none() || batch_len == 0 {
+                cache.exhausted = true;
+            }
+        }
+
+        let end = (offset + limit).min(cache.photos.len());
+        if offset >= cache.photos.len() {
+            Ok(vec![])
+        } else {
+            Ok(cache.photos[offset..end].to_vec())
+        }
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
-        let url = meta
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
+        let base = meta
             .download_url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no URL for {}", meta.id))?;
 
+        // Request a resized variant so gallery thumbs are not full originals.
+        let view = dw.max(dh).max(320);
+        let sep = if base.contains('?') { '&' } else { '?' };
+        let url = format!("{base}{sep}viewBox={view}");
+
         let resp = self
             .client
-            .get(url)
+            .get(&url)
             .bearer_auth(self.access_token()?)
             .send()
             .await?
@@ -455,8 +479,29 @@ impl PhotoPlugin for AmazonPhotosPlugin {
                 meta.filename
             ));
         }
+        if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
+            return Err(anyhow::anyhow!("not a JPEG (bad magic): {}", meta.filename));
+        }
 
-        debug!("Fetched {} bytes for {}", bytes.len(), meta.filename);
+        debug!(
+            "Fetched {} bytes for {} (viewBox={view})",
+            bytes.len(),
+            meta.filename
+        );
         Ok(bytes)
     }
+}
+
+/// Minimal query-encode for opaque Amazon startToken values (no extra crate).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

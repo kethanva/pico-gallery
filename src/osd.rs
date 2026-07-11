@@ -249,32 +249,33 @@ const MAX_LINES: usize = 4;
 /// Stamp a photo-info pill in the bottom-left corner of `img`.
 ///
 /// Lines displayed (when present), top to bottom, capped at `MAX_LINES`:
-///   1. Title      (`meta.extra["title"]`)      — richer sources only
-///   2. Album name (`meta.extra["album"]`)      — skipped if equal to title
-///   3. Location   (`meta.extra["location"]`)   — "City, Country"
+///   1. Title      (`meta.title`)
+///   2. Album name (`meta.album`) — skipped if equal to title
+///   3. Location   (`meta.location`) — "City, Country"
 ///   4. Capture date (from `exif_date` or `meta.taken_at`)
-///   5. Filename   (`meta.filename`)            — only when no title is present
+///   5. Filename   (`meta.filename`) — only when no title is present
 ///
-/// Sources without the richer keys (plain directories, etc.) fall back to the
-/// original album / date / filename pill. Does nothing when there is no text.
+/// Sources without the richer fields fall back to album / date / filename.
+/// Does nothing when there is no text.
 pub fn draw_photo_info(img: &mut RgbaImage, meta: &PhotoMeta, exif_date: Option<&str>) {
     // `taken_at` fallback owns its String; keep it alive for the borrows below.
     let taken_at_str: Option<String> = meta.taken_at.map(|dt| dt.format("%Y-%m-%d").to_string());
 
-    let nonempty = |k: &str| meta.extra.get(k).filter(|s| !s.is_empty());
-    let title = nonempty("title");
+    let title = meta.title.as_deref().filter(|s| !s.is_empty());
+    let album = meta.album.as_deref().filter(|s| !s.is_empty());
+    let location = meta.location.as_deref().filter(|s| !s.is_empty());
 
     let mut lines: Vec<Cow<'_, str>> = Vec::with_capacity(MAX_LINES);
     if let Some(t) = title {
         lines.push(truncate(t, MAX_LINE_CHARS));
     }
-    if let Some(album) = nonempty("album") {
+    if let Some(album) = album {
         // Avoid repeating the same text when title == album.
         if title.map(|t| t != album).unwrap_or(true) {
             lines.push(truncate(album, MAX_LINE_CHARS));
         }
     }
-    if let Some(loc) = nonempty("location") {
+    if let Some(loc) = location {
         lines.push(truncate(loc, MAX_LINE_CHARS));
     }
     // Prefer EXIF date; fall back to meta.taken_at.
@@ -406,10 +407,7 @@ pub fn draw_close_button(img: &mut RgbaImage) {
 pub fn close_button_hit(x: i32, y: i32, iw: u32, _ih: u32) -> bool {
     let bx = iw.saturating_sub(CLOSE_BTN + EDGE) as i32;
     let by = EDGE as i32;
-    x >= bx - 4
-        && y >= by - 4
-        && x < bx + CLOSE_BTN as i32 + 4
-        && y < by + CLOSE_BTN as i32 + 4
+    x >= bx - 4 && y >= by - 4 && x < bx + CLOSE_BTN as i32 + 4 && y < by + CLOSE_BTN as i32 + 4
 }
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
@@ -876,7 +874,12 @@ mod tests {
         let cy = by + CLOSE_BTN as i32 / 2;
         assert!(close_button_hit(cx, cy, w, h));
         assert!(close_button_hit(bx, by, w, h));
-        assert!(close_button_hit(bx + CLOSE_BTN as i32 - 1, by + CLOSE_BTN as i32 - 1, w, h));
+        assert!(close_button_hit(
+            bx + CLOSE_BTN as i32 - 1,
+            by + CLOSE_BTN as i32 - 1,
+            w,
+            h
+        ));
         assert!(!close_button_hit(bx - 5, cy, w, h));
         assert!(!close_button_hit(cx, by - 5, w, h));
         assert!(!close_button_hit(bx + CLOSE_BTN as i32 + 4, cy, w, h));

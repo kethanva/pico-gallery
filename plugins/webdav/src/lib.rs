@@ -777,24 +777,30 @@ impl PhotoPlugin for WebDavPlugin {
                     .to_string_lossy()
                     .to_string();
                 // First sub-directory under sync_dir = remote folder → album.
-                let mut extra: std::collections::HashMap<String, String> = Default::default();
-                if let Some(album) = path
+                let album = path
                     .strip_prefix(&sync_dir)
                     .ok()
                     .and_then(|rel| rel.parent())
                     .and_then(|p| p.iter().next())
                     .and_then(|c| c.to_str())
-                {
-                    extra.insert("album".to_string(), album.to_string());
-                }
+                    .map(|s| s.to_string());
+                let taken_at = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0));
                 PhotoMeta {
                     id,
                     filename,
                     width: 0,
                     height: 0,
-                    taken_at: None,
+                    taken_at,
                     download_url: Some(path.to_string_lossy().to_string()),
-                    extra,
+                    album,
+                    title: None,
+                    location: None,
+                    is_favorite: false,
+                    extra: Default::default(),
                 }
             })
             .collect();

@@ -413,6 +413,13 @@ impl PhotoPlugin for GooglePhotosPlugin {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
+                let taken_at = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
+                    });
                 PhotoMeta {
                     // Absolute path as id: stable across restarts and background
                     // syncs, so disk-cache entries always map back to the same
@@ -422,8 +429,12 @@ impl PhotoPlugin for GooglePhotosPlugin {
                     filename,
                     width: 0,
                     height: 0,
-                    taken_at: None,
+                    taken_at,
                     download_url: Some(path.to_string_lossy().to_string()),
+                    album: None,
+                    title: None,
+                    location: None,
+                    is_favorite: false,
                     extra: Default::default(),
                 }
             })
@@ -444,8 +455,21 @@ impl PhotoPlugin for GooglePhotosPlugin {
             .ok_or_else(|| anyhow::anyhow!("no local path for {}", meta.filename))?;
         let path = std::path::Path::new(path_str);
 
+        let canonical = fs::canonicalize(path)
+            .await
+            .with_context(|| format!("resolving {}", path_str))?;
+        let sync_root = fs::canonicalize(self.sync_dir())
+            .await
+            .with_context(|| format!("resolving sync_dir {}", self.sync_dir().display()))?;
+        if !canonical.starts_with(&sync_root) {
+            return Err(anyhow::anyhow!(
+                "security: {} is outside sync_dir",
+                canonical.display()
+            ));
+        }
+
         // Size guard before loading into memory.
-        let file_meta = fs::metadata(path)
+        let file_meta = fs::metadata(&canonical)
             .await
             .with_context(|| format!("stat {}", path_str))?;
         if file_meta.len() > MAX_IMAGE_BYTES {
@@ -456,9 +480,13 @@ impl PhotoPlugin for GooglePhotosPlugin {
             ));
         }
 
-        fs::read(path)
+        let bytes = fs::read(&canonical)
             .await
-            .with_context(|| format!("reading local photo {}", path_str))
+            .with_context(|| format!("reading local photo {}", path_str))?;
+        if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
+            return Err(anyhow::anyhow!("not a JPEG (bad magic): {}", meta.filename));
+        }
+        Ok(bytes)
     }
 }
 
