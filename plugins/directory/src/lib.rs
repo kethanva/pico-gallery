@@ -287,6 +287,27 @@ impl DirectoryPlugin {
         );
         photos
     }
+
+    /// Rebuild the photo list without disturbing offset-based paging.
+    ///
+    /// Photos still present keep their previous order (so `list_photos(limit,
+    /// offset)` cannot resurface already-served items after a rescan). Newly
+    /// discovered paths are appended in path order; removed paths are dropped.
+    fn merge_photo_lists(old: &[ScannedPhoto], new: Vec<ScannedPhoto>) -> Vec<ScannedPhoto> {
+        let mut incoming: HashMap<PathBuf, ScannedPhoto> =
+            new.into_iter().map(|p| (p.path.clone(), p)).collect();
+        let mut out = Vec::with_capacity(incoming.len());
+        for prev in old {
+            if let Some(updated) = incoming.remove(&prev.path) {
+                out.push(updated);
+            }
+        }
+        let mut added: Vec<ScannedPhoto> = incoming.into_values().collect();
+        added.sort_by(|a, b| a.path.cmp(&b.path));
+        out.extend(added);
+        out
+    }
+
 }
 
 // ── PhotoPlugin impl ──────────────────────────────────────────────────────────
@@ -369,10 +390,12 @@ impl PhotoPlugin for DirectoryPlugin {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let list = DirectoryPlugin::build_photo_list_at(&root, &cfg).await;
-                    let n = list.len();
-                    *photos.write().await = list;
-                    info!("Directory plugin: background rescan complete ({n} photos)");
+                    let fresh = DirectoryPlugin::build_photo_list_at(&root, &cfg).await;
+                    let mut guard = photos.write().await;
+                    let merged = DirectoryPlugin::merge_photo_lists(&guard, fresh);
+                    let n = merged.len();
+                    *guard = merged;
+                    info!("Directory plugin: background rescan complete ({n} photos, order preserved)");
                 }
             });
             self.rescan_abort = Some(handle.abort_handle());
@@ -390,8 +413,13 @@ impl PhotoPlugin for DirectoryPlugin {
         Ok(AuthStatus::Authenticated)
     }
     async fn refresh_auth(&mut self) -> Result<()> {
-        let photos = self.build_photo_list().await;
-        *self.photos.write().await = photos;
+        let fresh = self.build_photo_list().await;
+        let mut guard = self.photos.write().await;
+        if guard.is_empty() {
+            *guard = fresh;
+        } else {
+            *guard = Self::merge_photo_lists(&guard, fresh);
+        }
         Ok(())
     }
 
@@ -621,6 +649,41 @@ mod tests {
         shuffle(&mut b, 9999999);
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn merge_photo_lists_preserves_order_and_appends_new() {
+        let old = vec![
+            ScannedPhoto {
+                path: PathBuf::from("/p/b.jpg"),
+                album: None,
+                modified_secs: 2,
+            },
+            ScannedPhoto {
+                path: PathBuf::from("/p/a.jpg"),
+                album: None,
+                modified_secs: 1,
+            },
+        ];
+        let new = vec![
+            ScannedPhoto {
+                path: PathBuf::from("/p/a.jpg"),
+                album: Some("x".into()),
+                modified_secs: 9,
+            },
+            ScannedPhoto {
+                path: PathBuf::from("/p/c.jpg"),
+                album: None,
+                modified_secs: 3,
+            },
+        ];
+        let merged = DirectoryPlugin::merge_photo_lists(&old, new);
+        // b removed; a keeps its place among survivors; c is new → appended.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].path, PathBuf::from("/p/a.jpg"));
+        assert_eq!(merged[0].modified_secs, 9);
+        assert_eq!(merged[1].path, PathBuf::from("/p/c.jpg"));
+    }
+
 
     #[test]
     fn scanned_photo_into_meta_carries_album() {

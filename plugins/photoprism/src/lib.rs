@@ -92,7 +92,7 @@ use chrono::Datelike;
 use log::{debug, info, warn};
 use reqwest::{header, Client, ClientBuilder, StatusCode};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -256,6 +256,8 @@ struct Session {
 #[derive(Default)]
 struct State {
     cached: Vec<PhotoMeta>,
+    /// IDs already present in `cached` — keeps overlapping API pages unique.
+    cached_ids: HashSet<String>,
     next_page: u32,
     exhausted: bool,
     session: Option<Session>,
@@ -814,9 +816,14 @@ impl PhotoPrismPlugin {
             let sess = state.session.as_ref().expect("session set above");
 
             let returned = photos.len() as u32;
+            // Deduplicate by photo id. Overlapping pages (unstable sort, or
+            // `order=random`) must not inflate the cache with repeats that the
+            // gallery would then show again on the next offset window.
             for p in photos {
                 if let Some(meta) = photo_to_meta(p, sess, album_title.as_deref()) {
-                    state.cached.push(meta);
+                    if state.cached_ids.insert(meta.id.clone()) {
+                        state.cached.push(meta);
+                    }
                 }
             }
 
@@ -1080,6 +1087,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
         let mut state = self.state.lock().await;
         state.session = None;
         state.cached = Vec::new();
+        state.cached_ids.clear();
         state.next_page = 0;
         state.exhausted = false;
         state.albums_loaded = false;

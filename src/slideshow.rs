@@ -318,12 +318,39 @@ impl Slideshow {
         remote_status: &Option<SharedStatus>,
     ) -> bool {
         let before = queue.len();
-        let batch = Self::fetch_queue_round(&self.plugins, loader).await;
-        if batch.is_empty() {
+        // Skip photos already in the queue. Offset paging can resurface the
+        // same IDs when a plugin reshuffles/rescans mid-session, or when a
+        // remote API (e.g. order=random) returns overlapping pages.
+        let mut seen: HashSet<(usize, String)> = queue
+            .iter()
+            .map(|(pi, m)| (*pi, m.id.clone()))
+            .collect();
+        // One gallery tick may land in a duplicate window after a rescan —
+        // walk a few pages in this call so the UI still advances.
+        let mut unique: Vec<(usize, PhotoMeta)> = Vec::new();
+        for _ in 0..8 {
+            if loader.all_exhausted() {
+                break;
+            }
+            let batch = Self::fetch_queue_round(&self.plugins, loader).await;
+            if batch.is_empty() {
+                break;
+            }
+            let fresh = filter_unseen_photos(batch, &mut seen);
+            if fresh.is_empty() {
+                continue;
+            }
+            unique.extend(fresh);
+            // Prefer returning once we have a useful page of new photos.
+            if unique.len() >= PAGE_SIZE {
+                break;
+            }
+        }
+        if unique.is_empty() {
             return false;
         }
         let from = queue.len();
-        queue.extend(batch);
+        queue.extend(unique);
         apply_order_tail(queue, from, &self.config.display, loader.shuffle_seed);
         info!(
             "Loaded {} more photos ({} total)",
@@ -2005,6 +2032,19 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
+
+/// Keep only `(plugin_idx, id)` pairs not already recorded in `seen`.
+/// Inserts kept keys into `seen` so callers can chain multiple batches.
+fn filter_unseen_photos(
+    batch: Vec<(usize, PhotoMeta)>,
+    seen: &mut HashSet<(usize, String)>,
+) -> Vec<(usize, PhotoMeta)> {
+    batch
+        .into_iter()
+        .filter(|(pi, m)| seen.insert((*pi, m.id.clone())))
+        .collect()
+}
+
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
 
 fn shuffle<T>(v: &mut [T], seed: u64) {
@@ -2276,4 +2316,20 @@ mod tests {
         assert!(loader.near_end(9, 10));
         assert!(!loader.near_end(0, 1000));
     }
+    #[test]
+    fn filter_unseen_photos_drops_duplicates_keeps_new() {
+        let mut seen: HashSet<(usize, String)> = HashSet::new();
+        seen.insert((0, "a".into()));
+        let batch = vec![
+            (0usize, meta_for("a")),
+            (0usize, meta_for("b")),
+            (1usize, meta_for("a")), // different plugin — keep
+            (0usize, meta_for("b")), // dup in same batch — drop
+        ];
+        let fresh = filter_unseen_photos(batch, &mut seen);
+        let ids: Vec<_> = fresh.iter().map(|(pi, m)| (*pi, m.id.as_str())).collect();
+        assert_eq!(ids, vec![(0, "b"), (1, "a")]);
+        assert!(seen.contains(&(0, "b".into())));
+    }
+
 }
