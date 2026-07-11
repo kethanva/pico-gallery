@@ -18,6 +18,7 @@
 /// ```
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,7 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::RwLock;
 
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{
+    AuthStatus, PhotoMeta, PhotoPlugin, PluginCapabilities, PluginConfig, TargetingAdapter,
+};
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB guard (matches other plugins)
 
@@ -69,10 +72,11 @@ impl ScannedPhoto {
             .to_string_lossy()
             .to_string();
 
-        let mut extra = HashMap::new();
-        if let Some(album) = self.album {
-            extra.insert("album".to_string(), album);
-        }
+        let taken_at = if self.modified_secs > 0 {
+            DateTime::<Utc>::from_timestamp(self.modified_secs as i64, 0)
+        } else {
+            None
+        };
 
         PhotoMeta {
             // Use the absolute path as the id: stable across restarts and
@@ -83,10 +87,14 @@ impl ScannedPhoto {
             filename,
             width: 0,
             height: 0,
-            taken_at: None,
+            taken_at,
             // Store local path in download_url so get_photo_bytes can read it.
             download_url: Some(self.path.to_string_lossy().to_string()),
-            extra,
+            album: self.album,
+            title: None,
+            location: None,
+            is_favorite: false,
+            extra: HashMap::new(),
         }
     }
 }
@@ -294,6 +302,19 @@ impl PhotoPlugin for DirectoryPlugin {
     }
     fn version(&self) -> &str {
         "0.1.0"
+    }
+
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities {
+            targeting: TargetingAdapter {
+                album_key: Some("allowed_albums"),
+                album_as_array: true,
+                favorites_key: None,
+            },
+            favorite_toggle: false,
+            connection_fields: Vec::new(),
+            reconnect_label: None,
+        }
     }
 
     async fn init(&mut self, config: &PluginConfig) -> Result<()> {
@@ -593,10 +614,7 @@ mod tests {
         let meta = photo.into_meta();
         assert_eq!(meta.id, "/photos/Vacation/img.jpg");
         assert_eq!(meta.filename, "img.jpg");
-        assert_eq!(
-            meta.extra.get("album").map(String::as_str),
-            Some("Vacation")
-        );
+        assert_eq!(meta.album.as_deref(), Some("Vacation"));
         assert_eq!(
             meta.download_url.as_deref(),
             Some("/photos/Vacation/img.jpg")
@@ -611,7 +629,7 @@ mod tests {
             modified_secs: 0,
         };
         let meta = photo.into_meta();
-        assert!(!meta.extra.contains_key("album"));
+        assert!(meta.album.is_none());
     }
 
     #[tokio::test]

@@ -96,7 +96,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{
+    AuthStatus, ConnectionField, PhotoMeta, PhotoPlugin, PluginCapabilities, PluginConfig,
+    TargetingAdapter,
+};
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_PER_PAGE: u32 = 100;
@@ -132,10 +135,7 @@ fn json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// Parse `POST /api/v1/session` without strict struct deserialization.
 /// PhotoPrism may return both `id` and `session_id`, plus a large `config`
 /// blob — serde rejects duplicate keys when field aliases overlap.
-fn parse_login_response(
-    body: &serde_json::Value,
-    header_sid: Option<String>,
-) -> Result<Session> {
+fn parse_login_response(body: &serde_json::Value, header_sid: Option<String>) -> Result<Session> {
     // PhotoPrism returns the session token as `id` (+ X-Session-ID header).
     // Prefer those over a secondary `session_id` field some builds also emit.
     let sid = header_sid
@@ -156,42 +156,6 @@ fn parse_login_response(
         preview_token,
         download_token,
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionResponse {
-    #[serde(default, alias = "id")]
-    session_id: String,
-    #[serde(default, alias = "accessToken")]
-    access_token: Option<String>,
-    #[serde(default, rename = "previewToken")]
-    preview_token: Option<String>,
-    #[serde(default, rename = "downloadToken")]
-    download_token: Option<String>,
-    #[serde(default)]
-    config: Option<ServerConfig>,
-}
-
-/// The `config` object embedded in a `POST /api/v1/session` response — a subset
-/// of PhotoPrism's `ClientConfig`, which uses camelCase JSON keys.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerConfig {
-    #[serde(default, rename = "previewToken")]
-    preview_token: Option<String>,
-    #[serde(default, rename = "downloadToken")]
-    download_token: Option<String>,
-}
-
-/// `GET /api/v1/config` — runtime preview/download tokens (see
-/// `minimal-photo-app.js` `ensureRuntimeConfig()`, which reads `cfg.previewToken`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigResponse {
-    #[serde(default, rename = "previewToken")]
-    preview_token: Option<String>,
-    #[serde(default, rename = "downloadToken")]
-    download_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -743,9 +707,8 @@ impl PhotoPrismPlugin {
         if resp.status() == StatusCode::UNAUTHORIZED {
             let hint = resp.text().await.unwrap_or_default();
             let hint = hint.chars().take(200).collect::<String>();
-            return Err(anyhow::Error::new(SessionExpired).context(format!(
-                "GET {url} (photos page={page}) HTTP 401: {hint}"
-            )));
+            return Err(anyhow::Error::new(SessionExpired)
+                .context(format!("GET {url} (photos page={page}) HTTP 401: {hint}")));
         }
         let resp = resp
             .error_for_status()
@@ -931,25 +894,18 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
     extra.insert("preview_token".into(), sess.preview_token.clone());
     extra.insert("download_token".into(), sess.download_token.clone());
     extra.insert("media_type".into(), p.media_type);
-    if p.favorite {
-        extra.insert("favorite".into(), "true".into());
-    }
 
     // Human album title (resolved from the configured slug/UID) for the OSD.
-    if let Some(title) = album_title {
-        if !title.is_empty() {
-            extra.insert("album".into(), title.to_string());
-        }
-    }
+    let album = album_title.filter(|t| !t.is_empty()).map(|t| t.to_string());
     // Per-photo title — only when it adds information beyond the filename.
-    if !p.title.is_empty() && p.title != filename {
-        extra.insert("title".into(), p.title);
-    }
+    let title = if !p.title.is_empty() && p.title != filename {
+        Some(p.title)
+    } else {
+        None
+    };
     // "City, Country" location line. PhotoPrism uses "Unknown" / "zz" as
     // placeholders for unresolved places — drop those so the OSD stays clean.
-    if let Some(loc) = format_location(&p.place_city, &p.place_state, &p.place_country) {
-        extra.insert("location".into(), loc);
-    }
+    let location = format_location(&p.place_city, &p.place_state, &p.place_country);
 
     let width = if file.width > 0 { file.width } else { p.width };
     let height = if file.height > 0 {
@@ -969,6 +925,10 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
         height,
         taken_at,
         download_url: None, // resolved at fetch time using hash + token
+        album,
+        title,
+        location,
+        is_favorite: p.favorite,
         extra,
     })
 }
@@ -1045,6 +1005,35 @@ impl PhotoPlugin for PhotoPrismPlugin {
     }
     fn version(&self) -> &str {
         "0.1.0"
+    }
+
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities {
+            targeting: TargetingAdapter {
+                album_key: Some("album"),
+                album_as_array: false,
+                favorites_key: Some("favorites"),
+            },
+            favorite_toggle: true,
+            connection_fields: vec![
+                ConnectionField {
+                    key: "url",
+                    label: "PhotoPrism URL",
+                    secret: false,
+                },
+                ConnectionField {
+                    key: "username",
+                    label: "PhotoPrism user",
+                    secret: false,
+                },
+                ConnectionField {
+                    key: "password",
+                    label: "PhotoPrism password",
+                    secret: true,
+                },
+            ],
+            reconnect_label: Some("Connect PhotoPrism"),
+        }
     }
 
     async fn init(&mut self, config: &PluginConfig) -> Result<()> {
@@ -1412,10 +1401,10 @@ mod tests {
         assert_eq!(m.width, 4000);
         assert_eq!(m.extra.get("hash").unwrap(), "primaryhash");
         assert_eq!(m.extra.get("preview_token").unwrap(), "ptok");
-        assert_eq!(m.extra.get("favorite").unwrap(), "true");
-        assert_eq!(m.extra.get("album").unwrap(), "January 2024");
-        assert_eq!(m.extra.get("title").unwrap(), "Sunset");
-        assert_eq!(m.extra.get("location").unwrap(), "Paris, France");
+        assert!(m.is_favorite);
+        assert_eq!(m.album.as_deref(), Some("January 2024"));
+        assert_eq!(m.title.as_deref(), Some("Sunset"));
+        assert_eq!(m.location.as_deref(), Some("Paris, France"));
         assert!(m.taken_at.is_some());
     }
 
@@ -1755,10 +1744,8 @@ mod tests {
         let sess = parse_login_response(&body, None).unwrap();
         assert_eq!(sess.session_id, "from-id");
 
-        let body2: serde_json::Value = serde_json::from_str(
-            r#"{"id":"good-id","session_id":"bad-sid"}"#,
-        )
-        .unwrap();
+        let body2: serde_json::Value =
+            serde_json::from_str(r#"{"id":"good-id","session_id":"bad-sid"}"#).unwrap();
         let sess2 = parse_login_response(&body2, None).unwrap();
         assert_eq!(sess2.session_id, "good-id");
 
@@ -1771,34 +1758,52 @@ mod tests {
 
     #[test]
     fn session_response_parses_camelcase_tokens() {
-        let json = r#"{
+        // Exercises the production login parser: session id from `id` and
+        // preview/download tokens pulled out of the nested `config` object.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
             "id": "sess-abc123",
             "config": {
                 "previewToken": "pv-live-tok",
                 "downloadToken": "dl-live-tok"
             }
-        }"#;
-        let parsed: SessionResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.session_id, "sess-abc123");
-        let cfg = parsed.config.expect("config object present");
-        assert_eq!(cfg.preview_token.as_deref(), Some("pv-live-tok"));
-        assert_eq!(cfg.download_token.as_deref(), Some("dl-live-tok"));
+        }"#,
+        )
+        .unwrap();
+        let sess = parse_login_response(&body, None).unwrap();
+        assert_eq!(sess.session_id, "sess-abc123");
+        assert_eq!(sess.preview_token, "pv-live-tok");
+        assert_eq!(sess.download_token, "dl-live-tok");
     }
 
     #[test]
     fn config_response_parses_camelcase_tokens() {
-        // `GET /api/v1/config` (ClientConfig) uses camelCase keys.
-        let json = r#"{ "previewToken": "pv-tok", "downloadToken": "dl-tok" }"#;
-        let parsed: ConfigResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.preview_token.as_deref(), Some("pv-tok"));
-        assert_eq!(parsed.download_token.as_deref(), Some("dl-tok"));
+        // `GET /api/v1/config` (ClientConfig) uses camelCase keys; production
+        // reads them via `json_str` rather than a typed struct.
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{ "previewToken": "pv-tok", "downloadToken": "dl-tok" }"#)
+                .unwrap();
+        assert_eq!(
+            json_str(&body, &["previewToken", "preview_token"]).as_deref(),
+            Some("pv-tok")
+        );
+        assert_eq!(
+            json_str(&body, &["downloadToken", "download_token"]).as_deref(),
+            Some("dl-tok")
+        );
     }
 
     #[test]
     fn config_json_accepts_snakecase_alias() {
         let json = r#"{ "preview_token": "pv", "download_token": "dl" }"#;
         let body: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert_eq!(json_str(&body, &["previewToken", "preview_token"]).as_deref(), Some("pv"));
-        assert_eq!(json_str(&body, &["downloadToken", "download_token"]).as_deref(), Some("dl"));
+        assert_eq!(
+            json_str(&body, &["previewToken", "preview_token"]).as_deref(),
+            Some("pv")
+        );
+        assert_eq!(
+            json_str(&body, &["downloadToken", "download_token"]).as_deref(),
+            Some("dl")
+        );
     }
 }

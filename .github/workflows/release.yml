@@ -2,7 +2,7 @@
 # PicoGallery — Build & Release for Raspberry Pi
 # ============================================================
 # Triggers:
-#   - Push to kva-revamparchitecture → auto pre-release (vX.Y.Z-kva.N++)
+#   - Push to kva-revamparchitecture / kva-revamparchitecture2.0 → auto pre-release (vX.Y.Z-kva.N++)
 #   - Push a stable tag like v0.1.0   → full release with GitHub Release
 #   - Push to main                    → build-only (artifact upload, no release)
 #   - Manual dispatch                 → build any branch; optionally create a release
@@ -23,6 +23,7 @@ on:
     branches:
       - main
       - kva-revamparchitecture
+      - kva-revamparchitecture2.0
   workflow_dispatch:
     inputs:
       branch:

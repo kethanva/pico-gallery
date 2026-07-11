@@ -18,22 +18,41 @@ pub struct TargetingMenuCtx<'a> {
 pub enum EditField {
     WifiSsid,
     WifiPassword,
-    PhotoPrismUrl,
-    PhotoPrismUser,
-    PhotoPrismPassword,
+    /// Plugin connection field: `(plugin_config_index, field_index)`.
+    Connection {
+        plugin_idx: usize,
+        field_idx: usize,
+    },
 }
 
 impl EditField {
     /// Human label shown before the value, e.g. "Wi-Fi network".
+    /// Connection fields use the label from [`ConnectionMenuField`].
     pub fn prefix(self) -> &'static str {
         match self {
             EditField::WifiSsid => "Wi-Fi network",
             EditField::WifiPassword => "Wi-Fi password",
-            EditField::PhotoPrismUrl => "PhotoPrism URL",
-            EditField::PhotoPrismUser => "PhotoPrism user",
-            EditField::PhotoPrismPassword => "PhotoPrism password",
+            EditField::Connection { .. } => "Setting",
         }
     }
+}
+
+/// One editable connection setting advertised by a plugin.
+#[derive(Debug, Clone)]
+pub struct ConnectionMenuField {
+    pub key: String,
+    pub label: String,
+    pub secret: bool,
+    pub value: String,
+}
+
+/// Connection UI for one plugin (capability-driven).
+#[derive(Debug, Clone)]
+pub struct ConnectionMenuCtx {
+    pub plugin_idx: usize,
+    pub header: String,
+    pub fields: Vec<ConnectionMenuField>,
+    pub reconnect_label: Option<String>,
 }
 
 /// Open/closed state, selection, and in-progress text edit of the settings menu.
@@ -74,8 +93,8 @@ pub enum MenuAction {
     BeginEdit(EditField),
     /// Apply the current Wi-Fi settings to the host OS (Linux/Pi only).
     ApplyWifi,
-    /// Apply the edited PhotoPrism URL/credentials and reconnect.
-    ConnectPhotoPrism,
+    /// Apply edited connection fields and reconnect that plugin source.
+    ReconnectPlugin(usize),
     SaveConfig,
     Exit,
 }
@@ -169,11 +188,9 @@ pub struct RowsCtx<'a> {
     /// `(name, is_active)` for each configured source, in config order.
     pub sources: &'a [(String, bool)],
     pub wifi: &'a WifiConfig,
-    /// `(url, username, has_password)` when a PhotoPrism source is configured;
-    /// `None` hides the PhotoPrism rows. The password itself is never passed —
-    /// only whether one is set.
-    pub photoprism: Option<(&'a str, &'a str, bool)>,
-    /// Album / favourites targeting for the active PhotoPrism or directory source.
+    /// Capability-driven connection settings for plugins that advertise them.
+    pub connections: &'a [ConnectionMenuCtx],
+    /// Album / favourites targeting when an active plugin supports it.
     pub targeting: Option<&'a TargetingMenuCtx<'a>>,
     /// The field currently being edited (its row shows the live buffer).
     pub editing: Option<EditField>,
@@ -183,8 +200,8 @@ pub struct RowsCtx<'a> {
 
 /// Build the menu rows from the live config and UI state. Rebuilt on every
 /// change so labels always reflect current values. Source-agnostic for the
-/// photo sources; Wi-Fi rows are always shown and PhotoPrism rows appear when
-/// a PhotoPrism source is configured.
+/// photo sources; Wi-Fi rows are always shown and connection rows appear when
+/// a plugin advertises connection capabilities.
 pub fn build_rows(ctx: &RowsCtx) -> Vec<MenuRow> {
     let d = ctx.display;
     let on = |b: bool| if b { "on" } else { "off" };
@@ -276,24 +293,32 @@ pub fn build_rows(ctx: &RowsCtx) -> Vec<MenuRow> {
     ));
     rows.push(MenuRow::new("Apply Wi-Fi now", MenuAction::ApplyWifi));
 
-    // ── PhotoPrism (only when a PhotoPrism source is configured) ─────────────
-    if let Some((url, user, has_pw)) = ctx.photoprism {
-        rows.push(MenuRow::header("PHOTOPRISM"));
-        rows.push(edit_row(ctx, EditField::PhotoPrismUrl, &display_value(url)));
-        rows.push(edit_row(
-            ctx,
-            EditField::PhotoPrismUser,
-            &display_value(user),
-        ));
-        rows.push(edit_row(
-            ctx,
-            EditField::PhotoPrismPassword,
-            secret_from_set(has_pw),
-        ));
-        rows.push(MenuRow::new(
-            "Connect PhotoPrism",
-            MenuAction::ConnectPhotoPrism,
-        ));
+    // ── Connection settings (capability-driven per plugin) ───────────────────
+    for conn in ctx.connections {
+        rows.push(MenuRow::header(conn.header.clone()));
+        for (field_idx, field) in conn.fields.iter().enumerate() {
+            let edit = EditField::Connection {
+                plugin_idx: conn.plugin_idx,
+                field_idx,
+            };
+            let shown = if field.secret {
+                secret_from_set(!field.value.is_empty()).to_string()
+            } else {
+                display_value(&field.value)
+            };
+            let label = if ctx.editing == Some(edit) {
+                format!("{}: {}_", field.label, ctx.buffer)
+            } else {
+                format!("{}: {shown}", field.label)
+            };
+            rows.push(MenuRow::new(label, MenuAction::BeginEdit(edit)));
+        }
+        if let Some(label) = &conn.reconnect_label {
+            rows.push(MenuRow::new(
+                label.clone(),
+                MenuAction::ReconnectPlugin(conn.plugin_idx),
+            ));
+        }
     }
 
     // ── System ───────────────────────────────────────────────────────────────
@@ -373,7 +398,7 @@ mod tests {
             paused,
             sources,
             wifi,
-            photoprism: None,
+            connections: &[],
             targeting: None,
             editing: None,
             buffer: "",
@@ -490,28 +515,44 @@ mod tests {
     }
 
     #[test]
-    fn photoprism_rows_only_when_configured() {
+    fn connection_rows_only_when_configured() {
         let d = DisplayConfig::default();
         let w = WifiConfig::default();
         let none = build_rows(&ctx(&d, false, &[], &w));
         assert!(!none
             .iter()
-            .any(|r| matches!(r.action, MenuAction::ConnectPhotoPrism)));
+            .any(|r| matches!(r.action, MenuAction::ReconnectPlugin(_))));
 
+        let connections = [ConnectionMenuCtx {
+            plugin_idx: 0,
+            header: "PHOTOPRISM".into(),
+            fields: vec![
+                ConnectionMenuField {
+                    key: "url".into(),
+                    label: "PhotoPrism URL".into(),
+                    secret: false,
+                    value: "http://pp.local:2342".into(),
+                },
+                ConnectionMenuField {
+                    key: "password".into(),
+                    label: "PhotoPrism password".into(),
+                    secret: true,
+                    value: "secret".into(),
+                },
+            ],
+            reconnect_label: Some("Connect PhotoPrism".into()),
+        }];
         let with = build_rows(&RowsCtx {
-            photoprism: Some(("http://pp.local:2342", "admin", true)),
+            connections: &connections,
             ..ctx(&d, false, &[], &w)
         });
         assert!(with
             .iter()
-            .any(|r| matches!(r.action, MenuAction::ConnectPhotoPrism)));
-        assert!(with.iter().any(|r| matches!(
-            r.action,
-            MenuAction::BeginEdit(EditField::PhotoPrismUrl)
-        ) && r.label.contains("pp.local")));
+            .any(|r| matches!(r.action, MenuAction::ReconnectPlugin(0))));
+        assert!(with.iter().any(|r| r.label.contains("pp.local")));
         let pw = with
             .iter()
-            .find(|r| matches!(r.action, MenuAction::BeginEdit(EditField::PhotoPrismPassword)))
+            .find(|r| r.label.starts_with("PhotoPrism password:"))
             .unwrap();
         assert!(pw.label.contains("****"));
     }

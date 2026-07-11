@@ -1,3 +1,5 @@
+use anyhow::Result;
+use async_trait::async_trait;
 /// Local filesystem plugin for PicoGallery.
 ///
 /// Reads JPEG images from one or more local directories.
@@ -6,8 +8,7 @@
 /// Config keys:
 ///   paths     = ["/mnt/photos", "/home/pi/Pictures"]  (required)
 ///   recursive = true                                   (default: true)
-use anyhow::Result;
-use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -185,13 +186,22 @@ impl PhotoPlugin for LocalPlugin {
             .filter_map(|path| {
                 let id = path.to_string_lossy().to_string();
                 let filename = path.file_name()?.to_string_lossy().to_string();
+                let taken_at = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0));
                 Some(PhotoMeta {
                     id,
                     filename,
                     width: 0,
                     height: 0,
-                    taken_at: None,
+                    taken_at,
                     download_url: None, // bytes are read directly in get_photo_bytes
+                    album: None,
+                    title: None,
+                    location: None,
+                    is_favorite: false,
                     extra: Default::default(),
                 })
             })
