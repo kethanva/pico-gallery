@@ -321,10 +321,8 @@ impl Slideshow {
         // Skip photos already in the queue. Offset paging can resurface the
         // same IDs when a plugin reshuffles/rescans mid-session, or when a
         // remote API (e.g. order=random) returns overlapping pages.
-        let mut seen: HashSet<(usize, String)> = queue
-            .iter()
-            .map(|(pi, m)| (*pi, m.id.clone()))
-            .collect();
+        let mut seen: HashSet<(usize, String)> =
+            queue.iter().map(|(pi, m)| (*pi, m.id.clone())).collect();
         // One gallery tick may land in a duplicate window after a rescan —
         // walk a few pages in this call so the UI still advances.
         let mut unique: Vec<(usize, PhotoMeta)> = Vec::new();
@@ -724,8 +722,7 @@ impl Slideshow {
                                     )
                                     .await
                             {
-                                scrolled =
-                                    grid.scroll_page(dir, queue.len(), renderer.height());
+                                scrolled = grid.scroll_page(dir, queue.len(), renderer.height());
                             }
                             if scrolled {
                                 gallery_ctl.dirty = true;
@@ -789,8 +786,6 @@ impl Slideshow {
                         // different photo they did not click.
                         mode = Mode::Gallery;
                         gallery_ctl.enter();
-                        gallery_ctl.mark_dirty();
-                        gallery_ctl.dirty = true;
                         warn!(
                             "Could not open photo {} ({}) — staying in gallery",
                             idx + 1,
@@ -2032,7 +2027,6 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-
 /// Keep only `(plugin_idx, id)` pairs not already recorded in `seen`.
 /// Inserts kept keys into `seen` so callers can chain multiple batches.
 fn filter_unseen_photos(
@@ -2331,5 +2325,4 @@ mod tests {
         assert_eq!(ids, vec![(0, "b"), (1, "a")]);
         assert!(seen.contains(&(0, "b".into())));
     }
-
 }
