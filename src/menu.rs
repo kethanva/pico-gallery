@@ -492,6 +492,7 @@ mod tests {
             enabled: true,
             ssid: "home".into(),
             password: "secret".into(),
+            password_file: None,
             country: String::new(),
         };
         let rows = build_rows(&ctx(&d, false, &[], &w));

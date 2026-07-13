@@ -177,6 +177,8 @@ enabled = false
 
 client_id     = "YOUR_LWA_CLIENT_ID"
 client_secret = "YOUR_LWA_CLIENT_SECRET"
+# client_secret_file = "/run/picogallery/amazon.secret"  # prefer over inline
+# Or set env PICOGALLERY_AMAZON_PHOTOS_CLIENT_SECRET
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [PLUGIN] webdav  ★ Nextcloud / ownCloud / Synology NAS
@@ -240,8 +242,10 @@ enabled = false
 
 url      = "http://photoprism.local:2342"   # base URL of the PhotoPrism server
 username = "admin"
-password = "insecure"                       # or use app_password below
+password = "insecure"                       # or use app_password / password_file below
 # app_password = "abcd-efgh-ijkl-mnop"      # PhotoPrism v0.10+ app password
+# password_file = "/run/picogallery/photoprism.pass"  # prefer over inline password
+# Or set env PICOGALLERY_PHOTOPRISM_PASSWORD / PICOGALLERY_PHOTOPRISM_APP_PASSWORD
 
 # ── Filtering (all optional) ────────────────────────────────────────────────
 # album       = "january-2024"     # album UID or slug
@@ -265,4 +269,5 @@ password = "insecure"                       # or use app_password below
 
 # ── Transport ───────────────────────────────────────────────────────────────
 # skip_tls_verify       = false    # true for self-signed LAN certs
+# allowed_hosts         = ["photoprism.local"]  # REQUIRED when skip_tls_verify=true
 # request_timeout_secs  = 30

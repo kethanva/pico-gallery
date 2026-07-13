@@ -22,4 +22,21 @@ fn config_roundtrips_through_toml() {
             .map(|p| p.name.clone())
             .collect::<Vec<_>>()
     );
+
+    // Secret-bearing fields must survive serialize → parse (menu Save path).
+    assert_eq!(cfg.wifi.password, reparsed.wifi.password);
+    for (a, b) in cfg.plugins.iter().zip(reparsed.plugins.iter()) {
+        assert_eq!(
+            a.config.get_str("password"),
+            b.config.get_str("password"),
+            "plugin {} password",
+            a.name
+        );
+        assert_eq!(
+            a.config.get_str("client_secret"),
+            b.config.get_str("client_secret"),
+            "plugin {} client_secret",
+            a.name
+        );
+    }
 }

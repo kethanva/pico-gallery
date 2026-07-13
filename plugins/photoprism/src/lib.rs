@@ -84,6 +84,7 @@
 ///
 /// # ── Transport ─────────────────────────────────────────────────────────
 /// # skip_tls_verify = false
+/// # allowed_hosts = ["photoprism.local"]  # required when skip_tls_verify
 /// # request_timeout_secs = 30
 /// ```
 use anyhow::{anyhow, Context, Result};
@@ -308,6 +309,42 @@ impl PhotoPrismPlugin {
 
     fn api_url(&self, path: &str) -> Result<String> {
         Ok(format!("{}/api/v1{path}", self.base_url()?))
+    }
+
+    /// When `skip_tls_verify` is on, require the URL host to appear in
+    /// `allowed_hosts` so a mistyped URL can't silently MITM credentials.
+    fn validate_tls_policy(&self, skip_tls: bool) -> Result<()> {
+        if !skip_tls {
+            return Ok(());
+        }
+        let base = self.base_url()?;
+        let host = url_host(&base).ok_or_else(|| {
+            anyhow!("photoprism: cannot parse host from url `{base}` (required when skip_tls_verify=true)")
+        })?;
+        let allowed = self.allowed_hosts();
+        if allowed.is_empty() {
+            return Err(anyhow!(
+                "photoprism: skip_tls_verify=true requires allowed_hosts                  (list the URL host, e.g. photoprism.local) so TLS bypass cannot follow a mistyped URL;                  url host is `{host}`"
+            ));
+        }
+        if !allowed.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+            return Err(anyhow!(
+                "photoprism: url host `{host}` is not in allowed_hosts {allowed:?}                  (required when skip_tls_verify=true)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn allowed_hosts(&self) -> Vec<String> {
+        match self.cfg.values.get("allowed_hosts") {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+            _ => Vec::new(),
+        }
     }
 
     fn username(&self) -> Option<&str> {
@@ -796,7 +833,10 @@ impl PhotoPrismPlugin {
             let page = state.next_page;
             // `fetch_page` may refresh preview/download tokens on the session.
             let photos = {
-                let sess = state.session.as_mut().expect("session set above");
+                let sess = state
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("photoprism: session missing after ensure_session"))?;
                 match self.fetch_page(sess, page).await {
                     Ok(p) => p,
                     Err(e) if e.root_cause().is::<SessionExpired>() => {
@@ -813,7 +853,10 @@ impl PhotoPrismPlugin {
                     Err(e) => return Err(e),
                 }
             };
-            let sess = state.session.as_ref().expect("session set above");
+            let sess = state
+                .session
+                .as_ref()
+                .ok_or_else(|| anyhow!("photoprism: session missing after fetch_page"))?;
 
             let returned = photos.len() as u32;
             // Deduplicate by photo id. Overlapping pages (unstable sort, or
@@ -1062,6 +1105,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
 
         // Validate base URL up-front so misconfiguration fails fast.
         let _ = self.base_url()?;
+        self.validate_tls_policy(skip_tls)?;
         Ok(())
     }
 
@@ -1254,7 +1298,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
             let sid = state
                 .session
                 .as_ref()
-                .expect("session set above")
+                .ok_or_else(|| anyhow!("photoprism: session missing after ensure_session"))?
                 .session_id
                 .clone();
 
@@ -1305,6 +1349,32 @@ impl PhotoPlugin for PhotoPrismPlugin {
         }
         Ok(())
     }
+}
+
+
+/// Extract host (no port) from an http(s) URL. Returns None if unparseable.
+fn url_host(url: &str) -> Option<String> {
+    let after = url.find("://").map(|i| i + 3)?;
+    let rest = &url[after..];
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    if hostport.is_empty() {
+        return None;
+    }
+    // Strip IPv6 brackets and optional :port (but keep bare IPv6 without port).
+    let host = if hostport.starts_with('[') {
+        hostport
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(hostport)
+            .to_string()
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| hostport.to_string())
+    };
+    if host.is_empty() { None } else { Some(host) }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1814,4 +1884,35 @@ mod tests {
             Some("dl")
         );
     }
+
+    #[test]
+    fn url_host_parses_common_forms() {
+        assert_eq!(url_host("http://photoprism.local:2342").as_deref(), Some("photoprism.local"));
+        assert_eq!(url_host("https://192.168.1.10/").as_deref(), Some("192.168.1.10"));
+        assert_eq!(url_host("http://[::1]:2342/api").as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn validate_tls_policy_requires_allowed_hosts() {
+        let mut cfg = PluginConfig::default();
+        cfg.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
+        let plugin = PhotoPrismPlugin::new(cfg);
+        let err = plugin.validate_tls_policy(true).unwrap_err().to_string();
+        assert!(err.contains("allowed_hosts"), "{err}");
+
+        let mut cfg2 = PluginConfig::default();
+        cfg2.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
+        cfg2.values.insert("allowed_hosts".into(), serde_json::json!(["other.local"]));
+        let plugin2 = PhotoPrismPlugin::new(cfg2);
+        let err2 = plugin2.validate_tls_policy(true).unwrap_err().to_string();
+        assert!(err2.contains("not in allowed_hosts"), "{err2}");
+
+        let mut cfg3 = PluginConfig::default();
+        cfg3.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
+        cfg3.values.insert("allowed_hosts".into(), serde_json::json!(["photoprism.local"]));
+        let plugin3 = PhotoPrismPlugin::new(cfg3);
+        assert!(plugin3.validate_tls_policy(true).is_ok());
+        assert!(plugin3.validate_tls_policy(false).is_ok());
+    }
+
 }

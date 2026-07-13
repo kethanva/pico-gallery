@@ -1886,7 +1886,9 @@ impl Slideshow {
     /// Pi's SD card. Note this rewrites the file without the template's
     /// explanatory comments: the settings survive, the prose does not.
     fn save_config(&self) -> Result<()> {
-        let text = toml::to_string_pretty(&self.config).context("serialising config to TOML")?;
+        let mut to_write = self.config.clone();
+        to_write.redact_file_backed_secrets();
+        let text = toml::to_string_pretty(&to_write).context("serialising config to TOML")?;
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
