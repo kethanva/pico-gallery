@@ -11,3 +11,22 @@ mnt/
 opentinyphotoapp.txt
 how_to_docs/
 plans/
+
+# Local secrets / machine-specific config (never commit)
+deploy.local.env
+*.local.env
+config.toml
+!config.example.toml
+.env
+.env.*
+!.env.example
+credentials*.json
+*credentials*.json
+client_secret*.json
+*client_secret*
+*.pem
+*.key
+!*.example.key
+
+# Generated analysis graphs (contain absolute local paths)
+graphify-out/

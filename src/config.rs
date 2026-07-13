@@ -443,9 +443,15 @@ pub struct WifiConfig {
     #[serde(default)]
     pub ssid: String,
 
-    /// WPA2 pre-shared key (passphrase).
+    /// WPA2 pre-shared key (passphrase). Prefer `password_file` or
+    /// `PICOGALLERY_WIFI_PASSWORD` so the passphrase is not stored in TOML.
     #[serde(default)]
     pub password: String,
+
+    /// Path to a file whose contents are the WPA2 passphrase (trimmed).
+    /// When set, overrides `password` at load time.
+    #[serde(default)]
+    pub password_file: Option<String>,
 
     /// ISO 3166 alpha-2 country code (e.g. "US", "GB"). Some regulatory setups
     /// require it for `wpa_supplicant`; ignored by the `nmcli` backend.
@@ -539,10 +545,65 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        config
+            .apply_secret_overrides()
+            .with_context(|| format!("resolving secrets for {}", path.display()))?;
         Self::restrict_private_permissions(path);
         Ok(config)
+    }
+
+    /// Resolve file-backed and environment secrets into in-memory config.
+    ///
+    /// Plugin keys: `password`, `app_password`, `client_secret` via
+    /// `{key}_file` and `PICOGALLERY_{PLUGIN}_{KEY}`.
+    /// Wi-Fi: `password_file` and `PICOGALLERY_WIFI_PASSWORD`.
+    pub fn apply_secret_overrides(&mut self) -> Result<()> {
+        const PLUGIN_SECRETS: &[&str] = &["password", "app_password", "client_secret"];
+
+        if let Some(path) = self.wifi.password_file.clone() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading wifi.password_file ({path})"))?;
+            let value = raw.trim().to_string();
+            if value.is_empty() {
+                return Err(anyhow::anyhow!("wifi.password_file ({path}) is empty"));
+            }
+            self.wifi.password = value;
+        }
+        match std::env::var("PICOGALLERY_WIFI_PASSWORD") {
+            Ok(v) if !v.is_empty() => self.wifi.password = v,
+            Ok(_) => {
+                return Err(anyhow::anyhow!("PICOGALLERY_WIFI_PASSWORD is set but empty"));
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(e) => return Err(anyhow::anyhow!("reading PICOGALLERY_WIFI_PASSWORD: {e}")),
+        }
+
+        for entry in &mut self.plugins {
+            for key in PLUGIN_SECRETS {
+                entry.config.resolve_secret_file(key)?;
+                entry.config.apply_env_secret(&entry.name, key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before writing config.toml, drop inline secret values that are backed
+    /// by a `*_file` path so Save does not re-embed file contents into TOML.
+    pub fn redact_file_backed_secrets(&mut self) {
+        const PLUGIN_SECRETS: &[&str] = &["password", "app_password", "client_secret"];
+        if self.wifi.password_file.as_ref().is_some_and(|p| !p.is_empty()) {
+            self.wifi.password.clear();
+        }
+        for entry in &mut self.plugins {
+            for key in PLUGIN_SECRETS {
+                let file_key = format!("{key}_file");
+                if entry.config.get_str(&file_key).is_some() {
+                    entry.config.values.remove(*key);
+                }
+            }
+        }
     }
 
     /// Best-effort: owner-only permissions on the config file (0600) and its
@@ -839,4 +900,80 @@ mod tests {
         cfg.sync_targeting_from_plugins(&adapters);
         assert_eq!(cfg.targeting.album, "family");
     }
+
+    #[test]
+    fn secret_file_overrides_plugin_password() {
+        let dir = tempfile_dir();
+        let secret_path = dir.join("pp.pass");
+        std::fs::write(&secret_path, "from-file\n").unwrap();
+
+        let mut cfg = Config::default();
+        let mut pc = PluginConfig::default();
+        pc.values
+            .insert("password".into(), serde_json::json!("inline"));
+        pc.values.insert(
+            "password_file".into(),
+            serde_json::json!(secret_path.to_str().unwrap()),
+        );
+        cfg.plugins.push(PluginEntry {
+            name: "photoprism".into(),
+            enabled: true,
+            config: pc,
+        });
+        cfg.apply_secret_overrides().unwrap();
+        assert_eq!(
+            cfg.plugins[0].config.get_str("password"),
+            Some("from-file")
+        );
+        assert_eq!(
+            cfg.plugins[0].config.get_str("password_file"),
+            Some(secret_path.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn env_overrides_wifi_password() {
+        let mut cfg = Config::default();
+        cfg.wifi.password = "old".into();
+        std::env::set_var("PICOGALLERY_WIFI_PASSWORD", "from-env");
+        cfg.apply_secret_overrides().unwrap();
+        std::env::remove_var("PICOGALLERY_WIFI_PASSWORD");
+        assert_eq!(cfg.wifi.password, "from-env");
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "picogallery-cfg-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+
+    #[test]
+    fn redact_clears_inline_when_file_set() {
+        let mut cfg = Config::default();
+        cfg.wifi.password = "secret".into();
+        cfg.wifi.password_file = Some("/run/wifi.pass".into());
+        let mut pc = PluginConfig::default();
+        pc.values
+            .insert("password".into(), serde_json::json!("inline"));
+        pc.values
+            .insert("password_file".into(), serde_json::json!("/run/pp.pass"));
+        cfg.plugins.push(PluginEntry {
+            name: "photoprism".into(),
+            enabled: true,
+            config: pc,
+        });
+        cfg.redact_file_backed_secrets();
+        assert!(cfg.wifi.password.is_empty());
+        assert!(cfg.plugins[0].config.get_str("password").is_none());
+        assert_eq!(
+            cfg.plugins[0].config.get_str("password_file"),
+            Some("/run/pp.pass")
+        );
+    }
+
 }

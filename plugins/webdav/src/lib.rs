@@ -216,6 +216,18 @@ fn url_origin(url: &str) -> &str {
     }
 }
 
+/// True when `path` is exactly `base` or a descendant (`base/...`).
+/// Plain `starts_with` is wrong: `/dav/photos` would also match `/dav/photosEvil`.
+fn path_under_base(path: &str, base: &str) -> bool {
+    let path = url_decode(path);
+    let base = url_decode(base);
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        return true;
+    }
+    path == base || path.starts_with(&(base.to_owned() + "/"))
+}
+
 /// True when `url` is safe to send the configured Basic-Auth credentials to:
 /// it must be on the configured `origin` (scheme://host[:port]) AND its path
 /// must sit under the configured `base_path`. A malicious or compromised WebDAV
@@ -229,7 +241,7 @@ fn href_in_scope(url: &str, origin: &str, base_path: &str) -> bool {
         return false;
     }
     let path = url.strip_prefix(origin).unwrap_or("");
-    url_decode(path).starts_with(&url_decode(base_path))
+    path_under_base(path, base_path)
 }
 
 /// Decode `%XX` percent-encoding. Invalid sequences pass through unchanged.
@@ -1037,6 +1049,38 @@ mod tests {
             "https://nas.local/anything/a.jpg",
             "https://nas.local",
             ""
+        ));
+    }
+
+    #[test]
+    fn href_in_scope_rejects_prefix_sibling_paths() {
+        // Classic starts_with footgun: base `/dav/photos` must NOT allow
+        // `/dav/photosEvil/...` (same origin, credentials would still attach).
+        assert!(!href_in_scope(
+            "https://nas.local/dav/photosEvil/a.jpg",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        assert!(!href_in_scope(
+            "https://nas.local/dav/photos-backup/a.jpg",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        // Exact base and true descendants remain allowed.
+        assert!(href_in_scope(
+            "https://nas.local/dav/photos",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        assert!(href_in_scope(
+            "https://nas.local/dav/photos/",
+            "https://nas.local",
+            "/dav/photos"
+        ));
+        assert!(href_in_scope(
+            "https://nas.local/dav/photos/trip/a.jpg",
+            "https://nas.local",
+            "/dav/photos"
         ));
     }
 

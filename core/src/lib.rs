@@ -68,6 +68,46 @@ impl PluginConfig {
         self.get_str(key)
             .ok_or_else(|| anyhow::anyhow!("Plugin config missing required key: {key}"))
     }
+
+    /// Resolve `{key}_file` into `{key}` by reading the file contents (trimmed).
+    /// Used so passwords / client secrets need not live in config.toml.
+    pub fn resolve_secret_file(&mut self, key: &str) -> Result<()> {
+        let file_key = format!("{key}_file");
+        let Some(path) = self.get_str(&file_key).map(str::to_string) else {
+            return Ok(());
+        };
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("reading {file_key} ({path}): {e}")
+        })?;
+        let value = raw.trim().to_string();
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("{file_key} ({path}) is empty"));
+        }
+        self.values.insert(key.into(), serde_json::Value::String(value));
+        // Keep `{key}_file` so a later Save can re-serialize the path and
+        // omit the inline secret (see Config::redact_file_backed_secrets).
+        Ok(())
+    }
+
+    /// Apply env override `PICOGALLERY_{PLUGIN}_{KEY}` (uppercased, `-` → `_`)
+    /// when set. Does not clear existing values when the env var is unset.
+    pub fn apply_env_secret(&mut self, plugin_name: &str, key: &str) -> Result<()> {
+        let env_key = format!(
+            "PICOGALLERY_{}_{}",
+            plugin_name.replace('-', "_").to_uppercase(),
+            key.to_uppercase()
+        );
+        match std::env::var(&env_key) {
+            Ok(v) if !v.is_empty() => {
+                self.values
+                    .insert(key.into(), serde_json::Value::String(v));
+                Ok(())
+            }
+            Ok(_) => Err(anyhow::anyhow!("{env_key} is set but empty")),
+            Err(std::env::VarError::NotPresent) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("reading {env_key}: {e}")),
+        }
+    }
 }
 
 /// Live album / favourites filter applied by the engine.

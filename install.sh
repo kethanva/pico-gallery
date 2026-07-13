@@ -47,8 +47,8 @@ section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 # pre-built release binary is installed — no on-device Rust compile:
 #
 #   sudo ./install.sh --mode all -y \
-#     --photoprism-url http://192.168.68.71:2342 \
-#     --photoprism-user admin --photoprism-pass 'secret'
+#     --photoprism-url http://photoprism.local:2342 \
+#     --photoprism-user admin --photoprism-pass 'YOUR_PASSWORD'
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 

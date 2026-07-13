@@ -182,7 +182,7 @@ impl AmazonPhotosPlugin {
             .and_then(|t| t.refresh_token.clone())
             .context("no refresh token")?;
 
-        let res = self
+        let resp = self
             .client
             .post(LWA_TOKEN_URL)
             .form(&[
@@ -192,22 +192,32 @@ impl AmazonPhotosPlugin {
                 ("client_secret", self.client_secret()?),
             ])
             .send()
-            .await?
-            .json::<LwaToken>()
-            .await?;
+            .await
+            .context("amazon-photos: token refresh request failed")?;
 
-        if let Some(at) = res.access_token {
-            let token = StoredToken {
-                access_token: at,
-                refresh_token: res.refresh_token.or(Some(rt)),
-                expires_at: Utc::now()
-                    + chrono::Duration::seconds(res.expires_in.unwrap_or(3600) as i64),
-            };
-            if let Err(e) = self.save_token(&token).await {
-                warn!("Amazon Photos: failed to persist refreshed token (auth still valid this session): {e:#}");
-            }
-            self.token = Some(token);
+        let status = resp.status();
+        let res = resp
+            .json::<LwaToken>()
+            .await
+            .context("amazon-photos: parsing token refresh response")?;
+
+        let at = res.access_token.ok_or_else(|| {
+            anyhow::anyhow!(
+                "amazon-photos: token refresh failed (HTTP {status}): {}",
+                res.error.as_deref().unwrap_or("no access_token in response")
+            )
+        })?;
+
+        let token = StoredToken {
+            access_token: at,
+            refresh_token: res.refresh_token.or(Some(rt)),
+            expires_at: Utc::now()
+                + chrono::Duration::seconds(res.expires_in.unwrap_or(3600) as i64),
+        };
+        if let Err(e) = self.save_token(&token).await {
+            warn!("Amazon Photos: failed to persist refreshed token (auth still valid this session): {e:#}");
         }
+        self.token = Some(token);
         Ok(())
     }
 
@@ -514,6 +524,28 @@ fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_error_response_is_not_ok() {
+        // Mirrors the JSON LWA returns on invalid_grant / revoked refresh tokens.
+        let res = LwaToken {
+            access_token: None,
+            refresh_token: None,
+            expires_in: None,
+            error: Some("invalid_grant".into()),
+        };
+        assert!(res.access_token.is_none());
+        let err = res
+            .access_token
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "amazon-photos: token refresh failed (HTTP 400): {}",
+                    res.error.as_deref().unwrap_or("no access_token")
+                )
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid_grant"));
+    }
 
     #[tokio::test]
     async fn init_clears_stale_page_cache() {

@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
+use tokio::sync::Semaphore;
 
 use crate::config::RemoteConfig;
 use crate::renderer::SlideshowCmd;
@@ -34,6 +35,10 @@ use crate::renderer::SlideshowCmd;
 /// short backlog is fine, but past that we tell the phone to retry (429)
 /// rather than queue up a pile of stale button presses.
 const CMD_QUEUE_CAP: usize = 16;
+
+/// Cap concurrent remote HTTP handlers. Without this, a LAN flood of TCP
+/// connections can spawn unbounded tasks and OOM a Pi Zero.
+const MAX_CONCURRENT_CONNS: usize = 32;
 
 /// Snapshot of what the slideshow is currently showing, shared with the
 /// HTTP server and serialised by `/api/status`.
@@ -62,15 +67,23 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
     info!("Remote control: http://{addr}/");
 
     let (tx, rx) = channel(CMD_QUEUE_CAP);
+    let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
 
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                        debug!("remote: rejecting {peer} — connection limit reached");
+                        // Drop the stream without spawning work.
+                        drop(stream);
+                        continue;
+                    };
                     debug!("remote: connection from {peer}");
                     let tx = tx.clone();
                     let status = status.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_conn(stream, tx, status).await {
                             debug!("remote: connection error: {e}");
                         }
@@ -128,7 +141,13 @@ async fn handle_conn(
     let req = String::from_utf8_lossy(&buf);
     let mut parts = req.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+    // Browsers / proxies may append `?…` — match on the path only.
+    let path = parts
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
 
     let response = match (method, path) {
         ("GET", "/") => http_response("200 OK", "text/html; charset=utf-8", CONTROL_PAGE),
@@ -257,5 +276,19 @@ mod tests {
     fn find_header_end_none_when_incomplete() {
         let buf = b"GET / HTTP/1.1\r\nHost: x\r\n";
         assert_eq!(find_header_end(buf), None);
+    }
+
+    #[test]
+    fn request_path_strips_query_string() {
+        let raw = "GET /api/status?x=1 HTTP/1.1";
+        let mut parts = raw.split_whitespace();
+        let _method = parts.next().unwrap();
+        let path = parts
+            .next()
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap();
+        assert_eq!(path, "/api/status");
     }
 }
