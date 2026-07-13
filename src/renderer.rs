@@ -627,8 +627,7 @@ impl ImageProcessor {
         let scale = f32::max(size as f32 / sw as f32, size as f32 / sh as f32);
         let nw = ((sw as f32 * scale).ceil() as u32).max(1);
         let nh = ((sh as f32 * scale).ceil() as u32).max(1);
-        let scaled =
-            image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
+        let scaled = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
         let ox = scaled.width().saturating_sub(size) / 2;
         let oy = scaled.height().saturating_sub(size) / 2;
         Ok(image::imageops::crop_imm(&scaled, ox, oy, size, size).to_image())

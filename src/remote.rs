@@ -87,7 +87,6 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
     Ok(rx)
 }
 
-
 /// Index just past the first CRLF-CRLF in `buf`, if present.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4)

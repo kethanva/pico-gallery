@@ -214,7 +214,10 @@ impl DirectoryPlugin {
                     album
                 };
 
-                Box::pin(Self::scan_dir(recursive, root, &canonical, new_album, allowed, visited, out)).await;
+                Box::pin(Self::scan_dir(
+                    recursive, root, &canonical, new_album, allowed, visited, out,
+                ))
+                .await;
             } else if is_image(&canonical) {
                 let modified_secs = fs::metadata(&canonical)
                     .await
@@ -260,7 +263,16 @@ impl DirectoryPlugin {
 
         let mut photos = Vec::new();
         let mut visited = HashSet::new();
-        Self::scan_dir(recursive, root, root, None, &allowed, &mut visited, &mut photos).await;
+        Self::scan_dir(
+            recursive,
+            root,
+            root,
+            None,
+            &allowed,
+            &mut visited,
+            &mut photos,
+        )
+        .await;
 
         let order = Order::from_cfg(cfg);
         match order {
@@ -307,7 +319,6 @@ impl DirectoryPlugin {
         out.extend(added);
         out
     }
-
 }
 
 // ── PhotoPlugin impl ──────────────────────────────────────────────────────────
@@ -683,7 +694,6 @@ mod tests {
         assert_eq!(merged[0].modified_secs, 9);
         assert_eq!(merged[1].path, PathBuf::from("/p/c.jpg"));
     }
-
 
     #[test]
     fn scanned_photo_into_meta_carries_album() {
