@@ -257,6 +257,13 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // ── HDMI CEC remote (optional, Linux) ────────────────────────────────────
+    let cec_rx = if config.cec.enabled {
+        Some(picogallery::cec_remote::start(&config.cec).await?)
+    } else {
+        None
+    };
+
     // Run the slideshow. The plugin factory lets the engine rebuild its photo
     // sources at runtime when the user switches source from the on-screen menu,
     // without the slideshow needing to know which plugins were compiled in.
@@ -267,7 +274,7 @@ async fn main() -> Result<()> {
         Box::new(|c: &Config| build_plugins(c, true)),
     )
     .await?;
-    slideshow.run(remote_rx, remote_status).await
+    slideshow.run(remote_rx, cec_rx, remote_status).await
 }
 
 // ── Config generation ─────────────────────────────────────────────────────────
@@ -391,6 +398,17 @@ prefetch_count = 3    # how many photos to pre-fetch ahead (keep low on Pi Zero)
 enabled = false
 port    = 8188
 bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HDMI CEC remote (optional, Linux only)
+# Control slideshow using your TV remote over HDMI CEC.
+# Mapped keys: pause/play, left/right or channel +/- for prev/next, and
+# favourite/menu color key for favourite toggle.
+# ─────────────────────────────────────────────────────────────────────────────
+[cec]
+enabled = false
+device  = "/dev/cec0"
+# poll_ms = 250
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Wi-Fi  (Linux / Raspberry Pi only)
@@ -607,5 +625,7 @@ mod tests {
         );
         // Remote section parses and is disabled out of the box (no-auth server).
         assert!(!cfg.remote.enabled);
+        // HDMI CEC remote input is opt-in.
+        assert!(!cfg.cec.enabled);
     }
 }

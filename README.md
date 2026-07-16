@@ -384,6 +384,19 @@ bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
 
 Open `http://<pi-ip>:8188/` from any phone on the LAN. The ♥ button favourites the current photo on sources that support it (e.g. `photoprism`). `GET /api/status` returns `{paused, index, total, filename, album, favorite}`.
 
+### HDMI CEC remote (Linux)
+
+Use your TV remote over HDMI CEC (no network needed):
+
+```toml
+[cec]
+enabled = true
+device  = "/dev/cec0"
+# poll_ms = 250
+```
+
+Mapped keys: left/right or channel +/- for prev/next, play/pause for pause toggle, and favourite/menu color key for favourite toggle.
+
 ---
 
 ## Hardware

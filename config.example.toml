@@ -115,6 +115,27 @@ max_mb         = 256   # on-disk cache ceiling in MB
 prefetch_count = 3     # photos pre-fetched while current photo is on screen
 # dir = "/tmp/picogallery-cache"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP remote control (optional)
+# Phone-friendly prev/pause/next/favourite on a trusted LAN.
+# No authentication: do not expose to the internet.
+# ─────────────────────────────────────────────────────────────────────────────
+[remote]
+enabled = false
+port    = 8188
+bind    = "0.0.0.0"   # use "127.0.0.1" for local-only
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HDMI CEC remote (optional, Linux only)
+# Use your TV remote over HDMI CEC.
+# Mapped keys: left/right or channel +/- = prev/next, play/pause = pause,
+# favourite/menu color key = favourite toggle.
+# ─────────────────────────────────────────────────────────────────────────────
+[cec]
+enabled = false
+device  = "/dev/cec0"
+# poll_ms = 250
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Plugins — enable one or more by setting  enabled = true
 # ═════════════════════════════════════════════════════════════════════════════

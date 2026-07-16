@@ -81,6 +81,7 @@ picogallery-usb           = { path = "plugins/usb",           optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.15"
+linux-cec = { version = "0.2.0", default-features = true }
 
 [build-dependencies]
 cc = "1"

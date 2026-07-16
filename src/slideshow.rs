@@ -144,6 +144,7 @@ impl Slideshow {
     pub async fn run(
         mut self,
         remote_rx: Option<Receiver<SlideshowCmd>>,
+        cec_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
     ) -> Result<()> {
         // 1. Authenticate all plugins.
@@ -165,7 +166,7 @@ impl Slideshow {
         let mut renderer = Renderer::init(self.config.display.clone())?;
 
         // 4. Main display loop.
-        self.display_loop(&mut renderer, queue, remote_rx, remote_status)
+        self.display_loop(&mut renderer, queue, remote_rx, cec_rx, remote_status)
             .await
     }
 
@@ -368,6 +369,7 @@ impl Slideshow {
         renderer: &mut Renderer,
         mut queue: Vec<(usize, PhotoMeta)>,
         mut remote_rx: Option<Receiver<SlideshowCmd>>,
+        mut cec_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
     ) -> Result<()> {
         let mut queue_loader = QueueLoader::new(self.plugins.len());
@@ -465,6 +467,11 @@ impl Slideshow {
                 mode.is_gallery(),
             );
             if let Some(rx) = remote_rx.as_mut() {
+                while let Ok(cmd) = rx.try_recv() {
+                    cmds.push(cmd);
+                }
+            }
+            if let Some(rx) = cec_rx.as_mut() {
                 while let Ok(cmd) = rx.try_recv() {
                     cmds.push(cmd);
                 }

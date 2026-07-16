@@ -423,6 +423,44 @@ fn default_remote_bind() -> String {
     "0.0.0.0".to_string()
 }
 
+// ── HDMI CEC remote ──────────────────────────────────────────────────────────
+
+/// HDMI CEC input from a TV remote (Linux only).
+///
+/// Maps common transport keys to slideshow controls without opening a network
+/// port. Requires a CEC adapter exposed by the kernel (usually `/dev/cec0`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CecConfig {
+    /// Enable HDMI CEC remote control input.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Linux CEC character device.
+    #[serde(default = "default_cec_device")]
+    pub device: String,
+
+    /// Poll interval in milliseconds for incoming CEC messages.
+    #[serde(default = "default_cec_poll_ms")]
+    pub poll_ms: u64,
+}
+
+impl Default for CecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device: default_cec_device(),
+            poll_ms: default_cec_poll_ms(),
+        }
+    }
+}
+
+fn default_cec_device() -> String {
+    "/dev/cec0".to_string()
+}
+fn default_cec_poll_ms() -> u64 {
+    250
+}
+
 // ── Wi-Fi ──────────────────────────────────────────────────────────────────────
 
 /// Optional Wi-Fi credentials the app can apply to the host OS.
@@ -512,6 +550,10 @@ pub struct Config {
     #[serde(default)]
     pub remote: RemoteConfig,
 
+    /// Optional HDMI CEC TV-remote input (Linux only).
+    #[serde(default)]
+    pub cec: CecConfig,
+
     /// Optional Wi-Fi credentials applied to the host OS (Linux/Pi only).
     #[serde(default)]
     pub wifi: WifiConfig,
@@ -574,7 +616,9 @@ impl Config {
         match std::env::var("PICOGALLERY_WIFI_PASSWORD") {
             Ok(v) if !v.is_empty() => self.wifi.password = v,
             Ok(_) => {
-                return Err(anyhow::anyhow!("PICOGALLERY_WIFI_PASSWORD is set but empty"));
+                return Err(anyhow::anyhow!(
+                    "PICOGALLERY_WIFI_PASSWORD is set but empty"
+                ));
             }
             Err(std::env::VarError::NotPresent) => {}
             Err(e) => return Err(anyhow::anyhow!("reading PICOGALLERY_WIFI_PASSWORD: {e}")),
@@ -593,7 +637,12 @@ impl Config {
     /// by a `*_file` path so Save does not re-embed file contents into TOML.
     pub fn redact_file_backed_secrets(&mut self) {
         const PLUGIN_SECRETS: &[&str] = &["password", "app_password", "client_secret"];
-        if self.wifi.password_file.as_ref().is_some_and(|p| !p.is_empty()) {
+        if self
+            .wifi
+            .password_file
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
+        {
             self.wifi.password.clear();
         }
         for entry in &mut self.plugins {
@@ -921,10 +970,7 @@ mod tests {
             config: pc,
         });
         cfg.apply_secret_overrides().unwrap();
-        assert_eq!(
-            cfg.plugins[0].config.get_str("password"),
-            Some("from-file")
-        );
+        assert_eq!(cfg.plugins[0].config.get_str("password"), Some("from-file"));
         assert_eq!(
             cfg.plugins[0].config.get_str("password_file"),
             Some(secret_path.to_str().unwrap())
@@ -942,15 +988,11 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "picogallery-cfg-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("picogallery-cfg-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
 
     #[test]
     fn redact_clears_inline_when_file_set() {
@@ -975,5 +1017,4 @@ mod tests {
             Some("/run/pp.pass")
         );
     }
-
 }

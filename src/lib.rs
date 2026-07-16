@@ -9,6 +9,7 @@ pub mod plugin {
     pub use picogallery_core::*;
 }
 pub mod cache;
+pub mod cec_remote;
 pub mod compose;
 pub mod config;
 pub mod display_power;
