@@ -66,6 +66,9 @@ async fn start_linux(cfg: &CecConfig, tx: Sender<SlideshowCmd>) -> Result<()> {
 
     tokio::spawn(async move {
         loop {
+            if tx.is_closed() {
+                return;
+            }
             let polled = dev.poll(poll_timeout).await;
             let results = match polled {
                 Ok(r) => r,
@@ -87,8 +90,12 @@ async fn start_linux(cfg: &CecConfig, tx: Sender<SlideshowCmd>) -> Result<()> {
                     continue;
                 };
                 if let Some(cmd) = map_ui_command(ui_command) {
-                    if tx.try_send(cmd).is_err() {
-                        debug!("CEC command queue full; dropping keypress");
+                    match tx.try_send(cmd) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            debug!("CEC command queue full; dropping keypress");
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
             }

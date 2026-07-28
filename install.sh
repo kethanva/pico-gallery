@@ -229,20 +229,35 @@ if [[ "$INSTALL_MODE" == "download" ]]; then
     info "Downloaded: $TARBALL"
 
     # Verify checksum if available
-    if curl -sSL -o "${TMPDIR}/${TARBALL}.sha256" "$SHA_URL" 2>/dev/null; then
+    if curl -fsSL -o "${TMPDIR}/${TARBALL}.sha256" "$SHA_URL" 2>/dev/null; then
       SAVED_DIR=$(pwd)
       cd "$TMPDIR"
       if sha256sum -c "${TARBALL}.sha256" &>/dev/null; then
         info "SHA-256 checksum verified."
       else
-        warn "Checksum mismatch — continuing anyway."
+        die "SHA-256 checksum mismatch for ${TARBALL}; refusing to install."
       fi
       cd "$SAVED_DIR"
+    else
+      die "Could not download checksum for ${TARBALL}; refusing to install."
     fi
 
     # Extract
     info "Extracting..."
-    tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
+    if tar tzf "${TMPDIR}/${TARBALL}" | awk '
+      /^\// || /(^|\/)\.\.($|\/)/ { exit 1 }
+      { next }
+    '; then
+      :
+    else
+      die "Archive contains an unsafe path; refusing to extract."
+    fi
+    if tar tvzf "${TMPDIR}/${TARBALL}" | awk '$1 ~ /^[lh]/ { exit 1 }'; then
+      :
+    else
+      die "Archive contains a symlink or hardlink; refusing to extract."
+    fi
+    tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}" --no-same-owner --no-same-permissions
     EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "picogallery-*" | head -1)
 
     if [[ -d "$EXTRACT_DIR" ]] && [[ -f "${EXTRACT_DIR}/picogallery" ]]; then
@@ -696,14 +711,23 @@ Environment=RUST_LOG=info
 # dedicated runtime dir instead of pointing at a path that may not exist.
 RuntimeDirectory=picogallery
 Environment=XDG_RUNTIME_DIR=/run/picogallery
-ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/picogallery
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+UMask=0077
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+TasksMax=128
+MemoryMax=384M
 
-# Allow /dev/dri access without root
+# Allow DRM/input access without root. Wi-Fi and USB mounting require host
+# policy (NetworkManager/udisks) and are deliberately not granted privileges.
 SupplementaryGroups=video render input
 
 [Install]

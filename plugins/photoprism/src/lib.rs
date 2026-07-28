@@ -103,6 +103,21 @@ use picogallery_core::{
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+
+async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {label}"))?
+    {
+        if body.len().saturating_add(chunk.len()) as u64 > max {
+            return Err(anyhow!("{label}: response exceeds {max} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 const DEFAULT_PER_PAGE: u32 = 100;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -243,7 +258,7 @@ impl std::error::Error for SessionExpired {}
 
 pub struct PhotoPrismPlugin {
     cfg: PluginConfig,
-    client: Client,
+    client: Option<Client>,
     state: Mutex<State>,
 }
 
@@ -272,14 +287,9 @@ struct State {
 
 impl PhotoPrismPlugin {
     pub fn new(cfg: PluginConfig) -> Self {
-        // Fully configured client from the start — a bare Client::new() has no
-        // timeout, and a stalled request would hang the single-threaded
-        // executor. init() rebuilds it once config overrides are known.
-        let client = Self::build_client(false, DEFAULT_TIMEOUT_SECS)
-            .expect("building default PhotoPrism HTTP client");
         Self {
             cfg,
-            client,
+            client: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -287,16 +297,23 @@ impl PhotoPrismPlugin {
     /// Build the HTTP client. Called from `new()` with defaults and from
     /// `init()` with config overrides (skip_tls_verify, request_timeout_secs).
     fn build_client(skip_tls: bool, timeout_secs: u64) -> Result<Client> {
-        ClientBuilder::new()
+        let builder = ClientBuilder::new()
             .danger_accept_invalid_certs(skip_tls)
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .user_agent(concat!(
                 "picogallery-photoprism/",
                 env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .context("building PhotoPrism HTTP client")
+            ));
+        #[cfg(target_os = "macos")]
+        let builder = builder.no_proxy();
+        builder.build().context("building PhotoPrism HTTP client")
+    }
+
+    fn client(&self) -> Result<&Client> {
+        self.client
+            .as_ref()
+            .context("photoprism: plugin has not been initialized")
     }
 
     // ── Config helpers ─────────────────────────────────────────────────────
@@ -593,7 +610,7 @@ impl PhotoPrismPlugin {
         });
 
         let resp = self
-            .client
+            .client()?
             .post(&url)
             .json(&body)
             .send()
@@ -681,7 +698,7 @@ impl PhotoPrismPlugin {
     async fn fetch_config(&self, sess: &mut Session) -> Result<()> {
         let url = self.api_url("/config")?;
         let resp = self
-            .client
+            .client()?
             .get(&url)
             .headers(Self::auth_headers(sess))
             .send()
@@ -735,7 +752,7 @@ impl PhotoPrismPlugin {
         }
 
         let resp = self
-            .client
+            .client()?
             .get(&url)
             .headers(Self::auth_headers(sess))
             .query(&params)
@@ -790,7 +807,7 @@ impl PhotoPrismPlugin {
         let url = self.api_url("/albums")?;
         let params = [("count", "1000"), ("offset", "0"), ("type", "album")];
         let resp = self
-            .client
+            .client()?
             .get(&url)
             .headers(Self::session_headers(sid))
             .query(&params)
@@ -853,17 +870,12 @@ impl PhotoPrismPlugin {
                     Err(e) => return Err(e),
                 }
             };
-            let sess = state
-                .session
-                .as_ref()
-                .ok_or_else(|| anyhow!("photoprism: session missing after fetch_page"))?;
-
             let returned = photos.len() as u32;
             // Deduplicate by photo id. Overlapping pages (unstable sort, or
             // `order=random`) must not inflate the cache with repeats that the
             // gallery would then show again on the next offset window.
             for p in photos {
-                if let Some(meta) = photo_to_meta(p, sess, album_title.as_deref()) {
+                if let Some(meta) = photo_to_meta(p, album_title.as_deref()) {
                     if state.cached_ids.insert(meta.id.clone()) {
                         state.cached.push(meta);
                     }
@@ -901,7 +913,7 @@ fn pick_hash(photo: &PpPhoto) -> Option<String> {
         .map(|f| f.hash.clone())
 }
 
-fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Option<PhotoMeta> {
+fn photo_to_meta(p: PpPhoto, album_title: Option<&str>) -> Option<PhotoMeta> {
     let hash = pick_hash(&p)?;
 
     // Photos only — skip when the resolved hash belongs to a video file.
@@ -941,8 +953,6 @@ fn photo_to_meta(p: PpPhoto, sess: &Session, album_title: Option<&str>) -> Optio
     let mut extra: HashMap<String, String> = HashMap::new();
     extra.insert("hash".into(), hash.clone());
     extra.insert("uid".into(), p.uid.clone());
-    extra.insert("preview_token".into(), sess.preview_token.clone());
-    extra.insert("download_token".into(), sess.download_token.clone());
     extra.insert("media_type".into(), p.media_type);
 
     // Human album title (resolved from the configured slug/UID) for the OSD.
@@ -1101,7 +1111,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        self.client = Self::build_client(skip_tls, timeout)?;
+        self.client = Some(Self::build_client(skip_tls, timeout)?);
 
         // Validate base URL up-front so misconfiguration fails fast.
         let _ = self.base_url()?;
@@ -1170,33 +1180,22 @@ impl PhotoPlugin for PhotoPrismPlugin {
         Ok(state.cached[offset..end].to_vec())
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
         let hash = meta
             .extra
             .get("hash")
             .ok_or_else(|| anyhow!("photoprism: meta missing `hash` for '{}'", meta.filename))?;
-        // Prefer live session tokens (refreshed via /config and list headers).
+        // Tokens are session-scoped secrets and must never be copied into
+        // queue metadata, logs, status responses, or cache records.
         let (preview_token, download_token, headers) = {
             let state = self.state.lock().await;
-            let (preview_token, download_token) = if let Some(sess) = state.session.as_ref() {
-                (sess.preview_token.clone(), sess.download_token.clone())
-            } else {
-                (
-                    meta.extra
-                        .get("preview_token")
-                        .cloned()
-                        .unwrap_or_else(|| "public".into()),
-                    meta.extra
-                        .get("download_token")
-                        .cloned()
-                        .unwrap_or_else(|| "public".into()),
-                )
-            };
-            let headers = state
+            let session = state
                 .session
                 .as_ref()
-                .map(Self::auth_headers)
-                .unwrap_or_default();
+                .ok_or_else(|| anyhow!("photoprism: no authenticated session"))?;
+            let preview_token = session.preview_token.clone();
+            let download_token = session.download_token.clone();
+            let headers = Self::auth_headers(session);
             (preview_token, download_token, headers)
         };
         let preview_token = preview_token.as_str();
@@ -1223,7 +1222,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
         // tokens, so reject anything else rather than percent-encode (avoids a
         // new dependency, and a hostile value can't smuggle path segments).
         let request = if need_original {
-            self.client
+            self.client()?
                 .get(self.api_url(&format!("/dl/{hash}"))?)
                 .query(&[("t", download_token)])
         } else {
@@ -1232,7 +1231,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
                     "photoprism: preview token contains unexpected characters"
                 ));
             }
-            self.client
+            self.client()?
                 .get(self.api_url(&format!("/t/{hash}/{preview_token}/{size}"))?)
         };
 
@@ -1254,17 +1253,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
             }
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .context("reading PhotoPrism image body")?;
-
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return Err(anyhow!(
-                "photoprism: image too large ({} MB, hash {hash})",
-                bytes.len() / 1_048_576
-            ));
-        }
+        let bytes = read_bounded(resp, MAX_IMAGE_BYTES, "PhotoPrism image body").await?;
         if !is_image_magic(&bytes) {
             warn!(
                 "PhotoPrism: response for hash {hash} ({} bytes) is not a recognised image format",
@@ -1275,7 +1264,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
                 bytes.len()
             ));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     async fn set_favorite(&self, meta: &PhotoMeta, favorite: bool) -> Result<()> {
@@ -1304,9 +1293,9 @@ impl PhotoPlugin for PhotoPrismPlugin {
 
             // POST /like favourites; DELETE /like clears it.
             let req = if favorite {
-                self.client.post(&url)
+                self.client()?.post(&url)
             } else {
-                self.client.delete(&url)
+                self.client()?.delete(&url)
             };
             let resp = req
                 .headers(Self::session_headers(&sid))
@@ -1340,7 +1329,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
         if let Some(sess) = state.session.as_ref() {
             if let Ok(url) = self.api_url(&format!("/session/{}", sess.session_id)) {
                 let _ = self
-                    .client
+                    .client()?
                     .delete(&url)
                     .headers(Self::auth_headers(sess))
                     .send()
@@ -1350,7 +1339,6 @@ impl PhotoPlugin for PhotoPrismPlugin {
         Ok(())
     }
 }
-
 
 /// Extract host (no port) from an http(s) URL. Returns None if unparseable.
 fn url_host(url: &str) -> Option<String> {
@@ -1374,7 +1362,11 @@ fn url_host(url: &str) -> Option<String> {
             .map(|(h, _)| h.to_string())
             .unwrap_or_else(|| hostport.to_string())
     };
-    if host.is_empty() { None } else { Some(host) }
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1428,14 +1420,6 @@ mod tests {
         assert!(!is_image_magic(b""));
     }
 
-    fn sess() -> Session {
-        Session {
-            session_id: "sid123".into(),
-            preview_token: "ptok".into(),
-            download_token: "dtok".into(),
-        }
-    }
-
     #[test]
     fn photo_to_meta_picks_primary_file() {
         let p = PpPhoto {
@@ -1473,12 +1457,13 @@ mod tests {
                 },
             ],
         };
-        let m = photo_to_meta(p, &sess(), Some("January 2024")).unwrap();
+        let m = photo_to_meta(p, Some("January 2024")).unwrap();
         assert_eq!(m.id, "uid42");
         assert_eq!(m.filename, "IMG_42.jpg");
         assert_eq!(m.width, 4000);
         assert_eq!(m.extra.get("hash").unwrap(), "primaryhash");
-        assert_eq!(m.extra.get("preview_token").unwrap(), "ptok");
+        assert!(!m.extra.contains_key("preview_token"));
+        assert!(!m.extra.contains_key("download_token"));
         assert!(m.is_favorite);
         assert_eq!(m.album.as_deref(), Some("January 2024"));
         assert_eq!(m.title.as_deref(), Some("Sunset"));
@@ -1514,7 +1499,7 @@ mod tests {
             }],
         };
         // Video-only photos are always skipped — this is a photo frame.
-        assert!(photo_to_meta(p, &sess(), None).is_none());
+        assert!(photo_to_meta(p, None).is_none());
     }
 
     /// Look up a single search-param value by key.
@@ -1887,32 +1872,50 @@ mod tests {
 
     #[test]
     fn url_host_parses_common_forms() {
-        assert_eq!(url_host("http://photoprism.local:2342").as_deref(), Some("photoprism.local"));
-        assert_eq!(url_host("https://192.168.1.10/").as_deref(), Some("192.168.1.10"));
+        assert_eq!(
+            url_host("http://photoprism.local:2342").as_deref(),
+            Some("photoprism.local")
+        );
+        assert_eq!(
+            url_host("https://192.168.1.10/").as_deref(),
+            Some("192.168.1.10")
+        );
         assert_eq!(url_host("http://[::1]:2342/api").as_deref(), Some("::1"));
     }
 
     #[test]
     fn validate_tls_policy_requires_allowed_hosts() {
         let mut cfg = PluginConfig::default();
-        cfg.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
+        cfg.values.insert(
+            "url".into(),
+            serde_json::json!("http://photoprism.local:2342"),
+        );
         let plugin = PhotoPrismPlugin::new(cfg);
         let err = plugin.validate_tls_policy(true).unwrap_err().to_string();
         assert!(err.contains("allowed_hosts"), "{err}");
 
         let mut cfg2 = PluginConfig::default();
-        cfg2.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
-        cfg2.values.insert("allowed_hosts".into(), serde_json::json!(["other.local"]));
+        cfg2.values.insert(
+            "url".into(),
+            serde_json::json!("http://photoprism.local:2342"),
+        );
+        cfg2.values
+            .insert("allowed_hosts".into(), serde_json::json!(["other.local"]));
         let plugin2 = PhotoPrismPlugin::new(cfg2);
         let err2 = plugin2.validate_tls_policy(true).unwrap_err().to_string();
         assert!(err2.contains("not in allowed_hosts"), "{err2}");
 
         let mut cfg3 = PluginConfig::default();
-        cfg3.values.insert("url".into(), serde_json::json!("http://photoprism.local:2342"));
-        cfg3.values.insert("allowed_hosts".into(), serde_json::json!(["photoprism.local"]));
+        cfg3.values.insert(
+            "url".into(),
+            serde_json::json!("http://photoprism.local:2342"),
+        );
+        cfg3.values.insert(
+            "allowed_hosts".into(),
+            serde_json::json!(["photoprism.local"]),
+        );
         let plugin3 = PhotoPrismPlugin::new(cfg3);
         assert!(plugin3.validate_tls_policy(true).is_ok());
         assert!(plugin3.validate_tls_policy(false).is_ok());
     }
-
 }

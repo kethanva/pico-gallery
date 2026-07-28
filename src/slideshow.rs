@@ -36,6 +36,9 @@ const GALLERY_THUMBS_PER_TICK: usize = 4;
 struct QueueLoader {
     plugin_offsets: Vec<usize>,
     plugin_exhausted: Vec<bool>,
+    plugin_retryable_error: Vec<bool>,
+    retry_after: Vec<Option<Instant>>,
+    consecutive_errors: Vec<u8>,
     shuffle_seed: u64,
 }
 
@@ -44,6 +47,9 @@ impl QueueLoader {
         Self {
             plugin_offsets: vec![0; plugin_count],
             plugin_exhausted: vec![false; plugin_count],
+            plugin_retryable_error: vec![false; plugin_count],
+            retry_after: vec![None; plugin_count],
+            consecutive_errors: vec![0; plugin_count],
             shuffle_seed: shuffle_seed_now(),
         }
     }
@@ -57,11 +63,10 @@ impl QueueLoader {
     }
 
     /// Recompute per-plugin item counts from an externally-built `queue` (e.g.
-    /// the single-round initial load). A count of zero, or one that isn't an
-    /// exact multiple of `PAGE_SIZE`, means the last page fetched for that
-    /// plugin was short — i.e. the plugin already signalled exhaustion during
-    /// that fetch — so mark it exhausted here too rather than re-discovering
-    /// that with a wasted round-trip the first time navigation nears the end.
+    /// the single-round initial load). A nonzero count that isn't an exact
+    /// multiple of `PAGE_SIZE` means the last page was short and exhausted.
+    /// Zero is deliberately retryable: it may represent a transient initial
+    /// failure from a provider that has not contributed a page yet.
     fn sync_counts(&mut self, queue: &[(usize, PhotoMeta)]) {
         self.plugin_offsets.fill(0);
         for (pi, _) in queue {
@@ -70,7 +75,7 @@ impl QueueLoader {
             }
         }
         for (i, off) in self.plugin_offsets.iter().enumerate() {
-            if *off >= MAX_PHOTOS_PER_PLUGIN || *off == 0 || *off % PAGE_SIZE != 0 {
+            if *off >= MAX_PHOTOS_PER_PLUGIN || (*off > 0 && *off % PAGE_SIZE != 0) {
                 self.plugin_exhausted[i] = true;
             }
         }
@@ -81,11 +86,31 @@ impl QueueLoader {
             && queue_len > 0
             && trigger_idx + LOAD_AHEAD_MARGIN >= queue_len.saturating_sub(1)
     }
+
+    fn ready_to_retry(&self, plugin_idx: usize) -> bool {
+        self.retry_after[plugin_idx].is_none_or(|deadline| Instant::now() >= deadline)
+    }
+
+    fn record_success(&mut self, plugin_idx: usize) {
+        self.plugin_retryable_error[plugin_idx] = false;
+        self.consecutive_errors[plugin_idx] = 0;
+        self.retry_after[plugin_idx] = None;
+    }
+
+    fn record_error(&mut self, plugin_idx: usize) -> Duration {
+        self.plugin_retryable_error[plugin_idx] = true;
+        self.consecutive_errors[plugin_idx] = self.consecutive_errors[plugin_idx].saturating_add(1);
+        let exponent = u32::from(self.consecutive_errors[plugin_idx].saturating_sub(1)).min(6);
+        let delay = Duration::from_secs(1u64 << exponent);
+        self.retry_after[plugin_idx] = Some(Instant::now() + delay);
+        delay
+    }
 }
 
 /// Settings-menu title. Used both to render the panel and to compute its
 /// geometry for click/hover hit-testing, so the two must use the same string.
 const MENU_TITLE: &str = "PicoGallery - Settings";
+const MAX_PREFETCH_ATTEMPTS_PER_TICK: usize = 8;
 
 /// Builds fresh plugin instances from a config. Lets the engine rebuild its
 /// photo sources at runtime (e.g. when the user switches source from the
@@ -146,13 +171,27 @@ impl Slideshow {
         remote_rx: Option<Receiver<SlideshowCmd>>,
         cec_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
+        shutdown_rx: Receiver<()>,
     ) -> Result<()> {
         // 1. Authenticate all plugins.
         self.authenticate_all().await?;
 
-        // 2. Build the initial play queue (first API page per plugin — more load
-        // on demand as the user pages through the gallery or slideshow).
-        let queue = self.build_queue().await?;
+        // 2. Build the initial play queue. A source may be temporarily offline
+        // after authentication, so give retryable providers a short bounded
+        // window before declaring the appliance empty.
+        let mut queue = Vec::new();
+        for attempt in 0..3 {
+            queue = self.build_queue().await?;
+            if !queue.is_empty() {
+                break;
+            }
+            let delay = Duration::from_secs(1 << attempt);
+            warn!(
+                "No photos available yet; retrying providers in {}s",
+                delay.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+        }
         if queue.is_empty() {
             anyhow::bail!(
                 "No photos found across all plugins. Check your config and photo source \
@@ -161,45 +200,82 @@ impl Slideshow {
             );
         }
         info!("Play queue: {} photos", queue.len());
+        if let Some(status) = &remote_status {
+            let mut snapshot = status.lock().await;
+            snapshot.total = queue.len();
+            snapshot.providers = self.plugins.len();
+        }
 
         // 3. Create renderer on the main thread (SDL2 requires it).
         let mut renderer = Renderer::init(self.config.display.clone())?;
 
         // 4. Main display loop.
-        self.display_loop(&mut renderer, queue, remote_rx, cec_rx, remote_status)
-            .await
+        let result = self
+            .display_loop(
+                &mut renderer,
+                queue,
+                remote_rx,
+                cec_rx,
+                remote_status,
+                shutdown_rx,
+            )
+            .await;
+        for plugin in &mut self.plugins {
+            if let Err(e) = plugin.shutdown().await {
+                warn!("{} shutdown failed: {e}", plugin.name());
+            }
+        }
+        result
     }
 
     // ── Authentication ────────────────────────────────────────────────────
 
     async fn authenticate_all(&mut self) -> Result<()> {
-        for plugin in &mut self.plugins {
+        let mut authenticated = Vec::with_capacity(self.plugins.len());
+        for mut plugin in self.plugins.drain(..) {
             info!("Authenticating plugin: {}", plugin.display_name());
+            let mut usable = false;
             loop {
-                match plugin.authenticate().await? {
-                    AuthStatus::Authenticated => {
-                        info!("  {} authenticated.", plugin.display_name());
+                match plugin.authenticate().await {
+                    Err(e) => {
+                        warn!("  {} authentication failed: {e:#}", plugin.display_name());
                         break;
                     }
-                    AuthStatus::PendingUserAction {
+                    Ok(AuthStatus::Authenticated) => {
+                        info!("  {} authenticated.", plugin.display_name());
+                        usable = true;
+                        break;
+                    }
+                    Ok(AuthStatus::PendingUserAction {
                         message,
                         poll_interval_secs,
-                    } => {
-                        // Print instructions to the terminal; in a future release
-                        // these would render on-screen via OSD.
+                    }) => {
                         println!("\n=== {} ===\n{}", plugin.display_name(), message);
                         println!("Checking again in {} seconds…", poll_interval_secs);
-                        tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
+                        tokio::time::sleep(Duration::from_secs(poll_interval_secs.clamp(1, 60)))
+                            .await;
                     }
-                    AuthStatus::NotAuthenticated => {
+                    Ok(AuthStatus::NotAuthenticated) => {
                         warn!(
-                            "  {} is not authenticated and cannot continue.",
+                            "  {} is not authenticated; source disabled.",
                             plugin.display_name()
                         );
                         break;
                     }
                 }
             }
+            if usable {
+                authenticated.push(plugin);
+            } else if let Err(e) = plugin.shutdown().await {
+                warn!(
+                    "{} shutdown after authentication failure: {e}",
+                    plugin.name()
+                );
+            }
+        }
+        self.plugins = authenticated;
+        if self.plugins.is_empty() {
+            anyhow::bail!("No providers authenticated successfully")
         }
         Ok(())
     }
@@ -253,6 +329,9 @@ impl Slideshow {
             if loader.plugin_exhausted[plugin_idx] {
                 continue;
             }
+            if !loader.ready_to_retry(plugin_idx) {
+                continue;
+            }
             let offset = loader.plugin_offsets[plugin_idx];
             if offset >= MAX_PHOTOS_PER_PLUGIN {
                 loader.plugin_exhausted[plugin_idx] = true;
@@ -260,9 +339,11 @@ impl Slideshow {
             }
             match plugin.list_photos(PAGE_SIZE, offset).await {
                 Ok(page) if page.is_empty() => {
+                    loader.record_success(plugin_idx);
                     loader.plugin_exhausted[plugin_idx] = true;
                 }
                 Ok(page) => {
+                    loader.record_success(plugin_idx);
                     info!(
                         "  {} loaded {} photos (offset {})",
                         plugin.name(),
@@ -277,8 +358,15 @@ impl Slideshow {
                     }
                 }
                 Err(e) => {
-                    warn!("  {} list_photos error: {}", plugin.name(), e);
-                    loader.plugin_exhausted[plugin_idx] = true;
+                    let delay = loader.record_error(plugin_idx);
+                    warn!(
+                        "  {} list_photos error: {}; retrying in {}s",
+                        plugin.name(),
+                        e,
+                        delay.as_secs()
+                    );
+                    // Keep the source retryable. An empty successful page is the
+                    // only signal that paging is exhausted.
                 }
             }
         }
@@ -289,6 +377,7 @@ impl Slideshow {
     async fn try_extend_queue(
         &self,
         queue: &mut Vec<(usize, PhotoMeta)>,
+        queue_ids: &mut HashSet<(usize, String)>,
         loader: &mut QueueLoader,
         trigger_idx: usize,
         remote_status: &Option<SharedStatus>,
@@ -296,34 +385,31 @@ impl Slideshow {
         if !loader.near_end(trigger_idx, queue.len()) {
             return false;
         }
-        self.extend_queue_once(queue, loader, remote_status).await
+        self.extend_queue_once(queue, queue_ids, loader, remote_status).await
     }
 
     /// Always try to append the next API page (e.g. user hit the last row/photo).
     async fn try_extend_queue_force(
         &self,
         queue: &mut Vec<(usize, PhotoMeta)>,
+        queue_ids: &mut HashSet<(usize, String)>,
         loader: &mut QueueLoader,
         remote_status: &Option<SharedStatus>,
     ) -> bool {
         if loader.all_exhausted() {
             return false;
         }
-        self.extend_queue_once(queue, loader, remote_status).await
+        self.extend_queue_once(queue, queue_ids, loader, remote_status).await
     }
 
     async fn extend_queue_once(
         &self,
         queue: &mut Vec<(usize, PhotoMeta)>,
+        queue_ids: &mut HashSet<(usize, String)>,
         loader: &mut QueueLoader,
         remote_status: &Option<SharedStatus>,
     ) -> bool {
         let before = queue.len();
-        // Skip photos already in the queue. Offset paging can resurface the
-        // same IDs when a plugin reshuffles/rescans mid-session, or when a
-        // remote API (e.g. order=random) returns overlapping pages.
-        let mut seen: HashSet<(usize, String)> =
-            queue.iter().map(|(pi, m)| (*pi, m.id.clone())).collect();
         // One gallery tick may land in a duplicate window after a rescan —
         // walk a few pages in this call so the UI still advances.
         let mut unique: Vec<(usize, PhotoMeta)> = Vec::new();
@@ -335,7 +421,7 @@ impl Slideshow {
             if batch.is_empty() {
                 break;
             }
-            let fresh = filter_unseen_photos(batch, &mut seen);
+            let fresh = filter_unseen_photos(batch, queue_ids);
             if fresh.is_empty() {
                 continue;
             }
@@ -357,7 +443,7 @@ impl Slideshow {
             queue.len()
         );
         if let Some(status) = remote_status {
-            status.lock().unwrap_or_else(|e| e.into_inner()).total = queue.len();
+            status.lock().await.total = queue.len();
         }
         true
     }
@@ -371,9 +457,14 @@ impl Slideshow {
         mut remote_rx: Option<Receiver<SlideshowCmd>>,
         mut cec_rx: Option<Receiver<SlideshowCmd>>,
         remote_status: Option<SharedStatus>,
+        mut shutdown_rx: Receiver<()>,
     ) -> Result<()> {
+        let tc = renderer.texture_creator();
         let mut queue_loader = QueueLoader::new(self.plugins.len());
         queue_loader.sync_counts(&queue);
+        let mut queue_ids: HashSet<(usize, String)> =
+            queue.iter().map(|(pi, m)| (*pi, m.id.clone())).collect();
+
         // Prefetch ring: up to `prefetch_count` photos fetched *and* fully
         // decoded/scaled ahead of time, so showing a slide is just a texture
         // upload + transition — the costly JPEG decode and Lanczos resize run
@@ -414,7 +505,14 @@ impl Slideshow {
         let mut gallery_thumb_cursor = 0usize;
 
         let no_repeat_shown = self.config.display.no_repeat_shown;
-        let mut shown_ids: HashSet<(usize, String)> = HashSet::new();
+        let mut shown_ids: Vec<HashSet<String>> =
+            (0..self.plugins.len()).map(|_| HashSet::new()).collect();
+        let mut shown_count = 0usize;
+        let mut menu_frame = RgbaImage::from_pixel(
+            renderer.width().max(1),
+            renderer.height().max(1),
+            Rgba([0, 0, 0, 255]),
+        );
         // First frame after opening from the grid uses Cut (no fade from grid).
         let mut open_cut_once = false;
 
@@ -476,6 +574,10 @@ impl Slideshow {
                     cmds.push(cmd);
                 }
             }
+            if shutdown_rx.try_recv().is_ok() {
+                info!("OS shutdown signal received.");
+                cmds.push(SlideshowCmd::Quit);
+            }
 
             // Menu rows + labels for *this* input batch, built once so clicks
             // map to the exact layout poll_events hit-tested against. Only built
@@ -522,7 +624,7 @@ impl Slideshow {
                                 gallery_ctl.dirty = true;
                             } else if let Some(img) = &current_rgba {
                                 // Repaint the photo underneath so the menu vanishes.
-                                let _ = renderer.show_cut(img);
+                                let _ = renderer.show_cut(img, &tc);
                             }
                             if !paused {
                                 last_advance = Instant::now();
@@ -587,7 +689,7 @@ impl Slideshow {
                                     if mode.is_gallery() {
                                         gallery_ctl.dirty = true;
                                     } else if let Some(img) = &current_rgba {
-                                        let _ = renderer.show_cut(img);
+                                        let _ = renderer.show_cut(img, &tc);
                                     }
                                     if !paused {
                                         last_advance = Instant::now();
@@ -609,7 +711,7 @@ impl Slideshow {
                             info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                             last_advance = Instant::now();
                             if let Some(status) = &remote_status {
-                                status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
+                                status.lock().await.paused = paused;
                             }
                         }
                     }
@@ -618,6 +720,7 @@ impl Slideshow {
                             if current_queue_idx + 1 >= queue.len() {
                                 self.try_extend_queue_force(
                                     &mut queue,
+                                    &mut queue_ids,
                                     &mut queue_loader,
                                     &remote_status,
                                 )
@@ -724,6 +827,7 @@ impl Slideshow {
                                 && self
                                     .try_extend_queue_force(
                                         &mut queue,
+                                        &mut queue_ids,
                                         &mut queue_loader,
                                         &remote_status,
                                     )
@@ -744,6 +848,7 @@ impl Slideshow {
                                 && self
                                     .try_extend_queue_force(
                                         &mut queue,
+                                        &mut queue_ids,
                                         &mut queue_loader,
                                         &remote_status,
                                     )
@@ -836,7 +941,7 @@ impl Slideshow {
                         info!("Slideshow {}.", if paused { "paused" } else { "resumed" });
                         last_advance = Instant::now();
                         if let Some(status) = &remote_status {
-                            status.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
+                            status.lock().await.paused = paused;
                         }
                         menu_dirty = true;
                     }
@@ -873,7 +978,8 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
-                            shown_ids.clear();
+                            shown_ids.iter_mut().for_each(HashSet::clear);
+                            shown_count = 0;
                             if gallery_mode {
                                 let grid = &mut gallery_ctl.grid;
                                 grid.clear();
@@ -888,7 +994,8 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
-                            shown_ids.clear();
+                            shown_ids = (0..self.plugins.len()).map(|_| HashSet::new()).collect();
+                            shown_count = 0;
                             current_meta = None;
                             current_rgba = None;
                             menu.open = false;
@@ -906,7 +1013,8 @@ impl Slideshow {
                             }
                         }
                         MenuOutcome::ResetShown => {
-                            shown_ids.clear();
+                            shown_ids.iter_mut().for_each(HashSet::clear);
+                            shown_count = 0;
                             menu_dirty = true;
                         }
                     },
@@ -936,16 +1044,14 @@ impl Slideshow {
                     // (which uses the screen height) would be vertically offset
                     // whenever the photo doesn't fill the screen — e.g. plain
                     // letterbox (`letterbox_blur = false`) or `fill_screen` crop.
-                    let mut frame = RgbaImage::from_pixel(
-                        renderer.width().max(1),
-                        renderer.height().max(1),
-                        Rgba([0, 0, 0, 255]),
-                    );
+                    menu_frame
+                        .pixels_mut()
+                        .for_each(|pixel| *pixel = Rgba([0, 0, 0, 255]));
                     if let Some(img) = &current_rgba {
-                        blit_center(&mut frame, img);
+                        blit_center(&mut menu_frame, img);
                     }
-                    crate::osd::draw_menu(&mut frame, MENU_TITLE, &items, menu.selected);
-                    if let Err(e) = renderer.show_cut(&frame) {
+                    crate::osd::draw_menu(&mut menu_frame, MENU_TITLE, &items, menu.selected);
+                    if let Err(e) = renderer.show_cut(&menu_frame, &tc) {
                         warn!("menu render error: {e}");
                     }
                     menu_dirty = false;
@@ -961,7 +1067,7 @@ impl Slideshow {
                     grid.clamp_scroll(queue.len(), renderer.height());
                     let sel = grid.selected.min(queue.len().saturating_sub(1));
                     if self
-                        .try_extend_queue(&mut queue, &mut queue_loader, sel, &remote_status)
+                        .try_extend_queue(&mut queue, &mut queue_ids, &mut queue_loader, sel, &remote_status)
                         .await
                     {
                         gallery_ctl.dirty = true;
@@ -1022,7 +1128,7 @@ impl Slideshow {
                     // loaded grid does no render or blit work.
                     if gallery_ctl.dirty {
                         let frame = grid.render(renderer.width(), renderer.height(), queue.len());
-                        if let Err(e) = renderer.show_cut(&frame) {
+                        if let Err(e) = renderer.show_cut(&frame, &tc) {
                             warn!("gallery render error: {e}");
                         }
                         gallery_ctl.dirty = false;
@@ -1038,6 +1144,7 @@ impl Slideshow {
                 if queue_loader.near_end(current_queue_idx, queue.len()) {
                     self.try_extend_queue(
                         &mut queue,
+                        &mut queue_ids,
                         &mut queue_loader,
                         current_queue_idx,
                         &remote_status,
@@ -1075,7 +1182,7 @@ impl Slideshow {
                     let w = renderer.width().max(1);
                     let h = renderer.height().max(1);
                     let black = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
-                    if let Err(e) = renderer.show_cut(&black) {
+                    if let Err(e) = renderer.show_cut(&black, &tc) {
                         warn!("schedule: could not show black frame: {e}");
                     }
                     crate::display_power::set_power(false).await;
@@ -1147,7 +1254,7 @@ impl Slideshow {
 
             if last_advance.elapsed() < current_slide_dur {
                 if queue_loader.near_end(cursor, queue.len()) {
-                    self.try_extend_queue(&mut queue, &mut queue_loader, cursor, &remote_status)
+                    self.try_extend_queue(&mut queue, &mut queue_ids, &mut queue_loader, cursor, &remote_status)
                         .await;
                 }
                 self.prefetch_one(
@@ -1171,12 +1278,12 @@ impl Slideshow {
             if let Some((q_idx, meta, mut rgba, exif_date)) = prefetched.pop_front() {
                 debug!("Showing: {}", meta.filename);
                 if no_repeat_shown {
-                    shown_ids.insert((queue[q_idx].0, meta.id.clone()));
-                    if queue
-                        .iter()
-                        .all(|(pi, m)| shown_ids.contains(&(*pi, m.id.clone())))
-                    {
-                        shown_ids.clear();
+                    if shown_ids[queue[q_idx].0].insert(meta.id.clone()) {
+                        shown_count += 1;
+                    }
+                    if shown_count >= queue.len() {
+                        shown_ids.iter_mut().for_each(HashSet::clear);
+                        shown_count = 0;
                         info!("All photos shown — starting a fresh no-repeat cycle");
                     }
                 }
@@ -1239,7 +1346,7 @@ impl Slideshow {
                     self.config.display.transition.clone()
                 };
                 let result = match transition {
-                    Transition::Cut => renderer.show_cut(&frame),
+                    Transition::Cut => renderer.show_cut(&frame, &tc),
                     Transition::Fade => {
                         renderer
                             .show_fade(current_rgba.as_ref(), &frame, trans_dur)
@@ -1267,7 +1374,8 @@ impl Slideshow {
                 last_advance = Instant::now();
                 // Reflect the newly displayed photo in the remote's status endpoint.
                 if let Some(status) = &remote_status {
-                    let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut s = status.lock().await;
+                    s.paused = paused;
                     s.index = q_idx;
                     s.total = queue.len();
                     s.filename = meta.filename.clone();
@@ -1307,7 +1415,7 @@ impl Slideshow {
     /// ring. Used when opening a photo from the gallery so the clicked photo
     /// is what appears — not a neighbour that happened to decode first.
     async fn load_photo_into_prefetch(
-        &self,
+        &mut self,
         queue: &[(usize, PhotoMeta)],
         idx: usize,
         prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
@@ -1335,21 +1443,23 @@ impl Slideshow {
 
     #[allow(clippy::too_many_arguments)] // prefetch-ring state fan-out; a struct would only add ceremony
     async fn prefetch_one(
-        &self,
+        &mut self,
         queue: &[(usize, PhotoMeta)],
         cursor: &mut usize,
         prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
         prefetch_n: usize,
         renderer: &Renderer,
         no_repeat: bool,
-        shown_ids: &HashSet<(usize, String)>,
+        shown_ids: &[HashSet<String>],
     ) {
         if prefetched.len() >= prefetch_n || queue.is_empty() {
             return;
         }
         let start = *cursor;
         let mut attempts = 0usize;
-        while prefetched.len() < prefetch_n && attempts < queue.len() {
+        while prefetched.len() < prefetch_n
+            && attempts < queue.len().min(MAX_PREFETCH_ATTEMPTS_PER_TICK)
+        {
             let idx = *cursor;
             let (pidx, meta) = &queue[idx];
             *cursor += 1;
@@ -1358,7 +1468,7 @@ impl Slideshow {
             }
             attempts += 1;
 
-            if no_repeat && shown_ids.contains(&(*pidx, meta.id.clone())) {
+            if no_repeat && shown_ids[*pidx].contains(meta.id.as_str()) {
                 continue;
             }
 
@@ -1370,8 +1480,10 @@ impl Slideshow {
             };
             // Decode on a blocking thread (see load_photo_into_prefetch).
             let processor = renderer.image_processor();
+            let decode_start = Instant::now();
             match tokio::task::spawn_blocking(move || processor.decode_and_scale(&bytes)).await {
                 Ok(Ok((rgba, exif_date))) => {
+                    debug!("Decoded {} in {:?}", meta.filename, decode_start.elapsed());
                     prefetched.push_back((idx, meta.clone(), rgba, exif_date));
                     return;
                 }
@@ -1427,8 +1539,8 @@ impl Slideshow {
                     },
                     meta.filename
                 );
-                if let Some(status) = remote_status {
-                    status.lock().unwrap_or_else(|e| e.into_inner()).favorite = target;
+                if let Some(status) = &remote_status {
+                    status.lock().await.favorite = target;
                 }
             }
             Err(e) => warn!("Favourite toggle failed: {e}"),
@@ -1712,15 +1824,40 @@ impl Slideshow {
         }
     }
 
-    async fn reload_plugins_after_targeting(&mut self) -> Result<()> {
+    async fn reload_plugins_after_targeting(
+        &mut self,
+        old_targeting: Option<crate::config::TargetingConfig>,
+    ) -> Result<()> {
+        let mut errors = Vec::new();
         for plugin in &mut self.plugins {
             let pcfg = self
                 .config
                 .plugin_config(plugin.name())
                 .cloned()
                 .unwrap_or_default();
-            plugin.init(&pcfg).await?;
-            plugin.refresh_auth().await?;
+            if let Err(e) = plugin.init(&pcfg).await {
+                errors.push(format!("{} init error: {}", plugin.name(), e));
+                continue;
+            }
+            if let Err(e) = plugin.refresh_auth().await {
+                errors.push(format!("{} auth error: {}", plugin.name(), e));
+            }
+        }
+        if !errors.is_empty() {
+            if let Some(old) = old_targeting {
+                self.config.targeting = old;
+                self.apply_targeting_now();
+                for plugin in &mut self.plugins {
+                    let pcfg = self
+                        .config
+                        .plugin_config(plugin.name())
+                        .cloned()
+                        .unwrap_or_default();
+                    let _ = plugin.init(&pcfg).await;
+                    let _ = plugin.refresh_auth().await;
+                }
+            }
+            return Err(anyhow::anyhow!("targeting application failed: {}", errors.join(", ")));
         }
         Ok(())
     }
@@ -1755,9 +1892,10 @@ impl Slideshow {
             .position(|o| o.as_ref() == current.as_ref())
             .unwrap_or(0);
         let next = options[(pos + 1) % options.len()].clone();
+        let old_targeting = self.config.targeting.clone();
         self.config.targeting.album = next.unwrap_or_default();
         self.apply_targeting_now();
-        if let Err(e) = self.reload_plugins_after_targeting().await {
+        if let Err(e) = self.reload_plugins_after_targeting(Some(old_targeting)).await {
             warn!("Reload after album change failed: {e}");
             return MenuOutcome::Stay;
         }
@@ -1788,9 +1926,10 @@ impl Slideshow {
         }) {
             return MenuOutcome::Stay;
         }
+        let old_targeting = self.config.targeting.clone();
         self.config.targeting.favorites_only = !self.config.targeting.favorites_only;
         self.apply_targeting_now();
-        if let Err(e) = self.reload_plugins_after_targeting().await {
+        if let Err(e) = self.reload_plugins_after_targeting(Some(old_targeting)).await {
             warn!("Reload after favourites toggle failed: {e}");
             return MenuOutcome::Stay;
         }
@@ -1910,20 +2049,23 @@ impl Slideshow {
     // ── Fetching ──────────────────────────────────────────────────────────
 
     async fn fetch_photo_thumb(
-        &self,
+        &mut self,
         plugin_idx: usize,
         meta: &PhotoMeta,
         thumb_px: u32,
         _renderer: &Renderer,
     ) -> Option<Vec<u8>> {
-        let plugin = &self.plugins[plugin_idx];
-        let cache_key = format!("{}/thumb/{}", plugin.name(), meta.id);
+        let plugin_name = self.plugins.get(plugin_idx)?.name().to_owned();
+        let cache_key = format!("{plugin_name}/thumb/{}", meta.id);
 
         if let Some(bytes) = self.cache.lock().await.get(&cache_key).await {
             return Some(bytes);
         }
 
-        let fetch = plugin.get_photo_bytes(meta, thumb_px, thumb_px);
+        let fetch = self
+            .plugins
+            .get_mut(plugin_idx)?
+            .get_photo_bytes(meta, thumb_px, thumb_px);
         match tokio::time::timeout(Duration::from_secs(30), fetch).await {
             Ok(Ok(bytes)) => {
                 let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
@@ -1941,13 +2083,13 @@ impl Slideshow {
     }
 
     async fn fetch_photo(
-        &self,
+        &mut self,
         plugin_idx: usize,
         meta: &PhotoMeta,
         renderer: &Renderer,
     ) -> Option<Vec<u8>> {
-        let plugin = &self.plugins[plugin_idx];
-        let cache_key = meta.cache_key(plugin.name());
+        let plugin_name = self.plugins.get(plugin_idx)?.name().to_owned();
+        let cache_key = meta.cache_key(&plugin_name);
 
         // Check disk cache first.
         if let Some(bytes) = self.cache.lock().await.get(&cache_key).await {
@@ -1955,7 +2097,11 @@ impl Slideshow {
         }
 
         // Fetch from remote — 30 s timeout prevents a hung plugin from stalling the slideshow.
-        let fetch = plugin.get_photo_bytes(meta, renderer.width(), renderer.height());
+        let fetch = self.plugins.get_mut(plugin_idx)?.get_photo_bytes(
+            meta,
+            renderer.width(),
+            renderer.height(),
+        );
         match tokio::time::timeout(Duration::from_secs(30), fetch).await {
             Ok(Ok(bytes)) => {
                 let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
@@ -2258,6 +2404,18 @@ mod tests {
         assert_eq!(next_slide_secs(7), 10); // not a preset → snaps to 10
     }
 
+    #[test]
+    fn provider_errors_use_backoff_without_permanent_exhaustion() {
+        let mut loader = QueueLoader::new(1);
+        let delay = loader.record_error(0);
+        assert_eq!(delay, Duration::from_secs(1));
+        assert!(!loader.plugin_exhausted[0]);
+        assert!(!loader.ready_to_retry(0));
+        loader.record_success(0);
+        assert!(loader.ready_to_retry(0));
+        assert!(!loader.plugin_retryable_error[0]);
+    }
+
     fn meta_for(id: &str) -> PhotoMeta {
         PhotoMeta {
             id: id.into(),
@@ -2300,10 +2458,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_counts_marks_zero_items_as_exhausted() {
+    fn sync_counts_keeps_zero_items_retryable() {
         let mut loader = QueueLoader::new(2);
         loader.sync_counts(&[]);
-        assert!(loader.all_exhausted());
+        assert!(!loader.all_exhausted());
     }
 
     #[test]

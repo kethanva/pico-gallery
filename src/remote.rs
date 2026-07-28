@@ -11,9 +11,10 @@
 //!   POST /api/pause    → toggle pause
 //!   POST /api/favorite → favourite/un-favourite the current photo
 //!   GET  /api/status   → {"paused":…,"index":…,"total":…,"filename":…,"album":…,"favorite":…}
+//!   GET  /api/health   → process/readiness status for local supervision
 //!
 //! Security:
-//!   - No authentication — bind to a trusted LAN only (see `[remote] bind`).
+//!   - A bearer token is mandatory whenever the remote is enabled.
 //!   - Commands are display-control only; no photo bytes or filesystem paths.
 //!   - `/api/status` returns [`Status`] only — no Wi-Fi, PhotoPrism, or other
 //!     credentials are ever included in the JSON payload.
@@ -21,8 +22,10 @@
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -49,6 +52,7 @@ pub struct Status {
     pub paused: bool,
     pub index: usize,
     pub total: usize,
+    pub providers: usize,
     pub filename: String,
     pub album: String,
     pub favorite: bool,
@@ -60,8 +64,18 @@ pub type SharedStatus = Arc<Mutex<Status>>;
 /// the display loop drains. Fails fast on bind errors (port in use, bad
 /// address) so misconfiguration is visible at startup.
 pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<SlideshowCmd>> {
-    let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let listener = TcpListener::bind(&addr)
+    let token = Arc::new(
+        cfg.token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("remote: token is required"))?,
+    );
+    let bind_ip = cfg
+        .bind
+        .parse::<IpAddr>()
+        .context("remote: bind must be a literal IP address")?;
+    let addr = SocketAddr::new(bind_ip, cfg.port);
+    let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("remote: binding {addr}"))?;
     info!("Remote control: http://{addr}/");
@@ -71,7 +85,11 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
 
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                _ = tx.closed() => return,
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, peer)) => {
                     let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
                         debug!("remote: rejecting {peer} — connection limit reached");
@@ -82,9 +100,11 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
                     debug!("remote: connection from {peer}");
                     let tx = tx.clone();
                     let status = status.clone();
+                    let token = token.clone();
+                    let bind_ip_str = Arc::new(bind_ip.to_string());
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = handle_conn(stream, tx, status).await {
+                        if let Err(e) = handle_conn(stream, tx, status, token, bind_ip_str).await {
                             debug!("remote: connection error: {e}");
                         }
                     });
@@ -111,6 +131,8 @@ async fn handle_conn(
     mut stream: tokio::net::TcpStream,
     tx: Sender<SlideshowCmd>,
     status: SharedStatus,
+    token: Arc<String>,
+    bind_ip: Arc<String>,
 ) -> Result<()> {
     // Read until end-of-headers or the buffer fills. A single `read` can
     // return a partial request when TCP fragments; looping keeps large
@@ -142,23 +164,57 @@ async fn handle_conn(
     let mut parts = req.split_whitespace();
     let method = parts.next().unwrap_or("");
     // Browsers / proxies may append `?…` — match on the path only.
-    let path = parts
-        .next()
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("");
+    let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
+
+    // The control shell has no data or side effects. It remains readable so a
+    // user can open `http://host:8188/#TOKEN`; the fragment never traverses
+    // the network and JavaScript sends it only in API request headers.
+    if !validate_host(&req, &bind_ip) {
+        let response = http_response("400 Bad Request", "text/plain", "invalid host");
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await.ok();
+        return Ok(());
+    }
+
+    if !(authorized(&req, &token) || method == "GET" && path == "/") {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let response = http_response(
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":\"unauthorized\"}",
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await.ok();
+        return Ok(());
+    }
 
     let response = match (method, path) {
         ("GET", "/") => http_response("200 OK", "text/html; charset=utf-8", CONTROL_PAGE),
         ("GET", "/api/status") => {
             let body = {
-                // A poisoned lock still holds valid status data — report it
-                // rather than masking the panic behind a default snapshot.
-                let s = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let s = status.lock().await.clone();
                 serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string())
             };
             http_response("200 OK", "application/json", &body)
+        }
+        ("GET", "/api/health") => {
+            let snapshot = status.lock().await.clone();
+            if snapshot.total > 0 && snapshot.providers > 0 {
+                http_response(
+                    "200 OK",
+                    "application/json",
+                    &format!(
+                        "{{\"status\":\"ready\",\"photos\":{},\"providers\":{}}}",
+                        snapshot.total, snapshot.providers
+                    ),
+                )
+            } else {
+                http_response(
+                    "503 Service Unavailable",
+                    "application/json",
+                    "{\"status\":\"starting\"}",
+                )
+            }
         }
         ("POST", "/api/next") => command(&tx, SlideshowCmd::Next),
         ("POST", "/api/prev") => command(&tx, SlideshowCmd::Prev),
@@ -170,6 +226,40 @@ async fn handle_conn(
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await.ok();
     Ok(())
+}
+
+fn authorized(req: &str, token: &str) -> bool {
+    let Some(value) = req.lines().skip(1).find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().strip_prefix("Bearer "))
+                .flatten()
+        })
+    }) else {
+        return false;
+    };
+    constant_time_eq(value.as_bytes(), token.as_bytes())
+}
+
+fn validate_host(req: &str, bind_ip: &str) -> bool {
+    let Some(value) = req.lines().skip(1).find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("host")
+                .then(|| value.trim())
+        })
+    }) else {
+        return false;
+    };
+    let host_no_port = value.split(':').next().unwrap_or(value);
+    host_no_port == bind_ip || host_no_port == "localhost"
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for i in 0..left.len().max(right.len()) {
+        diff |= usize::from(*left.get(i).unwrap_or(&0) ^ *right.get(i).unwrap_or(&0));
+    }
+    diff == 0
 }
 
 fn command(tx: &Sender<SlideshowCmd>, cmd: SlideshowCmd) -> String {
@@ -240,11 +330,13 @@ const CONTROL_PAGE: &str = r#"<!DOCTYPE html>
 </div>
 <div id="status">…</div>
 <script>
-async function cmd(c){ try{ await fetch('/api/'+c,{method:'POST'}); }catch(e){}
+const token = decodeURIComponent(location.hash.slice(1));
+const auth = token ? {'Authorization':'Bearer '+token} : {};
+async function cmd(c){ try{ await fetch('/api/'+c,{method:'POST',headers:auth}); }catch(e){}
                        setTimeout(poll, 300); }
 async function poll(){
   try{
-    const s = await (await fetch('/api/status')).json();
+    const s = await (await fetch('/api/status',{headers:auth})).json();
     document.getElementById('pp').innerHTML = s.paused ? '&#9654;' : '&#10073;&#10073;';
     const fav = document.getElementById('fav');
     fav.innerHTML = s.favorite ? '&#9829;' : '&#9825;';   // filled vs outline heart
@@ -283,12 +375,20 @@ mod tests {
         let raw = "GET /api/status?x=1 HTTP/1.1";
         let mut parts = raw.split_whitespace();
         let _method = parts.next().unwrap();
-        let path = parts
-            .next()
-            .unwrap()
-            .split('?')
-            .next()
-            .unwrap();
+        let path = parts.next().unwrap().split('?').next().unwrap();
         assert_eq!(path, "/api/status");
+    }
+
+    #[test]
+    fn authorization_requires_exact_bearer_token() {
+        assert!(authorized(
+            "GET /api/status HTTP/1.1\r\nAuthorization: Bearer abc\r\n",
+            "abc"
+        ));
+        assert!(!authorized(
+            "GET /api/status HTTP/1.1\r\nAuthorization: Bearer ab\r\n",
+            "abc"
+        ));
+        assert!(!authorized("GET /api/status HTTP/1.1\r\n", "abc"));
     }
 }

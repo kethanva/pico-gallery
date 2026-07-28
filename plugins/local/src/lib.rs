@@ -45,6 +45,11 @@ impl LocalPlugin {
     }
 
     async fn scan_dir(&self, dir: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+        const MAX_DIRS: usize = 10_000;
+        const MAX_FILES: usize = 100_000;
+        if visited.len() >= MAX_DIRS || out.len() >= MAX_FILES {
+            return;
+        }
         // Symlink cycles inside the root (e.g. photos/loop -> photos/) would
         // recurse forever — skip any canonical dir we've already walked.
         if !visited.insert(dir.to_path_buf()) {
@@ -78,7 +83,9 @@ impl LocalPlugin {
             if is_dir && self.recursive() {
                 Box::pin(self.scan_dir(&canonical, visited, out)).await;
             } else if is_image(&canonical) {
-                out.push(canonical);
+                if out.len() < MAX_FILES {
+                    out.push(canonical);
+                }
             }
         }
     }
@@ -124,7 +131,8 @@ impl PhotoPlugin for LocalPlugin {
         "Local filesystem"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self.cfg = config.clone();
         if let Some(arr) = self.cfg.values.get("paths").and_then(|v| v.as_array()) {
             let mut paths = Vec::new();
             for s in arr.iter().filter_map(|v| v.as_str()) {
@@ -210,7 +218,7 @@ impl PhotoPlugin for LocalPlugin {
         Ok(page)
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
         let path = PathBuf::from(&meta.id);
 
         // Re-canonicalize and re-validate at read time (symlinks could have been swapped).

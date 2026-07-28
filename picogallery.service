@@ -11,14 +11,24 @@ Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=RUST_LOG=info
 RuntimeDirectory=picogallery
 Environment=XDG_RUNTIME_DIR=/run/picogallery
-ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/picogallery
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+UMask=0077
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+TasksMax=128
+MemoryMax=384M
+ReadWritePaths=/etc/wpa_supplicant /etc/NetworkManager/system-connections /media
 
-# Allow /dev/dri access without root.
+# Allow DRM/input access without root. Wi-Fi and USB mounting require host
+# policy (NetworkManager/udisks) and are deliberately not granted privileges.
 SupplementaryGroups=video render input
 
 [Install]

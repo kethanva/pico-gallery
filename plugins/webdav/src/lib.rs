@@ -29,7 +29,7 @@ use log::{debug, info, warn};
 use reqwest::{Client, ClientBuilder, Method};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::fs;
 
@@ -46,6 +46,21 @@ const MAX_IMAGES: usize = 100_000;
 /// Network timeouts — a dead server must not hang a request indefinitely.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {label}"))?
+    {
+        if body.len().saturating_add(chunk.len()) as u64 > max {
+            return Err(anyhow::anyhow!("{label}: response exceeds {max} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 const PROPFIND_BODY: &str = concat!(
     r#"<?xml version="1.0" encoding="utf-8"?>"#,
@@ -125,7 +140,11 @@ fn parse_propfind(xml: &str) -> Vec<DavEntry> {
                 if !in_response {
                     continue;
                 }
-                let text = match e.unescape() {
+                let decoded = match e.decode() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let text = match quick_xml::escape::unescape(&decoded) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
@@ -327,19 +346,27 @@ fn is_image_magic(bytes: &[u8]) -> bool {
 
 pub struct WebDavPlugin {
     cfg: PluginConfig,
-    client: Client,
+    client: Option<Client>,
     /// Guards the background sync loop so it is spawned at most once, no
     /// matter how many times `list_photos(offset == 0)` is called.
     sync_started: Arc<AtomicBool>,
+    sync_abort: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl WebDavPlugin {
     pub fn new(cfg: PluginConfig) -> Self {
         Self {
             cfg,
-            client: Client::new(),
+            client: None,
             sync_started: Arc::new(AtomicBool::new(false)),
+            sync_abort: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    fn client(&self) -> Result<&Client> {
+        self.client
+            .as_ref()
+            .context("webdav: plugin has not been initialized")
     }
 
     // ── Config helpers ─────────────────────────────────────────────────────
@@ -348,6 +375,33 @@ impl WebDavPlugin {
         self.cfg
             .require_str("url")
             .map(|s| s.trim_end_matches('/').to_string())
+    }
+
+    fn validate_tls_policy(&self, skip_tls: bool) -> Result<()> {
+        if !skip_tls {
+            return Ok(());
+        }
+        let base = reqwest::Url::parse(&self.base_url()?).context("parsing WebDAV url")?;
+        let host = base
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("WebDAV url has no host"))?;
+        let allowed = self
+            .cfg
+            .values
+            .get("allowed_hosts")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str());
+        if !allowed
+            .into_iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(host))
+        {
+            return Err(anyhow::anyhow!(
+                "WebDAV skip_tls_verify=true requires the URL host `{host}` in allowed_hosts"
+            ));
+        }
+        Ok(())
     }
 
     fn remote_path(&self) -> String {
@@ -390,7 +444,7 @@ impl WebDavPlugin {
         let method = Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid HTTP method");
 
         let response = self
-            .client
+            .client()?
             .request(method, url)
             .basic_auth(self.username()?, Some(self.password()?))
             .header("Depth", "1")
@@ -411,13 +465,7 @@ impl WebDavPlugin {
             }
         }
 
-        let bytes = response.bytes().await.context("reading PROPFIND body")?;
-        if bytes.len() as u64 > MAX_PROPFIND_BYTES {
-            return Err(anyhow::anyhow!(
-                "PROPFIND {url}: response too large ({} bytes, max {MAX_PROPFIND_BYTES})",
-                bytes.len()
-            ));
-        }
+        let bytes = read_bounded(response, MAX_PROPFIND_BYTES, "PROPFIND body").await?;
 
         let text = String::from_utf8_lossy(&bytes);
         debug!("PROPFIND {url}: {} bytes", text.len());
@@ -574,7 +622,7 @@ impl WebDavPlugin {
 
     async fn download_file(&self, url: &str, dest: &Path) -> Result<()> {
         let response = self
-            .client
+            .client()?
             .get(url)
             .basic_auth(self.username()?, Some(self.password()?))
             .send()
@@ -593,14 +641,7 @@ impl WebDavPlugin {
             }
         }
 
-        let bytes = response.bytes().await.context("reading image body")?;
-
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return Err(anyhow::anyhow!(
-                "image too large ({} MB): {url}",
-                bytes.len() / 1_048_576
-            ));
-        }
+        let bytes = read_bounded(response, MAX_IMAGE_BYTES, "WebDAV image body").await?;
 
         if !is_image_magic(&bytes) {
             return Err(anyhow::anyhow!("response is not a recognised image: {url}"));
@@ -651,9 +692,13 @@ impl WebDavPlugin {
 
     // ── Background sync loop ────────────────────────────────────────────────
 
-    fn spawn_sync_loop(client: Client, cfg: PluginConfig, interval: u64) {
+    fn spawn_sync_loop(
+        client: Client,
+        cfg: PluginConfig,
+        interval: u64,
+    ) -> tokio::task::AbortHandle {
         #[allow(unused_variables)]
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Wait one interval before the first background sync so the initial
             // foreground sync has time to finish before we pile on.
             if interval > 0 {
@@ -665,9 +710,10 @@ impl WebDavPlugin {
             loop {
                 let plugin = WebDavPlugin {
                     cfg: cfg.clone(),
-                    client: client.clone(),
+                    client: Some(client.clone()),
                     // Already running inside the loop — never spawn another.
                     sync_started: Arc::new(AtomicBool::new(true)),
+                    sync_abort: Arc::new(StdMutex::new(None)),
                 };
                 info!("WebDAV: background sync started");
                 match plugin.sync_images().await {
@@ -678,6 +724,7 @@ impl WebDavPlugin {
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
             }
         });
+        task.abort_handle()
     }
 }
 
@@ -695,7 +742,11 @@ impl PhotoPlugin for WebDavPlugin {
         "0.1.0"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self.cfg = config.clone();
+        if self.cfg.get_str("url").is_none() {
+            return Ok(());
+        }
         // Build the HTTP client — supports custom TLS for self-signed certs.
         let skip_tls = self
             .cfg
@@ -703,15 +754,17 @@ impl PhotoPlugin for WebDavPlugin {
             .get("skip_tls_verify")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.validate_tls_policy(skip_tls)?;
 
-        self.client = ClientBuilder::new()
+        let builder = ClientBuilder::new()
             .danger_accept_invalid_certs(skip_tls)
             // Without timeouts a dead/unreachable server hangs requests
             // forever and the slideshow freezes on the current frame.
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("building WebDAV HTTP client")?;
+            .timeout(REQUEST_TIMEOUT);
+        #[cfg(target_os = "macos")]
+        let builder = builder.no_proxy();
+        self.client = Some(builder.build().context("building WebDAV HTTP client")?);
 
         fs::create_dir_all(self.sync_dir())
             .await
@@ -750,11 +803,12 @@ impl PhotoPlugin for WebDavPlugin {
         if offset == 0 && !self.sync_started.swap(true, Ordering::Relaxed) {
             // Kick off the background periodic sync exactly once — spawning
             // on every offset-0 request would pile up concurrent sync loops.
-            Self::spawn_sync_loop(
-                self.client.clone(),
+            let abort = Self::spawn_sync_loop(
+                self.client()?.clone(),
                 self.cfg.clone(),
                 self.sync_interval_secs(),
             );
+            *self.sync_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(abort);
         }
 
         if paths.is_empty() {
@@ -820,7 +874,20 @@ impl PhotoPlugin for WebDavPlugin {
         Ok(photos)
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+    async fn shutdown(&mut self) -> Result<()> {
+        if let Some(abort) = self
+            .sync_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
+        }
+        self.sync_started.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
         let path_str = meta
             .download_url
             .as_deref()

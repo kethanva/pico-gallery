@@ -38,7 +38,8 @@ pub struct PhotoMeta {
     /// Whether the source marks this photo as a favourite.
     #[serde(default)]
     pub is_favorite: bool,
-    /// Plugin-private transport bag (hashes, tokens, paths). Not for display.
+    /// Plugin-private metadata bag (stable hashes and non-secret identifiers).
+    /// Session credentials and bearer tokens must stay in plugin session state.
     #[serde(default)]
     pub extra: HashMap<String, String>,
 }
@@ -76,14 +77,14 @@ impl PluginConfig {
         let Some(path) = self.get_str(&file_key).map(str::to_string) else {
             return Ok(());
         };
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            anyhow::anyhow!("reading {file_key} ({path}): {e}")
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading {file_key} ({path}): {e}"))?;
         let value = raw.trim().to_string();
         if value.is_empty() {
             return Err(anyhow::anyhow!("{file_key} ({path}) is empty"));
         }
-        self.values.insert(key.into(), serde_json::Value::String(value));
+        self.values
+            .insert(key.into(), serde_json::Value::String(value));
         // Keep `{key}_file` so a later Save can re-serialize the path and
         // omit the inline secret (see Config::redact_file_backed_secrets).
         Ok(())
@@ -99,8 +100,7 @@ impl PluginConfig {
         );
         match std::env::var(&env_key) {
             Ok(v) if !v.is_empty() => {
-                self.values
-                    .insert(key.into(), serde_json::Value::String(v));
+                self.values.insert(key.into(), serde_json::Value::String(v));
                 Ok(())
             }
             Ok(_) => Err(anyhow::anyhow!("{env_key} is set but empty")),
@@ -312,7 +312,7 @@ pub trait PhotoPlugin: Send + Sync {
     /// should request the smallest version from their CDN that is ≥ those
     /// dimensions (saves bandwidth on Pi Zero's slow connection).
     async fn get_photo_bytes(
-        &self,
+        &mut self,
         meta: &PhotoMeta,
         display_width: u32,
         display_height: u32,
@@ -472,7 +472,12 @@ mod tests {
             }])
         }
 
-        async fn get_photo_bytes(&self, _meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+        async fn get_photo_bytes(
+            &mut self,
+            _meta: &PhotoMeta,
+            _dw: u32,
+            _dh: u32,
+        ) -> Result<Vec<u8>> {
             Ok(vec![0xFF, 0xD8, 0xFF])
         }
     }

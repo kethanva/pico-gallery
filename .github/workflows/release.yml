@@ -44,7 +44,7 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
@@ -54,6 +54,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    name: Test, lint, and audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libsdl2-dev libudev-dev pkg-config shellcheck
+
+      - name: Validate installer scripts
+        run: |
+          bash -n install.sh
+          bash -n deploy.sh
+          shellcheck install.sh deploy.sh
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: quality-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: quality-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   prepare:
     name: Resolve version
     runs-on: ubuntu-24.04
@@ -123,7 +170,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: prepare
+    needs: [prepare, quality]
     if: >-
       github.ref_type != 'tag' ||
       !contains(github.ref_name, '-kva.')
@@ -207,6 +254,13 @@ jobs:
           tar czf "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}"
           sha256sum "${ARTIFACT_NAME}.tar.gz" > "${ARTIFACT_NAME}.tar.gz.sha256"
 
+          tar tzf "${ARTIFACT_NAME}.tar.gz" | grep -qx "${ARTIFACT_NAME}/picogallery"
+          tar tzf "${ARTIFACT_NAME}.tar.gz" | awk '
+            /^\// || /(^|\/)\.\.($|\/)/ { exit 1 }
+            { next }
+          '
+          tar tvzf "${ARTIFACT_NAME}.tar.gz" | awk '$1 ~ /^[lh]/ { exit 1 }'
+
           echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> "$GITHUB_ENV"
           echo "ARTIFACT_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> "$GITHUB_ENV"
 
@@ -234,6 +288,8 @@ jobs:
         !contains(github.ref_name, '-kva.')
       )
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -272,10 +328,12 @@ jobs:
             PICOGALLERY_VERSION=${{ needs.prepare.outputs.release_tag }} \
               curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/kva-revamparchitecture/install.sh | sudo bash -s -- \
               --mode download -y --version ${{ needs.prepare.outputs.release_tag }} \
-              --photoprism-url http://YOUR_PHOTOPRISM:2342 \
-              --photoprism-user admin \
-              --photoprism-pass YOUR_PASSWORD
+              --photoprism-url http://YOUR_PHOTOPRISM:2342
             ```
+
+            Configure credentials afterwards in the owner-only config file or
+            through `password_file` / environment-based secret overrides; do
+            not put passwords on the shell command line.
 
             Or use `deploy.sh` from the repo (also download-only):
 

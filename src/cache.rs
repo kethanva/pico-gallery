@@ -60,19 +60,23 @@ impl ImageCache {
             .await
             .with_context(|| format!("creating cache dir {}", dir.display()))?;
 
-        // Restrict cache directory to owner-only: cached images are private photo data.
+        // Restrict cache directory to owner-only if it looks like our default dir.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-                warn!(
-                    "Could not restrict cache dir {} to 0700: {} — cached photos may be world-readable",
-                    dir.display(), e
-                );
+            if dir.ends_with("picogallery") {
+                if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                    warn!(
+                        "Could not restrict cache dir {} to 0700: {} — cached photos may be world-readable",
+                        dir.display(), e
+                    );
+                }
             }
         }
 
-        let max_bytes = max_mb * 1024 * 1024;
+        let max_bytes = max_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("cache size overflows bytes"))?;
         let mut cache = Self {
             dir: dir.to_path_buf(),
             max_bytes,
@@ -86,6 +90,10 @@ impl ImageCache {
         };
 
         cache.load_index().await;
+        while cache.used_bytes > cache.max_bytes && cache.head.is_some() {
+            cache.evict_oldest().await;
+        }
+        cache.save_index().await;
         info!(
             "Cache opened: {} MB used / {} MB limit",
             cache.used_bytes / 1_048_576,
@@ -295,10 +303,12 @@ impl ImageCache {
             ordered.push(&self.nodes[idx].entry);
             cur = self.nodes[idx].next;
         }
-        let index_path = self.dir.join(INDEX_FILE);
         match serde_json::to_vec(&ordered) {
             Ok(data) => {
-                let _ = fs::write(&index_path, data).await;
+                let index_path = self.dir.join(INDEX_FILE);
+                if let Err(e) = atomic_write(&index_path, &data).await {
+                    warn!("Failed to atomically save cache index: {e}");
+                }
             }
             Err(e) => warn!("Failed to save cache index: {}", e),
         }
@@ -306,15 +316,18 @@ impl ImageCache {
 
     async fn load_index(&mut self) {
         let index_path = self.dir.join(INDEX_FILE);
-        let data = match fs::read(&index_path).await {
-            Ok(d) => d,
-            Err(_) => return, // first run
-        };
-        let entries: Vec<CacheEntry> = match serde_json::from_slice(&data) {
-            Ok(e) => e,
+        let entries: Vec<CacheEntry> = match fs::read(&index_path).await {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("Cache index corrupt, rebuilding: {}", e);
+                    Vec::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                warn!("Cache index corrupt, rebuilding: {}", e);
-                return;
+                warn!("Could not read cache index: {e}");
+                Vec::new()
             }
         };
 
@@ -324,17 +337,45 @@ impl ImageCache {
         // comes from fresh metadata, never from the JSON. N stat syscalls —
         // run on a blocking thread so the current_thread executor isn't
         // stalled at startup.
+        let cache_root = match std::fs::canonicalize(&self.dir) {
+            Ok(path) => path,
+            Err(e) => {
+                warn!("Cache root cannot be canonicalized: {e}");
+                return;
+            }
+        };
         let result = tokio::task::spawn_blocking(move || {
             let mut used = 0u64;
             let valid: Vec<CacheEntry> = entries
                 .into_iter()
                 .filter_map(|mut e| {
-                    let len = std::fs::metadata(&e.path).map(|m| m.len()).ok()?;
+                    let canonical = std::fs::canonicalize(&e.path).ok()?;
+                    if !canonical.starts_with(&cache_root) {
+                        return None;
+                    }
+                    let len = std::fs::metadata(&canonical).map(|m| m.len()).ok()?;
+                    e.path = canonical;
                     e.size_bytes = len;
                     used += len;
                     Some(e)
                 })
                 .collect();
+            let known: std::collections::HashSet<PathBuf> =
+                valid.iter().map(|entry| entry.path.clone()).collect();
+            if let Ok(read_dir) = std::fs::read_dir(&cache_root) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if fname.ends_with(".jpg") && fname.len() >= 21 {
+                        let hex_part = &fname[fname.len() - 21 .. fname.len() - 4];
+                        if hex_part.starts_with('-') && hex_part[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+                            if !known.contains(&path) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
+                    }
+                }
+            }
             (valid, used)
         })
         .await;
@@ -353,6 +394,33 @@ impl ImageCache {
             Err(e) => warn!("Cache index validation task failed: {}", e),
         }
     }
+}
+
+async fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "index path has no parent")
+        })?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let tmp = parent.join(format!(".{}.{}.tmp", INDEX_FILE, nonce));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 /// Stable 64-bit FNV-1a hash. Hand-rolled (~6 lines) because std's
@@ -491,5 +559,16 @@ mod tests {
         assert_eq!(reopened.used_bytes, 512 * 1024);
         // Freed-slot reuse path still resolves correctly after a reload.
         assert_eq!(reopened.get("k/a").await, Some(vec![1u8; 256 * 1024]));
+    }
+
+    #[tokio::test]
+    async fn reopen_removes_orphaned_image_files() {
+        let tmp = TempDir::new("orphans");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let orphan = tmp.0.join("orphan-0123456789abcdef.jpg");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        let cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(cache.used_bytes, 0);
     }
 }

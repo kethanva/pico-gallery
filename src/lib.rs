@@ -21,7 +21,7 @@ pub mod menu;
 pub mod mode;
 pub mod night;
 pub mod osd;
-pub mod queue_source;
+
 pub mod remote;
 pub mod renderer;
 pub mod slideshow;

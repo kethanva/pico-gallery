@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 
 use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
@@ -18,6 +18,8 @@ pub struct UsbPlugin {
     _cfg: PluginConfig,
     photos: Arc<RwLock<Vec<PathBuf>>>,
     active_mounts: Arc<Mutex<HashMap<String, (PathBuf, bool)>>>, // partition -> (mount_path, mounted_by_us)
+    ready: Arc<Notify>,
+    poller: Option<tokio::task::AbortHandle>,
 }
 
 impl UsbPlugin {
@@ -26,6 +28,8 @@ impl UsbPlugin {
             _cfg: cfg,
             photos: Arc::new(RwLock::new(Vec::new())),
             active_mounts: Arc::new(Mutex::new(HashMap::new())),
+            ready: Arc::new(Notify::new()),
+            poller: None,
         }
     }
 }
@@ -40,7 +44,13 @@ fn is_image(p: &Path) -> bool {
     )
 }
 
+const MAX_DIRS: usize = 10_000;
+const MAX_FILES: usize = 100_000;
+
 async fn scan_dir(dir: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    if visited.len() >= MAX_DIRS || out.len() >= MAX_FILES {
+        return;
+    }
     if !visited.insert(dir.to_path_buf()) {
         return;
     }
@@ -61,7 +71,9 @@ async fn scan_dir(dir: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<Path
         if is_dir {
             Box::pin(scan_dir(&canonical, visited, out)).await;
         } else if is_image(&canonical) {
-            out.push(canonical);
+            if out.len() < MAX_FILES {
+                out.push(canonical);
+            }
         }
     }
 }
@@ -156,7 +168,9 @@ async fn unmount_partition(partition: &str) {
 async fn run_usb_poller(
     photos: Arc<RwLock<Vec<PathBuf>>>,
     active_mounts: Arc<Mutex<HashMap<String, (PathBuf, bool)>>>,
+    ready: Arc<Notify>,
 ) {
+    let mut first_scan = true;
     loop {
         let current_partitions = get_partitions().await;
         let mut mounts = active_mounts.lock().await;
@@ -222,6 +236,12 @@ async fn run_usb_poller(
         }
 
         drop(mounts);
+        if first_scan {
+            first_scan = false;
+            // `notify_one` stores a permit if list_photos has not started
+            // waiting yet, closing the init/list startup race.
+            ready.notify_one();
+        }
         sleep(Duration::from_secs(5)).await;
     }
 }
@@ -236,12 +256,18 @@ impl PhotoPlugin for UsbPlugin {
         "USB Auto-Mount"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self._cfg = config.clone();
+        if self.poller.is_some() {
+            return Ok(());
+        }
         let photos = self.photos.clone();
         let active_mounts = self.active_mounts.clone();
-        tokio::spawn(async move {
-            run_usb_poller(photos, active_mounts).await;
+        let ready = self.ready.clone();
+        let task = tokio::spawn(async move {
+            run_usb_poller(photos, active_mounts, ready).await;
         });
+        self.poller = Some(task.abort_handle());
         Ok(())
     }
 
@@ -254,6 +280,9 @@ impl PhotoPlugin for UsbPlugin {
     }
 
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
+        if self.photos.read().await.is_empty() {
+            let _ = tokio::time::timeout(Duration::from_secs(10), self.ready.notified()).await;
+        }
         let photos = self.photos.read().await;
         let page: Vec<PhotoMeta> = photos
             .iter()
@@ -291,8 +320,15 @@ impl PhotoPlugin for UsbPlugin {
         Ok(page)
     }
 
+    async fn shutdown(&mut self) -> Result<()> {
+        if let Some(handle) = self.poller.take() {
+            handle.abort();
+        }
+        Ok(())
+    }
+
     async fn get_photo_bytes(
-        &self,
+        &mut self,
         meta: &PhotoMeta,
         _display_width: u32,
         _display_height: u32,

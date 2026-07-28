@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,6 +30,21 @@ const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 /// single-threaded executor indefinitely.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {label}"))?
+    {
+        if body.len().saturating_add(chunk.len()) as u64 > max {
+            return Err(anyhow::anyhow!("{label}: response exceeds {max} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredToken {
@@ -109,7 +125,7 @@ struct PageCache {
 
 pub struct AmazonPhotosPlugin {
     cfg: PluginConfig,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
     token: Option<StoredToken>,
     token_dir: PathBuf,
     pending: Option<PendingAuth>,
@@ -118,19 +134,31 @@ pub struct AmazonPhotosPlugin {
 
 impl AmazonPhotosPlugin {
     pub fn new(cfg: PluginConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-            .build()
-            .expect("building Amazon Photos HTTP client");
         Self {
             cfg,
-            client,
+            client: None,
             token: None,
             token_dir: dirs::config_dir().unwrap_or_default().join("picogallery"),
             pending: None,
             page_cache: tokio::sync::Mutex::new(PageCache::default()),
         }
+    }
+
+    fn build_client() -> Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
+        #[cfg(target_os = "macos")]
+        let builder = builder.no_proxy();
+        builder
+            .build()
+            .context("building Amazon Photos HTTP client")
+    }
+
+    fn client(&self) -> Result<&reqwest::Client> {
+        self.client
+            .as_ref()
+            .context("amazon-photos: plugin has not been initialized")
     }
 
     fn client_id(&self) -> Result<&str> {
@@ -183,7 +211,7 @@ impl AmazonPhotosPlugin {
             .context("no refresh token")?;
 
         let resp = self
-            .client
+            .client()?
             .post(LWA_TOKEN_URL)
             .form(&[
                 ("grant_type", "refresh_token"),
@@ -204,7 +232,9 @@ impl AmazonPhotosPlugin {
         let at = res.access_token.ok_or_else(|| {
             anyhow::anyhow!(
                 "amazon-photos: token refresh failed (HTTP {status}): {}",
-                res.error.as_deref().unwrap_or("no access_token in response")
+                res.error
+                    .as_deref()
+                    .unwrap_or("no access_token in response")
             )
         })?;
 
@@ -241,12 +271,14 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         "0.1.0"
     }
 
-    async fn init(&mut self, _config: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        self.cfg = config.clone();
         // Drop any accumulated page walk so a re-init (targeting or credential
         // reload on a live instance) serves a fresh library rather than the
         // previous filter's cached photos. `get_mut` avoids a lock — `init`
         // holds `&mut self`.
         *self.page_cache.get_mut() = PageCache::default();
+        self.client = Some(Self::build_client()?);
         self.load_token().await;
         Ok(())
     }
@@ -279,7 +311,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         // the user is currently typing in).
         if let Some(pending) = self.pending.take() {
             let res = self
-                .client
+                .client()?
                 .post(LWA_TOKEN_URL)
                 .form(&[
                     ("grant_type", "device_code"),
@@ -342,7 +374,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
 
         // LWA device code request.
         let res = self
-            .client
+            .client()?
             .post(LWA_AUTH_URL)
             .form(&[
                 ("response_type", "device_code"),
@@ -400,7 +432,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
             }
 
             let res = self
-                .client
+                .client()?
                 .get(&url)
                 .bearer_auth(self.access_token()?)
                 .send()
@@ -456,7 +488,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         }
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
         let base = meta
             .download_url
             .as_deref()
@@ -467,13 +499,24 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         let sep = if base.contains('?') { '&' } else { '?' };
         let url = format!("{base}{sep}viewBox={view}");
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(self.access_token()?)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut refreshed = false;
+        let resp = loop {
+            let resp = self
+                .client()?
+                .get(&url)
+                .bearer_auth(self.access_token()?)
+                .send()
+                .await
+                .context("amazon-photos: image request failed")?;
+            if resp.status() != StatusCode::UNAUTHORIZED || refreshed {
+                break resp.error_for_status()?;
+            }
+
+            // A token can be revoked or expire between the periodic refresh
+            // and this request. Renew once and replay the idempotent GET.
+            self.refresh_token_now().await?;
+            refreshed = true;
+        };
 
         // Size guard before buffering the body — protects Pi Zero RAM.
         if let Some(len) = resp.content_length() {
@@ -486,14 +529,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
             }
         }
 
-        let bytes = resp.bytes().await?.to_vec();
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return Err(anyhow::anyhow!(
-                "image too large ({} MB): {}",
-                bytes.len() / 1_048_576,
-                meta.filename
-            ));
-        }
+        let bytes = read_bounded(resp, MAX_IMAGE_BYTES, "Amazon Photos image body").await?;
         if bytes.len() < 3 || bytes[0] != 0xFF || bytes[1] != 0xD8 || bytes[2] != 0xFF {
             return Err(anyhow::anyhow!("not a JPEG (bad magic): {}", meta.filename));
         }

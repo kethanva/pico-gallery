@@ -90,7 +90,8 @@ resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | 
 #   max_image_mb   = 20   # most phone JPEGs under 20 MB; rejects huge RAW exports
 #   max_megapixels = 16   # 16 MP → ~72 MB peak; safe headroom on Pi Zero
 #
-# Leave both at 0 (default) to use the built-in 50 MB file cap with no MP limit.
+# Leave both at 0 (default) to use the built-in 50 MB file cap and 24 MP
+# decoded-image backstop. The production validator permits at most 32 MP.
 #
 # max_image_mb   = 20
 # max_megapixels = 16
@@ -117,13 +118,14 @@ prefetch_count = 3     # photos pre-fetched while current photo is on screen
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP remote control (optional)
-# Phone-friendly prev/pause/next/favourite on a trusted LAN.
-# No authentication: do not expose to the internet.
+# Phone-friendly prev/pause/next/favourite. Set token_file to a root-owned
+# random token; open http://<pi-ip>:8188/#<token> from the controlling phone.
 # ─────────────────────────────────────────────────────────────────────────────
 [remote]
 enabled = false
 port    = 8188
-bind    = "0.0.0.0"   # use "127.0.0.1" for local-only
+bind    = "127.0.0.1" # set an explicit LAN IP only on a trusted network
+# token_file = "/etc/picogallery/remote.token"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HDMI CEC remote (optional, Linux only)
@@ -241,6 +243,7 @@ sync_interval_secs = 3600
 
 # Set to true to accept self-signed TLS certificates (e.g. a local NAS).
 # skip_tls_verify = false
+# allowed_hosts = ["cloud.example.com"] # required when skip_tls_verify = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [PLUGIN] photoprism  ★ another Raspberry Pi running PhotoPrism as a server

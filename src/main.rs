@@ -1,11 +1,27 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use std::path::PathBuf;
 
 use picogallery::config::Config;
 use picogallery::plugin::BoxedPlugin;
 use picogallery::slideshow::Slideshow;
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -234,16 +250,30 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Initialise each enabled plugin.
-    for plugin in &mut plugins {
+    // Initialise providers independently. A misconfigured optional source must
+    // not stop healthy sources from starting the appliance.
+    let mut initialized = Vec::with_capacity(plugins.len());
+    for mut plugin in plugins.drain(..) {
         let pcfg = config
             .plugin_config(plugin.name())
             .cloned()
             .unwrap_or_default();
-        plugin
-            .init(&pcfg)
-            .await
-            .with_context(|| format!("initialising plugin '{}'", plugin.name()))?;
+        match plugin.init(&pcfg).await {
+            Ok(()) => initialized.push(plugin),
+            Err(e) => {
+                warn!(
+                    "Provider '{}' disabled during initialization: {e:#}",
+                    plugin.name()
+                );
+                let _ = plugin.shutdown().await;
+            }
+        }
+    }
+    plugins = initialized;
+    if plugins.is_empty() {
+        anyhow::bail!(
+            "No enabled provider initialized successfully; check journalctl -u picogallery"
+        );
     }
 
     // ── HTTP remote (optional) ────────────────────────────────────────────────
@@ -259,7 +289,13 @@ async fn main() -> Result<()> {
 
     // ── HDMI CEC remote (optional, Linux) ────────────────────────────────────
     let cec_rx = if config.cec.enabled {
-        Some(picogallery::cec_remote::start(&config.cec).await?)
+        match picogallery::cec_remote::start(&config.cec).await {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                warn!("CEC unavailable; continuing without TV remote input: {e:#}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -274,7 +310,14 @@ async fn main() -> Result<()> {
         Box::new(|c: &Config| build_plugins(c, true)),
     )
     .await?;
-    slideshow.run(remote_rx, cec_rx, remote_status).await
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx.send(()).await;
+    });
+    slideshow
+        .run(remote_rx, cec_rx, remote_status, shutdown_rx)
+        .await
 }
 
 // ── Config generation ─────────────────────────────────────────────────────────
@@ -389,15 +432,15 @@ prefetch_count = 3    # how many photos to pre-fetch ahead (keep low on Pi Zero)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP remote control (optional)
-# Phone-friendly next/prev/pause/favourite page + JSON status API. No
-# authentication — only enable on a trusted LAN. Visit http://<pi-ip>:8188/
-# once enabled. The ♥ button favourites the current photo (sources that
+# Phone-friendly next/prev/pause/favourite page + JSON status API. A token is
+# required: visit http://<pi-ip>:8188/#<token> once enabled. The ♥ button favourites the current photo (sources that
 # support it, e.g. photoprism).
 # ─────────────────────────────────────────────────────────────────────────────
 [remote]
 enabled = false
 port    = 8188
-bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
+bind    = "127.0.0.1" # set an explicit LAN IP only on a trusted network
+# token_file = "/etc/picogallery/remote.token"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HDMI CEC remote (optional, Linux only)

@@ -733,10 +733,12 @@ impl ImageProcessor {
 
 impl Renderer {
     // ── Display methods ──────────────────────────────────────────────────────
+    pub fn texture_creator(&self) -> sdl2::render::TextureCreator<sdl2::video::WindowContext> {
+        self.canvas.texture_creator()
+    }
 
-    pub fn show_cut(&mut self, rgba: &RgbaImage) -> Result<()> {
-        let tc = self.canvas.texture_creator();
-        let tex = rgba_to_texture(&tc, rgba)?;
+    pub fn show_cut(&mut self, rgba: &RgbaImage, tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>) -> Result<()> {
+        let tex = rgba_to_texture(tc, rgba)?;
         self.canvas.clear();
         blit_centered(
             &mut self.canvas,
@@ -760,11 +762,11 @@ impl Renderer {
         next_rgba: &RgbaImage,
         duration: Duration,
     ) -> Result<()> {
+        let tc = self.texture_creator();
         if duration.is_zero() {
-            return self.show_cut(next_rgba);
+            return self.show_cut(next_rgba, &tc);
         }
 
-        let tc = self.canvas.texture_creator();
         // Pre-bake current frame texture (outside the loop — avoids re-allocating every frame).
         let cur_tex = match current_rgba {
             Some(cur) => Some(rgba_to_texture(&tc, cur)?),
@@ -845,11 +847,11 @@ impl Renderer {
         duration: Duration,
         leftward: bool,
     ) -> Result<()> {
+        let tc = self.texture_creator();
         if duration.is_zero() {
-            return self.show_cut(next_rgba);
+            return self.show_cut(next_rgba, &tc);
         }
 
-        let tc = self.canvas.texture_creator();
         let w = self.width as i32;
 
         // Pre-bake textures once before the animation loop.

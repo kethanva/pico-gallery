@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::fs;
 use tokio::process::Command;
 
@@ -37,6 +37,7 @@ pub struct GooglePhotosPlugin {
     cfg: PluginConfig,
     conf_path: PathBuf, // our generated rclone.conf (isolated from user's rclone)
     sync_running: Arc<AtomicBool>, // guards against overlapping rclone sync runs
+    sync_abort: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
 }
 
 /// Clears the sync-running flag on drop, so every exit path of a sync run
@@ -59,6 +60,7 @@ impl GooglePhotosPlugin {
             cfg,
             conf_path,
             sync_running: Arc::new(AtomicBool::new(false)),
+            sync_abort: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -247,7 +249,7 @@ impl GooglePhotosPlugin {
         let max_mb = self.max_transfer_mb();
         let root_args = self.drive_root_args();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _guard = guard; // clears the flag on every exit path of this task
             info!("rclone background sync: {} → {}", src, dst.display());
             let mut args = vec![
@@ -279,6 +281,7 @@ impl GooglePhotosPlugin {
                 Err(e) => warn!("rclone spawn error: {}", e),
             }
         });
+        *self.sync_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.abort_handle());
     }
 
     // ── Local file listing ────────────────────────────────────────────────────
@@ -327,7 +330,8 @@ impl PhotoPlugin for GooglePhotosPlugin {
         "0.4.0"
     }
 
-    async fn init(&mut self, _cfg: &PluginConfig) -> Result<()> {
+    async fn init(&mut self, cfg: &PluginConfig) -> Result<()> {
+        self.cfg = cfg.clone();
         fs::create_dir_all(self.sync_dir())
             .await
             .with_context(|| format!("creating sync_dir {}", self.sync_dir().display()))?;
@@ -448,7 +452,20 @@ impl PhotoPlugin for GooglePhotosPlugin {
         Ok(photos)
     }
 
-    async fn get_photo_bytes(&self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+    async fn shutdown(&mut self) -> Result<()> {
+        if let Some(abort) = self
+            .sync_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
+        }
+        self.sync_running.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
         let path_str = meta
             .download_url
             .as_deref()

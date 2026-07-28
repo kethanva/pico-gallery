@@ -4,6 +4,7 @@ use log::warn;
 use picogallery_core::{PluginConfig, TargetingAdapter, TargetingState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 // ── Display ──────────────────────────────────────────────────────────────────
@@ -389,7 +390,7 @@ impl CacheConfig {
 /// Built-in HTTP remote control: a phone-friendly page with next / prev /
 /// pause buttons plus a tiny JSON status API. Near-zero cost while idle.
 ///
-/// NOTE: there is no authentication — only enable on a trusted LAN.
+/// A bearer token is required when enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
     /// Enable the HTTP remote (default: false).
@@ -400,10 +401,19 @@ pub struct RemoteConfig {
     #[serde(default = "default_remote_port")]
     pub port: u16,
 
-    /// Bind address. Default "0.0.0.0" (all interfaces); use "127.0.0.1"
-    /// to restrict to local-only access.
+    /// Bind address. Defaults to loopback; a token is required on every API call.
     #[serde(default = "default_remote_bind")]
     pub bind: String,
+
+    /// Path to a file containing the remote-control bearer token. Prefer this
+    /// over environment variables so systemd can use LoadCredential.
+    #[serde(default)]
+    pub token_file: Option<String>,
+
+    /// Resolved from `token_file` or `PICOGALLERY_REMOTE_TOKEN`; never
+    /// serialized back to config.toml.
+    #[serde(skip)]
+    pub token: Option<String>,
 }
 
 impl Default for RemoteConfig {
@@ -412,6 +422,8 @@ impl Default for RemoteConfig {
             enabled: false,
             port: default_remote_port(),
             bind: default_remote_bind(),
+            token_file: None,
+            token: None,
         }
     }
 }
@@ -420,7 +432,7 @@ fn default_remote_port() -> u16 {
     8188
 }
 fn default_remote_bind() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 // ── HDMI CEC remote ──────────────────────────────────────────────────────────
@@ -465,9 +477,10 @@ fn default_cec_poll_ms() -> u64 {
 
 /// Optional Wi-Fi credentials the app can apply to the host OS.
 ///
-/// Only effective on Linux/Raspberry Pi: applying it (re)writes the system
-/// Wi-Fi configuration and reconnects, which needs root (the Pi appliance
-/// service runs as root). On other platforms applying is a logged no-op error.
+/// Only effective on Linux/Raspberry Pi when the service account is authorized
+/// by NetworkManager/udisks or a local privileged helper. Standard appliance
+/// installs run unprivileged, so host Wi-Fi should normally be provisioned by
+/// the OS rather than this optional UI feature.
 /// `password` is the WPA2 pre-shared key — WPA-Enterprise (username/identity)
 /// is not supported. Credentials live here so the on-screen settings menu can
 /// edit them; treat the config file as sensitive (it may hold the passphrase).
@@ -592,6 +605,9 @@ impl Config {
         config
             .apply_secret_overrides()
             .with_context(|| format!("resolving secrets for {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("validating config {}", path.display()))?;
         Self::restrict_private_permissions(path);
         Ok(config)
     }
@@ -601,6 +617,7 @@ impl Config {
     /// Plugin keys: `password`, `app_password`, `client_secret` via
     /// `{key}_file` and `PICOGALLERY_{PLUGIN}_{KEY}`.
     /// Wi-Fi: `password_file` and `PICOGALLERY_WIFI_PASSWORD`.
+    /// Remote: `token_file` and `PICOGALLERY_REMOTE_TOKEN`.
     pub fn apply_secret_overrides(&mut self) -> Result<()> {
         const PLUGIN_SECRETS: &[&str] = &["password", "app_password", "client_secret"];
 
@@ -624,11 +641,112 @@ impl Config {
             Err(e) => return Err(anyhow::anyhow!("reading PICOGALLERY_WIFI_PASSWORD: {e}")),
         }
 
+        if let Some(path) = self.remote.token_file.clone() {
+            let value = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading remote.token_file ({path})"))?
+                .trim()
+                .to_string();
+            if value.is_empty() {
+                return Err(anyhow::anyhow!("remote.token_file ({path}) is empty"));
+            }
+            self.remote.token = Some(value);
+        }
+        match std::env::var("PICOGALLERY_REMOTE_TOKEN") {
+            Ok(v) if !v.is_empty() => self.remote.token = Some(v),
+            Ok(_) => return Err(anyhow::anyhow!("PICOGALLERY_REMOTE_TOKEN is set but empty")),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(e) => return Err(anyhow::anyhow!("reading PICOGALLERY_REMOTE_TOKEN: {e}")),
+        }
+
         for entry in &mut self.plugins {
             for key in PLUGIN_SECRETS {
                 entry.config.resolve_secret_file(key)?;
                 entry.config.apply_env_secret(&entry.name, key)?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=3600).contains(&self.display.slide_duration_secs) {
+            return Err(anyhow::anyhow!(
+                "display.slide_duration_secs must be between 1 and 3600"
+            ));
+        }
+        if self.display.transition_ms > 10_000 {
+            return Err(anyhow::anyhow!(
+                "display.transition_ms must not exceed 10000"
+            ));
+        }
+        if !(1..=60).contains(&self.display.fps) {
+            return Err(anyhow::anyhow!("display.fps must be between 1 and 60"));
+        }
+        let dimensions_are_auto = self.display.width == 0 && self.display.height == 0;
+        let dimensions_are_valid = (320..=8192).contains(&self.display.width)
+            && (240..=8192).contains(&self.display.height);
+        if !dimensions_are_auto && !dimensions_are_valid {
+            return Err(anyhow::anyhow!(
+                "display width/height must both be auto (0) or within 320x240 to 8192x8192"
+            ));
+        }
+        if self.display.max_image_mb > 50 || self.display.max_megapixels > 32 {
+            return Err(anyhow::anyhow!(
+                "display image limits exceed the supported appliance resource budget"
+            ));
+        }
+        if self.display.night_dim_percent > 90 || self.display.night_warmth > 100 {
+            return Err(anyhow::anyhow!(
+                "display night percentages are out of range"
+            ));
+        }
+        if self.cache.max_mb == 0 || self.cache.max_mb > 4096 {
+            return Err(anyhow::anyhow!("cache.max_mb must be between 1 and 4096"));
+        }
+        if self.cache.prefetch_count == 0 || self.cache.prefetch_count > 8 {
+            return Err(anyhow::anyhow!(
+                "cache.prefetch_count must be between 1 and 8"
+            ));
+        }
+        if self.remote.bind.trim().is_empty() {
+            return Err(anyhow::anyhow!("remote.bind must not be empty"));
+        }
+        self.remote
+            .bind
+            .parse::<IpAddr>()
+            .with_context(|| "remote.bind must be a literal IPv4 or IPv6 address")?;
+        if self.remote.enabled && self.remote.port == 0 {
+            return Err(anyhow::anyhow!("remote.port must not be zero"));
+        }
+        if self.remote.enabled && self.remote.token.as_deref().is_none_or(str::is_empty) {
+            return Err(anyhow::anyhow!(
+                "remote.enabled requires remote.token_file or PICOGALLERY_REMOTE_TOKEN"
+            ));
+        }
+        if self.remote.enabled
+            && self
+                .remote
+                .token
+                .as_deref()
+                .is_some_and(|token| token.len() < 16)
+        {
+            return Err(anyhow::anyhow!(
+                "remote token must contain at least 16 characters"
+            ));
+        }
+        if self.remote.enabled
+            && self
+                .remote
+                .token
+                .as_deref()
+                .is_some_and(|token| token.chars().any(char::is_control))
+        {
+            return Err(anyhow::anyhow!(
+                "remote token must not contain control characters"
+            ));
+        }
+
+        if self.cec.enabled && !(50..=5000).contains(&self.cec.poll_ms) {
+            return Err(anyhow::anyhow!("cec.poll_ms must be between 50 and 5000"));
         }
         Ok(())
     }
@@ -664,15 +782,17 @@ impl Config {
         {
             use log::warn;
             use std::os::unix::fs::PermissionsExt;
-            if let Some(parent) = path.parent() {
-                if let Err(e) =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                {
-                    warn!(
-                        "Could not restrict config dir {} to 0700: {}",
-                        parent.display(),
-                        e
-                    );
+            if path == &Config::default_path() {
+                if let Some(parent) = path.parent() {
+                    if let Err(e) =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    {
+                        warn!(
+                            "Could not restrict config dir {} to 0700: {}",
+                            parent.display(),
+                            e
+                        );
+                    }
                 }
             }
             if path.exists() {
@@ -985,6 +1105,71 @@ mod tests {
         cfg.apply_secret_overrides().unwrap();
         std::env::remove_var("PICOGALLERY_WIFI_PASSWORD");
         assert_eq!(cfg.wifi.password, "from-env");
+    }
+
+    #[test]
+    fn rejects_unbounded_prefetch_configuration() {
+        let mut cfg = Config::default();
+        cfg.cache.prefetch_count = 10_000;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("prefetch_count"));
+    }
+
+    #[test]
+    fn remote_defaults_to_loopback() {
+        assert_eq!(RemoteConfig::default().bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn enabled_remote_requires_a_token() {
+        let mut cfg = Config::default();
+        cfg.remote.enabled = true;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("REMOTE_TOKEN"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_display_budget() {
+        let mut cfg = Config::default();
+        cfg.display.fps = 120;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("display.fps"));
+    }
+
+    #[test]
+    fn rejects_image_budget_that_exceeds_service_memory_limit() {
+        let mut cfg = Config::default();
+        cfg.display.max_megapixels = 33;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("resource budget"));
+    }
+
+    #[test]
+    fn rejects_non_ip_remote_bind_and_control_char_token() {
+        let mut cfg = Config::default();
+        cfg.remote.bind = "photos.local".into();
+        assert!(cfg.validate().is_err());
+
+        cfg.remote.bind = "127.0.0.1".into();
+        cfg.remote.enabled = true;
+        cfg.remote.token = Some("this-token-has-a-newline\n".into());
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("control characters"));
     }
 
     fn tempfile_dir() -> PathBuf {

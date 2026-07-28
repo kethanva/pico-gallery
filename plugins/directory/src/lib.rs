@@ -147,6 +147,12 @@ impl DirectoryPlugin {
         visited: &mut HashSet<PathBuf>,
         out: &mut Vec<ScannedPhoto>,
     ) {
+        const MAX_DIRS: usize = 10_000;
+        const MAX_FILES: usize = 100_000;
+        if visited.len() >= MAX_DIRS || out.len() >= MAX_FILES {
+            return;
+        }
+
         // Symlink cycles inside the root (e.g. Photos/loop -> Photos/) pass
         // the escape check below but would recurse forever — skip any
         // canonical dir we've already walked.
@@ -219,19 +225,21 @@ impl DirectoryPlugin {
                 ))
                 .await;
             } else if is_image(&canonical) {
-                let modified_secs = fs::metadata(&canonical)
-                    .await
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                if out.len() < MAX_FILES {
+                    let modified_secs = fs::metadata(&canonical)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
 
-                out.push(ScannedPhoto {
-                    path: canonical,
-                    album: album.map(str::to_string),
-                    modified_secs,
-                });
+                    out.push(ScannedPhoto {
+                        path: canonical,
+                        album: album.map(str::to_string),
+                        modified_secs,
+                    });
+                }
             }
         }
     }
@@ -466,7 +474,7 @@ impl PhotoPlugin for DirectoryPlugin {
     }
 
     async fn get_photo_bytes(
-        &self,
+        &mut self,
         meta: &PhotoMeta,
         _display_width: u32,
         _display_height: u32,
