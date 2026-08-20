@@ -32,8 +32,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{
+    exif_thumb_from_head, AuthStatus, FetchIntent, PhotoMeta, PhotoPlugin, PluginConfig,
+    EXIF_HEAD_SCAN_BYTES,
+};
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 /// Cap on a single PROPFIND response body — a buggy or hostile server must
@@ -48,7 +52,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -342,6 +347,65 @@ fn is_image_magic(bytes: &[u8]) -> bool {
     matches!(bytes, [0xFF, 0xD8, 0xFF, ..])
 }
 
+/// Gallery-thumb shortcut: read the JPEG head and return an embedded EXIF
+/// thumbnail when one is large enough. `None` means "read the whole file".
+async fn try_gallery_exif_thumb(
+    path: &Path,
+    file_size: u64,
+    intent: FetchIntent,
+) -> Result<Option<Vec<u8>>> {
+    if !intent.is_thumb() || file_size < 3 {
+        return Ok(None);
+    }
+    let n = (EXIF_HEAD_SCAN_BYTES as u64).min(file_size) as usize;
+    let mut file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut head = vec![0u8; n];
+    if file.read_exact(&mut head).await.is_err() {
+        return Ok(None);
+    }
+    if !is_image_magic(&head) {
+        return Ok(None);
+    }
+    Ok(exif_thumb_from_head(&head, intent.target_edge()))
+}
+
+async fn file_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0))
+}
+
+/// Return whether an existing local copy is older than the server's
+/// `getlastmodified` value.  A missing/unreadable local mtime is treated as a
+/// cache miss; when the server omits the timestamp we retain the safe
+/// historical behaviour of not re-downloading every sync interval.
+async fn local_needs_download(path: &Path, remote_modified: Option<DateTime<Utc>>) -> Result<bool> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat local WebDAV copy {}", path.display()))
+        }
+    };
+    let Some(remote_modified) = remote_modified else {
+        return Ok(false);
+    };
+    let Ok(local_modified) = metadata.modified() else {
+        return Ok(true);
+    };
+    let Ok(local_secs) = local_modified.duration_since(std::time::UNIX_EPOCH) else {
+        return Ok(true);
+    };
+    Ok(remote_modified.timestamp() >= 0
+        && remote_modified.timestamp() as u64 > local_secs.as_secs())
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct WebDavPlugin {
@@ -592,11 +656,12 @@ impl WebDavPlugin {
         let images = self.discover_images().await?;
         let mut synced = 0usize;
 
-        for (download_url, rel_path, _modified) in &images {
+        for (download_url, rel_path, modified) in &images {
             // Mirror the remote directory structure under sync_dir so files
             // with the same name in different remote folders don't collide.
             let local_path = sync_dir.join(rel_path);
-            if fs::try_exists(&local_path).await.unwrap_or(false) {
+            let exists = fs::try_exists(&local_path).await.unwrap_or(false);
+            if exists && !local_needs_download(&local_path, *modified).await? {
                 debug!("WebDAV: already cached {}", rel_path.display());
                 continue;
             }
@@ -604,12 +669,14 @@ impl WebDavPlugin {
             match self.download_file(download_url, &local_path).await {
                 Ok(()) => {
                     synced += 1;
-                    debug!("WebDAV: synced {}", rel_path.display());
+                    debug!(
+                        "WebDAV: {} {}",
+                        if exists { "updated" } else { "synced" },
+                        rel_path.display()
+                    );
                 }
                 Err(e) => {
                     warn!("WebDAV: failed to download {}: {e}", rel_path.display());
-                    // Remove partial file if it was created.
-                    let _ = fs::remove_file(&local_path).await;
                 }
             }
         }
@@ -650,9 +717,24 @@ impl WebDavPlugin {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(dest, &bytes)
-            .await
-            .with_context(|| format!("writing {}", dest.display()))
+        let ext = dest
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let temp_path = dest.with_extension(format!("{ext}.part"));
+
+        if let Err(error) = fs::write(&temp_path, &bytes).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(error).with_context(|| format!("writing {}", temp_path.display()));
+        }
+
+        if let Err(error) = fs::rename(&temp_path, dest).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(error).with_context(|| {
+                format!("renaming {} to {}", temp_path.display(), dest.display())
+            });
+        }
+        Ok(())
     }
 
     // ── Local file listing ──────────────────────────────────────────────────
@@ -735,6 +817,9 @@ impl PhotoPlugin for WebDavPlugin {
     fn name(&self) -> &str {
         "webdav"
     }
+    fn uses_engine_image_cache(&self) -> bool {
+        false
+    }
     fn display_name(&self) -> &str {
         "WebDAV / Nextcloud"
     }
@@ -743,9 +828,10 @@ impl PhotoPlugin for WebDavPlugin {
     }
 
     async fn init(&mut self, config: &PluginConfig) -> Result<()> {
+        let _ = self.shutdown().await;
         self.cfg = config.clone();
         if self.cfg.get_str("url").is_none() {
-            return Ok(());
+            return Err(anyhow::anyhow!("webdav: missing required config key 'url'"));
         }
         // Build the HTTP client — supports custom TLS for self-signed certs.
         let skip_tls = self
@@ -800,15 +886,15 @@ impl PhotoPlugin for WebDavPlugin {
             paths = self.list_local_images().await;
         }
 
-        if offset == 0 && !self.sync_started.swap(true, Ordering::Relaxed) {
-            // Kick off the background periodic sync exactly once — spawning
-            // on every offset-0 request would pile up concurrent sync loops.
-            let abort = Self::spawn_sync_loop(
-                self.client()?.clone(),
-                self.cfg.clone(),
-                self.sync_interval_secs(),
-            );
-            *self.sync_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(abort);
+        if offset == 0 && !self.sync_started.load(Ordering::Relaxed) {
+            // Resolve the client before flipping the flag so a missing URL
+            // cannot permanently skip background sync.
+            let client = self.client()?.clone();
+            if !self.sync_started.swap(true, Ordering::Relaxed) {
+                let abort =
+                    Self::spawn_sync_loop(client, self.cfg.clone(), self.sync_interval_secs());
+                *self.sync_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(abort);
+            }
         }
 
         if paths.is_empty() {
@@ -823,58 +909,47 @@ impl PhotoPlugin for WebDavPlugin {
         paths.sort();
 
         let sync_dir = self.sync_dir();
-        let photos: Vec<PhotoMeta> = paths
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|path| {
-                let filename = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                // Path relative to sync_dir as id: unique (mirrors the remote
-                // tree) and stable across restarts and background syncs. A
-                // positional index would remap cache entries to different
-                // photos whenever new files arrive.
-                let id = path
-                    .strip_prefix(&sync_dir)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                // First sub-directory under sync_dir = remote folder → album.
-                let album = path
-                    .strip_prefix(&sync_dir)
-                    .ok()
-                    .and_then(|rel| rel.parent())
-                    .and_then(|p| p.iter().next())
-                    .and_then(|c| c.to_str())
-                    .map(|s| s.to_string());
-                let taken_at = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0));
-                PhotoMeta {
-                    id,
-                    filename,
-                    width: 0,
-                    height: 0,
-                    taken_at,
-                    download_url: Some(path.to_string_lossy().to_string()),
-                    album,
-                    title: None,
-                    location: None,
-                    is_favorite: false,
-                    extra: Default::default(),
-                }
-            })
-            .collect();
+        let mut photos = Vec::new();
+        for path in paths.into_iter().skip(offset).take(limit) {
+            let rel = path.strip_prefix(&sync_dir).unwrap_or(&path);
+            let Some(id) = rel.to_str().map(str::to_string) else {
+                continue;
+            };
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&id)
+                .to_string();
+            let Some(download) = path.to_str().map(str::to_string) else {
+                continue;
+            };
+            let album = path
+                .strip_prefix(&sync_dir)
+                .ok()
+                .and_then(|rel| rel.parent())
+                .and_then(|p| p.iter().next())
+                .and_then(|c| c.to_str())
+                .map(|s| s.to_string());
+            let taken_at = file_mtime_utc(&path).await;
+            photos.push(PhotoMeta {
+                id,
+                filename,
+                width: 0,
+                height: 0,
+                taken_at,
+                download_url: Some(download),
+                album,
+                title: None,
+                location: None,
+                is_favorite: false,
+                extra: Default::default(),
+            });
+        }
 
         Ok(photos)
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         if let Some(abort) = self
             .sync_abort
             .lock()
@@ -887,7 +962,7 @@ impl PhotoPlugin for WebDavPlugin {
         Ok(())
     }
 
-    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>> {
         let path_str = meta
             .download_url
             .as_deref()
@@ -925,6 +1000,10 @@ impl PhotoPlugin for WebDavPlugin {
             ));
         }
 
+        if let Some(thumb) = try_gallery_exif_thumb(&canonical, file_size, intent).await? {
+            return Ok(thumb);
+        }
+
         let bytes = fs::read(&canonical)
             .await
             .with_context(|| format!("reading '{path_str}'"))?;
@@ -956,6 +1035,39 @@ fn filename_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_copy_is_refreshed_when_remote_mtime_is_newer() {
+        let dir =
+            std::env::temp_dir().join(format!("picogallery-webdav-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir).await;
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("photo.jpg");
+        fs::write(&path, b"old").await.unwrap();
+        let newer = DateTime::<Utc>::from_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 60,
+            0,
+        )
+        .unwrap();
+        assert!(local_needs_download(&path, Some(newer)).await.unwrap());
+        assert!(!local_needs_download(&path, None).await.unwrap());
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn missing_local_copy_needs_download() {
+        let dir =
+            std::env::temp_dir().join(format!("picogallery-webdav-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir).await;
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("missing.jpg");
+        assert!(local_needs_download(&path, None).await.unwrap());
+        let _ = fs::remove_dir_all(&dir).await;
+    }
 
     #[test]
     fn parse_propfind_finds_files_and_dirs() {
@@ -1219,4 +1331,183 @@ mod tests {
         assert_eq!(entries[0].href, "/dav/Photos/sunset.jpg");
         assert_eq!(entries[0].content_type.as_deref(), Some("image/jpeg"));
     }
+
+    #[tokio::test]
+    async fn test_webdav_propfind_mock() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/folder/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/folder/image.jpg</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getcontenttype>image/jpeg</d:getcontenttype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+        Mock::given(method("PROPFIND"))
+            .and(path("/dav/folder/"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(xml))
+            .mount(&server)
+            .await;
+
+        let mut cfg = picogallery_core::PluginConfig::default();
+        cfg.values.insert(
+            "url".to_string(),
+            serde_json::Value::String(format!("{}/dav/folder/", server.uri())),
+        );
+        cfg.values.insert(
+            "username".to_string(),
+            serde_json::Value::String("u".into()),
+        );
+        cfg.values.insert(
+            "password".to_string(),
+            serde_json::Value::String("p".into()),
+        );
+
+        let mut plugin = WebDavPlugin::new(cfg);
+        plugin.client = Some(reqwest::Client::new());
+
+        let entries = plugin
+            .propfind(&format!("{}/dav/folder/", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].href, "/dav/folder/");
+        assert!(entries[0].is_collection);
+        assert_eq!(entries[1].href, "/dav/folder/image.jpg");
+        assert!(!entries[1].is_collection);
+        assert_eq!(entries[1].content_type.as_deref(), Some("image/jpeg"));
+    }
+}
+
+#[tokio::test]
+async fn test_webdav_propfind_and_sync() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let propfind_resp = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/user/Photos/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/user/Photos/img.jpg</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getcontenttype>image/jpeg</d:getcontenttype>
+        <d:getlastmodified>Sun, 01 Jan 2023 12:00:00 GMT</d:getlastmodified>
+        <d:resourcetype/>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+    Mock::given(method("PROPFIND"))
+        .and(path("/remote.php/dav/files/user/Photos"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_resp))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the GET request for the file
+    Mock::given(method("GET"))
+        .and(path("/remote.php/dav/files/user/Photos/img.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(vec![0xFF, 0xD8, 0xFF, 0x00, 0x00, 0x00]),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut values = std::collections::HashMap::new();
+    values.insert(
+        "url".into(),
+        serde_json::Value::String(format!("{}/remote.php/dav/files/user", mock_server.uri())),
+    );
+    values.insert("username".into(), serde_json::Value::String("test".into()));
+    values.insert("password".into(), serde_json::Value::String("test".into()));
+    values.insert(
+        "remote_path".into(),
+        serde_json::Value::String("/Photos".into()),
+    );
+    let dir = std::env::temp_dir().join(format!("picogallery-webdav-mock-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir).await;
+    values.insert(
+        "sync_dir".into(),
+        serde_json::Value::String(dir.to_string_lossy().to_string()),
+    );
+
+    let cfg = PluginConfig { values };
+
+    let mut plugin = WebDavPlugin::new(cfg.clone());
+    plugin.init(&cfg).await.unwrap();
+
+    // Call sync images
+    let synced = plugin.sync_images().await.unwrap();
+    assert_eq!(synced, 1);
+
+    let _ = fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn test_webdav_malformed_xml() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("PROPFIND"))
+        .and(path("/remote.php/dav/files/user/Photos"))
+        .respond_with(ResponseTemplate::new(207).set_body_string("INVALID XML <d:response>"))
+        .mount(&mock_server)
+        .await;
+
+    let mut values = std::collections::HashMap::new();
+    values.insert(
+        "url".into(),
+        serde_json::Value::String(format!("{}/remote.php/dav/files/user", mock_server.uri())),
+    );
+    values.insert("username".into(), serde_json::Value::String("test".into()));
+    values.insert("password".into(), serde_json::Value::String("test".into()));
+    values.insert(
+        "remote_path".into(),
+        serde_json::Value::String("/Photos".into()),
+    );
+
+    let cfg = PluginConfig { values };
+
+    let mut plugin = WebDavPlugin::new(cfg.clone());
+    plugin.init(&cfg).await.unwrap();
+
+    // This shouldn't panic, but might result in empty or error
+    let result = plugin
+        .propfind(&format!(
+            "{}/remote.php/dav/files/user/Photos",
+            mock_server.uri()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 0);
 }

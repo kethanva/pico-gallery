@@ -14,6 +14,7 @@ pub mod compose;
 pub mod config;
 pub mod display_power;
 pub mod exif_util;
+pub mod fetcher;
 pub mod fullscreen_controller;
 pub mod gallery;
 pub mod gallery_controller;
@@ -21,6 +22,7 @@ pub mod menu;
 pub mod mode;
 pub mod night;
 pub mod osd;
+pub mod queue_io;
 
 pub mod remote;
 pub mod renderer;

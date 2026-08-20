@@ -507,13 +507,13 @@ if [[ "$PHOTO_DIR_IS_EMPTY" == "1" && -z "$PP_URL" ]]; then
     mkdir -p "$SAMPLE_TMP"
     FETCHED=0
     for i in 01 02 03 04 05 06 07 08 09 10; do
-      URL="https://raw.githubusercontent.com/${REPO}/main/sample_photos/${i}.png"
-      if curl -fsSL --max-time 30 -o "${SAMPLE_TMP}/${i}.png" "$URL" 2>/dev/null; then
+      URL="https://raw.githubusercontent.com/${REPO}/main/sample_photos/${i}.jpg"
+      if curl -fsSL --max-time 30 -o "${SAMPLE_TMP}/${i}.jpg" "$URL" 2>/dev/null; then
         FETCHED=$((FETCHED + 1))
       fi
     done
     if [[ "$FETCHED" -gt 0 ]]; then
-      sudo cp "$SAMPLE_TMP"/*.png "$PHOTO_DIR/" 2>/dev/null || true
+      sudo cp "$SAMPLE_TMP"/*.jpg "$PHOTO_DIR/" 2>/dev/null || true
       info "Installed $FETCHED sample photo(s)."
     else
       warn "Could not fetch sample photos. Add your own to $PHOTO_DIR before starting the service."
@@ -521,7 +521,8 @@ if [[ "$PHOTO_DIR_IS_EMPTY" == "1" && -z "$PP_URL" ]]; then
   fi
 
   sudo chown -R "$TARGET_USER:$TARGET_USER" "$PHOTO_DIR"
-  PHOTO_COUNT=$(find "$PHOTO_DIR" -maxdepth 2 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' \) 2>/dev/null | wc -l | tr -d ' ')
+  PHOTO_COUNT=$(find "$PHOTO_DIR" -maxdepth 2 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) 2>/dev/null | wc -l | tr -d ' ')
+  (( PHOTO_COUNT > 0 )) || die "No supported JPEG samples were installed."
   info "Photo directory ready: $PHOTO_DIR (${PHOTO_COUNT} photos)"
 elif [[ -n "$PP_URL" ]]; then
   info "PhotoPrism mode — photos stream from the server; skipping local samples."
@@ -695,44 +696,20 @@ fi
 section "Installing systemd service"
 
 SERVICE_FILE="/etc/systemd/system/picogallery.service"
-sudo tee "$SERVICE_FILE" > /dev/null <<SERVICE
-[Unit]
-Description=PicoGallery photo slideshow
-After=network-online.target
-Wants=network-online.target
+if [[ -f "${EXTRACT_DIR}/picogallery.service" ]]; then
+  UNIT_SRC="${EXTRACT_DIR}/picogallery.service"
+elif [[ -f "$SRC_DIR/picogallery.service" ]]; then
+  UNIT_SRC="$SRC_DIR/picogallery.service"
+else
+  die "picogallery.service template not found (looked in EXTRACT_DIR and SRC_DIR)"
+fi
 
-[Service]
-Type=simple
-User=${TARGET_USER}
-Group=video
-Environment=SDL_VIDEODRIVER=kmsdrm
-Environment=RUST_LOG=info
-# systemd does not create /run/user/%U for non-login service users — use a
-# dedicated runtime dir instead of pointing at a path that may not exist.
-RuntimeDirectory=picogallery
-Environment=XDG_RUNTIME_DIR=/run/picogallery
-ExecStart=/usr/local/bin/picogallery
-Restart=on-failure
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-UMask=0077
-ProtectSystem=full
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-LockPersonality=yes
-RestrictSUIDSGID=yes
-TasksMax=128
-MemoryMax=384M
-
-# Allow DRM/input access without root. Wi-Fi and USB mounting require host
-# policy (NetworkManager/udisks) and are deliberately not granted privileges.
-SupplementaryGroups=video render input
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
+# Deb/cargo-deb installs the binary at /usr/bin; this script installs at
+# /usr/local/bin. Rewrite only User= and ExecStart= so hardening stays in the
+# single checked-in unit.
+sed -e "s|^User=.*|User=${TARGET_USER}|" \
+    -e "s|^ExecStart=.*|ExecStart=/usr/local/bin/picogallery|" \
+    "$UNIT_SRC" | sudo tee "$SERVICE_FILE" > /dev/null
 
 sudo systemctl daemon-reload
 info "Service installed: picogallery.service"

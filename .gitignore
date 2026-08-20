@@ -8,9 +8,8 @@ target/
 BACKUPS/
 mnt/
 .claude/
+.cursor/
 opentinyphotoapp.txt
-how_to_docs/
-plans/
 
 # Local secrets / machine-specific config (never commit)
 deploy.local.env
@@ -30,3 +29,10 @@ client_secret*.json
 
 # Generated analysis graphs (contain absolute local paths)
 graphify-out/
+
+# Local scratch leftovers — never commit
+scratch.py
+scratch_*.rs
+temp_tests.txt
+.agents/
+

@@ -1,8 +1,26 @@
-/// Slideshow engine.
-///
-/// Runs on the Tokio runtime. A background task pre-fetches the next N images
-/// while the current one is on screen, so transitions are instant on slow Pi
-/// Zero I/O.  All plugin calls are async and non-blocking.
+//! Slideshow engine.
+//!
+//! Runs on the Tokio runtime. A background task pre-fetches the next N images
+//! while the current one is on screen, so transitions are instant on slow Pi
+//! Zero I/O. Plugin fetch and decode run on `Fetcher` tasks so the display
+//! loop never awaits I/O.
+use crate::cache::CacheHandle;
+use crate::compose::blit_center;
+use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
+use crate::fetcher::{
+    stall_state, FetchDone, FetchJob, Fetcher, JobKind, StallAction, MAX_IN_FLIGHT_FETCHES,
+};
+use crate::fullscreen_controller::FullscreenController;
+use crate::gallery_controller::GalleryController;
+use crate::menu::{EditField, Menu, MenuAction};
+use crate::mode::Mode;
+use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta, PhotoPlugin};
+use crate::queue_io::{
+    self, filter_unseen_photos, ExtendResult, FavoriteResult, QueueIo, QueueLoader,
+    EXTEND_MAX_ROUNDS, MAX_PHOTOS_PER_PLUGIN, PAGE_SIZE,
+};
+use crate::remote::SharedStatus;
+use crate::renderer::{DisplayEnv, Renderer, SlideshowCmd};
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
 use log::{debug, info, warn};
@@ -10,108 +28,22 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-
-use crate::cache::ImageCache;
-use crate::compose::blit_center;
-use crate::config::{Config, DisplayConfig, PhotoOrder, Transition};
-use crate::fullscreen_controller::FullscreenController;
-use crate::gallery_controller::GalleryController;
-use crate::menu::{EditField, Menu, MenuAction};
-use crate::mode::Mode;
-use crate::plugin::{AuthStatus, BoxedPlugin, PhotoMeta};
-use crate::remote::SharedStatus;
-use crate::renderer::{Renderer, SlideshowCmd};
 use tokio::sync::mpsc::Receiver;
 
-const PAGE_SIZE: usize = 50; // photos fetched per API page
-/// Hard cap per plugin when paging the remote library into the play queue.
-const MAX_PHOTOS_PER_PLUGIN: usize = 2000;
-/// Fetch the next API page when navigation is within this many items of the end.
-const LOAD_AHEAD_MARGIN: usize = 30;
-/// Thumbnails decoded per gallery tick — balances Pi Zero CPU with fast fill.
+/// Thumbnails spawned per gallery tick — balances Pi Zero CPU with fast fill.
 const GALLERY_THUMBS_PER_TICK: usize = 4;
-
-/// Tracks how many photos have been pulled from each plugin so far.
-struct QueueLoader {
-    plugin_offsets: Vec<usize>,
-    plugin_exhausted: Vec<bool>,
-    plugin_retryable_error: Vec<bool>,
-    retry_after: Vec<Option<Instant>>,
-    consecutive_errors: Vec<u8>,
-    shuffle_seed: u64,
-}
-
-impl QueueLoader {
-    fn new(plugin_count: usize) -> Self {
-        Self {
-            plugin_offsets: vec![0; plugin_count],
-            plugin_exhausted: vec![false; plugin_count],
-            plugin_retryable_error: vec![false; plugin_count],
-            retry_after: vec![None; plugin_count],
-            consecutive_errors: vec![0; plugin_count],
-            shuffle_seed: shuffle_seed_now(),
-        }
-    }
-
-    fn all_exhausted(&self) -> bool {
-        self.plugin_exhausted.iter().all(|&e| e)
-    }
-
-    fn mark_fully_loaded(&mut self) {
-        self.plugin_exhausted.fill(true);
-    }
-
-    /// Recompute per-plugin item counts from an externally-built `queue` (e.g.
-    /// the single-round initial load). A nonzero count that isn't an exact
-    /// multiple of `PAGE_SIZE` means the last page was short and exhausted.
-    /// Zero is deliberately retryable: it may represent a transient initial
-    /// failure from a provider that has not contributed a page yet.
-    fn sync_counts(&mut self, queue: &[(usize, PhotoMeta)]) {
-        self.plugin_offsets.fill(0);
-        for (pi, _) in queue {
-            if *pi < self.plugin_offsets.len() {
-                self.plugin_offsets[*pi] += 1;
-            }
-        }
-        for (i, off) in self.plugin_offsets.iter().enumerate() {
-            if *off >= MAX_PHOTOS_PER_PLUGIN || (*off > 0 && *off % PAGE_SIZE != 0) {
-                self.plugin_exhausted[i] = true;
-            }
-        }
-    }
-
-    fn near_end(&self, trigger_idx: usize, queue_len: usize) -> bool {
-        !self.all_exhausted()
-            && queue_len > 0
-            && trigger_idx + LOAD_AHEAD_MARGIN >= queue_len.saturating_sub(1)
-    }
-
-    fn ready_to_retry(&self, plugin_idx: usize) -> bool {
-        self.retry_after[plugin_idx].is_none_or(|deadline| Instant::now() >= deadline)
-    }
-
-    fn record_success(&mut self, plugin_idx: usize) {
-        self.plugin_retryable_error[plugin_idx] = false;
-        self.consecutive_errors[plugin_idx] = 0;
-        self.retry_after[plugin_idx] = None;
-    }
-
-    fn record_error(&mut self, plugin_idx: usize) -> Duration {
-        self.plugin_retryable_error[plugin_idx] = true;
-        self.consecutive_errors[plugin_idx] = self.consecutive_errors[plugin_idx].saturating_add(1);
-        let exponent = u32::from(self.consecutive_errors[plugin_idx].saturating_sub(1)).min(6);
-        let delay = Duration::from_secs(1u64 << exponent);
-        self.retry_after[plugin_idx] = Some(Instant::now() + delay);
-        delay
-    }
-}
+/// Exclusive `authenticate()` call budget. Pending-user-action waits use
+/// `[auth].pending_timeout_secs` instead.
+const AUTH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Settings-menu title. Used both to render the panel and to compute its
 /// geometry for click/hover hit-testing, so the two must use the same string.
 const MENU_TITLE: &str = "PicoGallery - Settings";
 const MAX_PREFETCH_ATTEMPTS_PER_TICK: usize = 8;
 
+/// Shared plugin handle. Fetch runs on `&self` so the display loop and
+/// background `Fetcher` tasks can hold clones without exclusive access.
+pub type SharedPlugin = Arc<dyn PhotoPlugin>;
 /// Builds fresh plugin instances from a config. Lets the engine rebuild its
 /// photo sources at runtime (e.g. when the user switches source from the
 /// menu) without the slideshow needing to know which plugins were compiled in
@@ -120,12 +52,13 @@ pub type PluginFactory = Box<dyn Fn(&Config) -> Vec<BoxedPlugin>>;
 
 pub struct Slideshow {
     config: Config,
-    plugins: Vec<BoxedPlugin>,
-    cache: Arc<Mutex<ImageCache>>,
+    plugins: Vec<SharedPlugin>,
+    cache: CacheHandle,
     /// Where to persist settings when the user picks "Save settings".
     config_path: PathBuf,
     /// Rebuilds the plugin set from a config — used to switch source at runtime.
     factory: PluginFactory,
+    display_env: DisplayEnv,
 }
 
 /// How the display loop must react to a menu action.
@@ -145,20 +78,44 @@ enum MenuOutcome {
     ResetShown,
 }
 
+/// Drive `fut` while pumping SDL so a plugin/network await cannot freeze the
+/// KMS/DRM display (and so Quit still reaches the loop). `Err` is only Quit.
+async fn pump_sdl_until<T>(
+    renderer: &mut Renderer,
+    fut: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, MenuOutcome> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut fut => return Ok(result),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {
+                let cmds = renderer.poll_events(true, false, false, false);
+                if cmds.iter().any(|c| matches!(c, SlideshowCmd::Quit)) {
+                    return Err(MenuOutcome::Quit);
+                }
+            }
+        }
+    }
+}
+
 impl Slideshow {
     pub async fn new(
         config: Config,
         plugins: Vec<BoxedPlugin>,
         config_path: PathBuf,
         factory: PluginFactory,
+        display_env: DisplayEnv,
     ) -> Result<Self> {
-        let cache = ImageCache::open(&config.cache.resolved_dir(), config.cache.max_mb).await?;
+        let cache =
+            CacheHandle::open_or_degrade(&config.cache.resolved_dir(), config.cache.max_mb).await;
         Ok(Self {
             config,
-            plugins,
-            cache: Arc::new(Mutex::new(cache)),
+            plugins: share_plugins(plugins),
+            cache,
             config_path,
             factory,
+            display_env,
         })
     }
 
@@ -173,8 +130,9 @@ impl Slideshow {
         remote_status: Option<SharedStatus>,
         shutdown_rx: Receiver<()>,
     ) -> Result<()> {
-        // 1. Authenticate all plugins.
-        self.authenticate_all().await?;
+        // 1. Renderer first so pending-auth OSD can paint; then authenticate.
+        let mut renderer = Renderer::init(self.config.display.clone(), self.display_env.clone())?;
+        self.authenticate_all(&mut renderer).await?;
 
         // 2. Build the initial play queue. A source may be temporarily offline
         // after authentication, so give retryable providers a short bounded
@@ -206,10 +164,7 @@ impl Slideshow {
             snapshot.providers = self.plugins.len();
         }
 
-        // 3. Create renderer on the main thread (SDL2 requires it).
-        let mut renderer = Renderer::init(self.config.display.clone())?;
-
-        // 4. Main display loop.
+        // 3. Main display loop.
         let result = self
             .display_loop(
                 &mut renderer,
@@ -220,63 +175,29 @@ impl Slideshow {
                 shutdown_rx,
             )
             .await;
-        for plugin in &mut self.plugins {
-            if let Err(e) = plugin.shutdown().await {
-                warn!("{} shutdown failed: {e}", plugin.name());
-            }
-        }
+        shutdown_shared(&self.plugins).await;
         result
     }
 
     // ── Authentication ────────────────────────────────────────────────────
 
-    async fn authenticate_all(&mut self) -> Result<()> {
-        let mut authenticated = Vec::with_capacity(self.plugins.len());
-        for mut plugin in self.plugins.drain(..) {
-            info!("Authenticating plugin: {}", plugin.display_name());
-            let mut usable = false;
-            loop {
-                match plugin.authenticate().await {
-                    Err(e) => {
-                        warn!("  {} authentication failed: {e:#}", plugin.display_name());
-                        break;
-                    }
-                    Ok(AuthStatus::Authenticated) => {
-                        info!("  {} authenticated.", plugin.display_name());
-                        usable = true;
-                        break;
-                    }
-                    Ok(AuthStatus::PendingUserAction {
-                        message,
-                        poll_interval_secs,
-                    }) => {
-                        println!("\n=== {} ===\n{}", plugin.display_name(), message);
-                        println!("Checking again in {} seconds…", poll_interval_secs);
-                        tokio::time::sleep(Duration::from_secs(poll_interval_secs.clamp(1, 60)))
-                            .await;
-                    }
-                    Ok(AuthStatus::NotAuthenticated) => {
-                        warn!(
-                            "  {} is not authenticated; source disabled.",
-                            plugin.display_name()
-                        );
-                        break;
-                    }
-                }
-            }
-            if usable {
-                authenticated.push(plugin);
-            } else if let Err(e) = plugin.shutdown().await {
-                warn!(
-                    "{} shutdown after authentication failure: {e}",
-                    plugin.name()
-                );
-            }
-        }
-        self.plugins = authenticated;
-        if self.plugins.is_empty() {
-            anyhow::bail!("No providers authenticated successfully")
-        }
+    async fn authenticate_all(&mut self, renderer: &mut Renderer) -> Result<()> {
+        let pending_timeout = Duration::from_secs(self.config.auth.pending_timeout_secs);
+        let plugins = std::mem::take(&mut self.plugins);
+        let kept = authenticate_plugin_set(
+            plugins,
+            AUTH_CALL_TIMEOUT,
+            pending_timeout,
+            |name, message, remaining| {
+                draw_sign_in_osd(renderer, name, message, remaining);
+                renderer
+                    .poll_events(false, false, false, false)
+                    .into_iter()
+                    .any(|c| matches!(c, SlideshowCmd::Quit))
+            },
+        )
+        .await?;
+        self.plugins = kept;
         Ok(())
     }
 
@@ -290,7 +211,7 @@ impl Slideshow {
     /// `full = false` loads one API page per plugin (fast gallery startup);
     /// `full = true` pages until each plugin is exhausted (menu re-order / switch).
     async fn build_queue_with(
-        plugins: &[BoxedPlugin],
+        plugins: &[SharedPlugin],
         display: &DisplayConfig,
         full: bool,
     ) -> Result<Vec<(usize, PhotoMeta)>> {
@@ -321,122 +242,64 @@ impl Slideshow {
 
     /// Pull one API page from every plugin that still has more photos.
     async fn fetch_queue_round(
-        plugins: &[BoxedPlugin],
+        plugins: &[SharedPlugin],
         loader: &mut QueueLoader,
     ) -> Vec<(usize, PhotoMeta)> {
-        let mut batch = Vec::new();
-        for (plugin_idx, plugin) in plugins.iter().enumerate() {
-            if loader.plugin_exhausted[plugin_idx] {
-                continue;
-            }
-            if !loader.ready_to_retry(plugin_idx) {
-                continue;
-            }
-            let offset = loader.plugin_offsets[plugin_idx];
-            if offset >= MAX_PHOTOS_PER_PLUGIN {
-                loader.plugin_exhausted[plugin_idx] = true;
-                continue;
-            }
-            match plugin.list_photos(PAGE_SIZE, offset).await {
-                Ok(page) if page.is_empty() => {
-                    loader.record_success(plugin_idx);
-                    loader.plugin_exhausted[plugin_idx] = true;
-                }
-                Ok(page) => {
-                    loader.record_success(plugin_idx);
-                    info!(
-                        "  {} loaded {} photos (offset {})",
-                        plugin.name(),
-                        page.len(),
-                        offset
-                    );
-                    let n = page.len();
-                    loader.plugin_offsets[plugin_idx] += n;
-                    batch.extend(page.into_iter().map(|m| (plugin_idx, m)));
-                    if n < PAGE_SIZE || loader.plugin_offsets[plugin_idx] >= MAX_PHOTOS_PER_PLUGIN {
-                        loader.plugin_exhausted[plugin_idx] = true;
-                    }
-                }
-                Err(e) => {
-                    let delay = loader.record_error(plugin_idx);
-                    warn!(
-                        "  {} list_photos error: {}; retrying in {}s",
-                        plugin.name(),
-                        e,
-                        delay.as_secs()
-                    );
-                    // Keep the source retryable. An empty successful page is the
-                    // only signal that paging is exhausted.
-                }
-            }
-        }
-        batch
+        queue_io::fetch_queue_round(plugins, loader, PAGE_SIZE, MAX_PHOTOS_PER_PLUGIN).await
     }
 
-    /// Append the next API page when the user is near the end of the queue.
-    async fn try_extend_queue(
+    /// Sync: spawn background paging when near the end (or forced).
+    fn request_extend(
         &self,
-        queue: &mut Vec<(usize, PhotoMeta)>,
-        queue_ids: &mut HashSet<(usize, String)>,
-        loader: &mut QueueLoader,
+        queue_io: &mut QueueIo,
+        queue_loader: &QueueLoader,
+        queue_ids: &HashSet<(usize, String)>,
+        force: bool,
         trigger_idx: usize,
-        remote_status: &Option<SharedStatus>,
-    ) -> bool {
-        if !loader.near_end(trigger_idx, queue.len()) {
-            return false;
+        queue_len: usize,
+    ) {
+        if queue_io.extend_in_flight() {
+            return;
         }
-        self.extend_queue_once(queue, queue_ids, loader, remote_status).await
+        let should = if force {
+            !queue_loader.all_exhausted()
+        } else {
+            queue_loader.near_end(trigger_idx, queue_len)
+        };
+        if !should {
+            return;
+        }
+        let _ = queue_io.try_spawn_extend(
+            self.plugins.clone(),
+            queue_loader.clone(),
+            queue_ids.clone(),
+            EXTEND_MAX_ROUNDS,
+            PAGE_SIZE,
+            MAX_PHOTOS_PER_PLUGIN,
+        );
     }
 
-    /// Always try to append the next API page (e.g. user hit the last row/photo).
-    async fn try_extend_queue_force(
+    /// Merge a completed extend into the live queue (display-loop only).
+    async fn apply_extend_result(
         &self,
+        done: ExtendResult,
         queue: &mut Vec<(usize, PhotoMeta)>,
         queue_ids: &mut HashSet<(usize, String)>,
-        loader: &mut QueueLoader,
+        queue_loader: &mut QueueLoader,
         remote_status: &Option<SharedStatus>,
     ) -> bool {
-        if loader.all_exhausted() {
+        *queue_loader = done.loader;
+        if done.photos.is_empty() {
             return false;
         }
-        self.extend_queue_once(queue, queue_ids, loader, remote_status).await
-    }
-
-    async fn extend_queue_once(
-        &self,
-        queue: &mut Vec<(usize, PhotoMeta)>,
-        queue_ids: &mut HashSet<(usize, String)>,
-        loader: &mut QueueLoader,
-        remote_status: &Option<SharedStatus>,
-    ) -> bool {
         let before = queue.len();
-        // One gallery tick may land in a duplicate window after a rescan —
-        // walk a few pages in this call so the UI still advances.
-        let mut unique: Vec<(usize, PhotoMeta)> = Vec::new();
-        for _ in 0..8 {
-            if loader.all_exhausted() {
-                break;
-            }
-            let batch = Self::fetch_queue_round(&self.plugins, loader).await;
-            if batch.is_empty() {
-                break;
-            }
-            let fresh = filter_unseen_photos(batch, queue_ids);
-            if fresh.is_empty() {
-                continue;
-            }
-            unique.extend(fresh);
-            // Prefer returning once we have a useful page of new photos.
-            if unique.len() >= PAGE_SIZE {
-                break;
-            }
-        }
-        if unique.is_empty() {
+        let fresh = filter_unseen_photos(done.photos, queue_ids);
+        if fresh.is_empty() {
             return false;
         }
         let from = queue.len();
-        queue.extend(unique);
-        apply_order_tail(queue, from, &self.config.display, loader.shuffle_seed);
+        queue.extend(fresh);
+        apply_order_tail(queue, from, &self.config.display, queue_loader.shuffle_seed);
         info!(
             "Loaded {} more photos ({} total)",
             queue.len() - before,
@@ -446,6 +309,76 @@ impl Slideshow {
             status.lock().await.total = queue.len();
         }
         true
+    }
+
+    /// Apply favourite result; revert optimistic flip on failure.
+    async fn apply_favorite_result(
+        fav: FavoriteResult,
+        current_meta: &mut Option<(usize, PhotoMeta)>,
+        remote_status: &Option<SharedStatus>,
+    ) {
+        let Some((plugin_idx, meta)) = current_meta.as_mut() else {
+            return;
+        };
+        if *plugin_idx != fav.plugin_idx || meta.id != fav.photo_id {
+            return;
+        }
+        if fav.ok {
+            meta.is_favorite = fav.favorite;
+            if let Some(status) = remote_status {
+                status.lock().await.favorite = fav.favorite;
+            }
+            info!(
+                "{} photo: {}",
+                if fav.favorite {
+                    "Favourited"
+                } else {
+                    "Un-favourited"
+                },
+                meta.filename
+            );
+        } else {
+            meta.is_favorite = !fav.favorite;
+            if let Some(status) = remote_status {
+                status.lock().await.favorite = meta.is_favorite;
+            }
+            if let Some(err) = &fav.error {
+                warn!("Favourite toggle failed: {err}");
+            } else {
+                warn!("Favourite toggle failed");
+            }
+        }
+    }
+
+    /// Optimistic favourite flip + background `set_favorite` (plugin I/O not awaited).
+    async fn request_favorite_toggle(
+        &self,
+        queue_io: &mut QueueIo,
+        current_meta: &mut Option<(usize, PhotoMeta)>,
+        remote_status: &Option<SharedStatus>,
+    ) {
+        let Some((plugin_idx, meta)) = current_meta.as_mut() else {
+            debug!("Favourite toggle ignored — no photo on screen yet");
+            return;
+        };
+        if !self.plugins[*plugin_idx].capabilities().favorite_toggle {
+            debug!(
+                "Favourite toggle ignored — source '{}' has no favourite support",
+                self.plugins[*plugin_idx].name()
+            );
+            return;
+        }
+        if queue_io.fav_in_flight() {
+            return;
+        }
+        let target = !meta.is_favorite;
+        meta.is_favorite = target;
+        if let Some(status) = remote_status {
+            status.lock().await.favorite = target;
+        }
+        let plugin = self.plugins[*plugin_idx].clone();
+        let meta_clone = meta.clone();
+        let _ = queue_io.try_spawn_favorite(plugin, *plugin_idx, meta_clone, target);
     }
 
     // ── Display loop ──────────────────────────────────────────────────────
@@ -516,21 +449,29 @@ impl Slideshow {
         // First frame after opening from the grid uses Cut (no fade from grid).
         let mut open_cut_once = false;
 
-        // Pre-warm the prefetch ring (fetch + decode the first N photos).
+        let mut fetcher = Fetcher::new(
+            self.plugins.clone(),
+            self.cache.clone(),
+            renderer.image_processor(),
+            MAX_IN_FLIGHT_FETCHES,
+        );
+        let mut queue_io = QueueIo::new();
+        let mut stall_since: Option<Instant> = None;
+        let mut stall_warned = false;
+        let mut stall_osd = false;
+
+        // Pre-warm: spawn only — never await plugin I/O before poll_events.
         let mut cursor = 0usize;
         if mode.is_fullscreen() {
-            for _ in 0..prefetch_n {
-                self.prefetch_one(
-                    &queue,
-                    &mut cursor,
-                    &mut prefetched,
-                    prefetch_n,
-                    renderer,
-                    no_repeat_shown,
-                    &shown_ids,
-                )
-                .await;
-            }
+            Self::pump_slide_fetches(
+                &mut fetcher,
+                &queue,
+                &mut cursor,
+                &prefetched,
+                prefetch_n,
+                no_repeat_shown,
+                &shown_ids,
+            );
         }
 
         let slide_dur = Duration::from_secs(self.config.display.slide_duration_secs);
@@ -608,7 +549,7 @@ impl Slideshow {
                 match cmd {
                     SlideshowCmd::Quit => {
                         info!("Quit requested.");
-                        self.cache.lock().await.flush().await;
+                        self.cache.flush().await;
                         return Ok(());
                     }
                     SlideshowCmd::OpenMenu => {
@@ -718,13 +659,14 @@ impl Slideshow {
                     SlideshowCmd::Next => {
                         if !menu.open && mode.is_fullscreen() {
                             if current_queue_idx + 1 >= queue.len() {
-                                self.try_extend_queue_force(
-                                    &mut queue,
-                                    &mut queue_ids,
-                                    &mut queue_loader,
-                                    &remote_status,
-                                )
-                                .await;
+                                self.request_extend(
+                                    &mut queue_io,
+                                    &queue_loader,
+                                    &queue_ids,
+                                    true,
+                                    current_queue_idx,
+                                    queue.len(),
+                                );
                             }
                             last_advance = Instant::now()
                                 .checked_sub(slide_dur)
@@ -739,6 +681,7 @@ impl Slideshow {
                                 current_queue_idx - 1
                             };
                             prefetched.clear();
+                            fetcher.invalidate();
                             cursor = current_queue_idx;
                             last_advance = Instant::now()
                                 .checked_sub(slide_dur)
@@ -747,8 +690,12 @@ impl Slideshow {
                     }
                     SlideshowCmd::ToggleFavorite => {
                         if !menu.open && mode.is_fullscreen() {
-                            self.toggle_favorite(&mut current_meta, &remote_status)
-                                .await;
+                            self.request_favorite_toggle(
+                                &mut queue_io,
+                                &mut current_meta,
+                                &remote_status,
+                            )
+                            .await;
                         }
                     }
                     // ── Text field editing (only meaningful while a field is open) ──
@@ -790,6 +737,8 @@ impl Slideshow {
                             gallery_ctl.mark_dirty();
                             paused = false;
                             prefetched.clear();
+                            fetcher.invalidate();
+                            gallery_ctl.grid.clear_all_pending_thumbs();
                             current_rgba = None;
                             current_meta = None;
                             gallery_thumb_cursor = 0;
@@ -807,126 +756,183 @@ impl Slideshow {
                             fullscreen_ctl.pending_open = Some(idx);
                         }
                     }
-                    SlideshowCmd::GalleryClick { x, y } => {
-                        if gallery_mode && mode.is_gallery() {
-                            let grid = &mut gallery_ctl.grid;
-                            if let Some(idx) = grid.index_at(x, y, queue.len()) {
-                                grid.set_selected(idx, queue.len());
-                                fullscreen_ctl.pending_open = Some(idx);
-                            }
+                    SlideshowCmd::GalleryClick { x, y } if gallery_mode && mode.is_gallery() => {
+                        let grid = &mut gallery_ctl.grid;
+                        if let Some(idx) = grid.index_at(x, y, queue.len()) {
+                            grid.set_selected(idx, queue.len());
+                            fullscreen_ctl.pending_open = Some(idx);
                         }
                     }
-                    SlideshowCmd::GalleryPage(dir) => {
-                        if mode.is_gallery() && gallery_mode {
-                            let grid = &mut gallery_ctl.grid;
-                            let mut scrolled =
-                                grid.scroll_page(dir, queue.len(), renderer.height());
-                            if !scrolled
-                                && dir > 0
-                                && grid.at_scroll_bottom(queue.len(), renderer.height())
-                                && self
-                                    .try_extend_queue_force(
-                                        &mut queue,
-                                        &mut queue_ids,
-                                        &mut queue_loader,
-                                        &remote_status,
-                                    )
-                                    .await
-                            {
-                                scrolled = grid.scroll_page(dir, queue.len(), renderer.height());
-                            }
-                            if scrolled {
-                                gallery_ctl.dirty = true;
-                            }
+                    SlideshowCmd::GalleryClick { .. } => {}
+                    SlideshowCmd::GalleryPage(dir) if gallery_mode && mode.is_gallery() => {
+                        let grid = &mut gallery_ctl.grid;
+                        let scrolled = grid.scroll_page(dir, queue.len(), renderer.height());
+                        if !scrolled
+                            && dir > 0
+                            && grid.at_scroll_bottom(queue.len(), renderer.height())
+                        {
+                            self.request_extend(
+                                &mut queue_io,
+                                &queue_loader,
+                                &queue_ids,
+                                true,
+                                grid.selected,
+                                queue.len(),
+                            );
                         }
-                    }
-                    SlideshowCmd::GalleryMoveSelection { dx, dy } => {
-                        if mode.is_gallery() && gallery_mode {
-                            let grid = &mut gallery_ctl.grid;
-                            let blocked = grid.move_selection(dx, dy, queue.len());
-                            if blocked
-                                && self
-                                    .try_extend_queue_force(
-                                        &mut queue,
-                                        &mut queue_ids,
-                                        &mut queue_loader,
-                                        &remote_status,
-                                    )
-                                    .await
-                            {
-                                let _ = grid.move_selection(dx, dy, queue.len());
-                            }
-                            grid.ensure_selected_visible(renderer.height(), queue.len());
+                        if scrolled {
                             gallery_ctl.dirty = true;
                         }
                     }
-                    SlideshowCmd::GalleryScroll(delta) => {
-                        if mode.is_gallery() && gallery_mode {
-                            let grid = &mut gallery_ctl.grid;
-                            let before = grid.scroll_y;
-                            grid.scroll_by(delta, queue.len(), renderer.height());
-                            if grid.scroll_y != before {
-                                gallery_ctl.dirty = true;
-                            }
+                    SlideshowCmd::GalleryPage(_) => {}
+                    SlideshowCmd::GalleryMoveSelection { dx, dy }
+                        if gallery_mode && mode.is_gallery() =>
+                    {
+                        let grid = &mut gallery_ctl.grid;
+                        let blocked = grid.move_selection(dx, dy, queue.len());
+                        if blocked {
+                            self.request_extend(
+                                &mut queue_io,
+                                &queue_loader,
+                                &queue_ids,
+                                true,
+                                grid.selected,
+                                queue.len(),
+                            );
+                        }
+                        grid.ensure_selected_visible(renderer.height(), queue.len());
+                        gallery_ctl.dirty = true;
+                    }
+                    SlideshowCmd::GalleryMoveSelection { .. } => {}
+                    SlideshowCmd::GalleryScroll(delta) if gallery_mode && mode.is_gallery() => {
+                        let grid = &mut gallery_ctl.grid;
+                        let before = grid.scroll_y;
+                        grid.scroll_by(delta, queue.len(), renderer.height());
+                        if grid.scroll_y != before {
+                            gallery_ctl.dirty = true;
                         }
                     }
-                    SlideshowCmd::GalleryOpenSelected => {
-                        if gallery_mode && mode.is_gallery() && !queue.is_empty() {
-                            let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
-                            fullscreen_ctl.pending_open = Some(idx);
-                        }
+                    SlideshowCmd::GalleryScroll(_) => {}
+                    SlideshowCmd::GalleryOpenSelected
+                        if gallery_mode && mode.is_gallery() && !queue.is_empty() =>
+                    {
+                        let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
+                        fullscreen_ctl.pending_open = Some(idx);
                     }
-                    SlideshowCmd::GalleryOpenVisible => {
-                        if gallery_mode && mode.is_gallery() && !queue.is_empty() {
-                            let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
-                            fullscreen_ctl.pending_open = Some(idx);
-                        }
+                    SlideshowCmd::GalleryOpenSelected => {}
+                    SlideshowCmd::GalleryOpenVisible
+                        if gallery_mode && mode.is_gallery() && !queue.is_empty() =>
+                    {
+                        let idx = gallery_ctl.grid.selected.min(queue.len() - 1);
+                        fullscreen_ctl.pending_open = Some(idx);
                     }
+                    SlideshowCmd::GalleryOpenVisible => {}
                 }
             }
 
-            // Open the selected photo: load THAT index into the prefetch ring
-            // first so a decode failure on it cannot silently show a neighbour.
+            // Spawn a priority fetch for the clicked index. Mode switch happens
+            // when the result arrives — never await JPEG I/O here.
             if let Some(idx) = fullscreen_ctl.pending_open.take() {
                 if idx < queue.len() {
                     prefetched.clear();
                     current_rgba = None;
-                    self.load_photo_into_prefetch(&queue, idx, &mut prefetched, renderer)
-                        .await;
-                    if prefetched.is_empty() {
-                        // Keep the user on the grid rather than advancing to a
-                        // different photo they did not click.
-                        mode = Mode::Gallery;
-                        gallery_ctl.enter();
-                        warn!(
-                            "Could not open photo {} ({}) — staying in gallery",
-                            idx + 1,
-                            queue[idx].1.filename
-                        );
+                    fetcher.invalidate();
+                    gallery_ctl.grid.clear_all_pending_thumbs();
+                    let (pidx, meta) = &queue[idx];
+                    if fetcher.try_spawn(FetchJob::Slide {
+                        queue_idx: idx,
+                        plugin_idx: *pidx,
+                        meta: meta.clone(),
+                        priority: true,
+                    }) {
+                        fullscreen_ctl.awaiting_open = Some(idx);
                     } else {
-                        mode = Mode::Fullscreen;
-                        paused = false;
-                        current_queue_idx = idx;
-                        cursor = (idx + 1) % queue.len();
-                        open_cut_once = true;
-                        // Top up the rest of the ring from the following photos.
-                        for _ in 0..prefetch_n.saturating_sub(1) {
-                            self.prefetch_one(
-                                &queue,
-                                &mut cursor,
-                                &mut prefetched,
-                                prefetch_n,
-                                renderer,
-                                no_repeat_shown,
-                                &shown_ids,
-                            )
-                            .await;
-                        }
-                        last_advance = Instant::now()
-                            .checked_sub(slide_dur)
-                            .unwrap_or_else(Instant::now);
-                        info!("Opened slideshow at photo {}.", idx + 1);
+                        fullscreen_ctl.pending_open = Some(idx);
                     }
+                }
+            }
+
+            for done in fetcher.drain() {
+                self.apply_fetch_result(
+                    done,
+                    &mut prefetched,
+                    &mut gallery_ctl,
+                    &mut fullscreen_ctl,
+                    &mut mode,
+                    &mut current_queue_idx,
+                    &mut cursor,
+                    &mut open_cut_once,
+                    &mut last_advance,
+                    &mut paused,
+                    slide_dur,
+                    &queue,
+                );
+            }
+
+            if let Some(done) = queue_io.drain_extend() {
+                if self
+                    .apply_extend_result(
+                        done,
+                        &mut queue,
+                        &mut queue_ids,
+                        &mut queue_loader,
+                        &remote_status,
+                    )
+                    .await
+                    && mode.is_gallery()
+                {
+                    gallery_ctl.dirty = true;
+                }
+            }
+            if let Some(fav) = queue_io.drain_favorite() {
+                Self::apply_favorite_result(fav, &mut current_meta, &remote_status).await;
+            }
+
+            if mode.is_fullscreen() {
+                if prefetched.is_empty() && fetcher.in_flight() == 0 {
+                    stall_since.get_or_insert(Instant::now());
+                } else if !prefetched.is_empty() {
+                    stall_since = None;
+                    stall_warned = false;
+                    stall_osd = false;
+                }
+                match stall_state(
+                    prefetched.is_empty(),
+                    fetcher.in_flight(),
+                    mode.is_fullscreen(),
+                    stall_since.map(|t| t.elapsed()),
+                    stall_warned,
+                    stall_osd,
+                ) {
+                    StallAction::Warn => {
+                        warn!(
+                            "Prefetch stalled: no photo could be fetched or decoded from {} sources — retrying",
+                            self.plugins.len()
+                        );
+                        stall_warned = true;
+                    }
+                    StallAction::Osd => {
+                        draw_stall_osd(renderer, &tc);
+                        stall_osd = true;
+                        self.request_extend(
+                            &mut queue_io,
+                            &queue_loader,
+                            &queue_ids,
+                            false,
+                            current_queue_idx,
+                            queue.len(),
+                        );
+                        Self::pump_slide_fetches(
+                            &mut fetcher,
+                            &queue,
+                            &mut cursor,
+                            &prefetched,
+                            prefetch_n,
+                            no_repeat_shown,
+                            &shown_ids,
+                        );
+                    }
+                    StallAction::None => {}
                 }
             }
 
@@ -956,11 +962,14 @@ impl Slideshow {
                     other => match self.handle_menu_action(other, renderer).await {
                         MenuOutcome::Stay => menu_dirty = true,
                         MenuOutcome::Quit => {
-                            self.cache.lock().await.flush().await;
+                            self.cache.flush().await;
                             return Ok(());
                         }
                         MenuOutcome::ReloadFrames => {
                             prefetched.clear();
+                            fetcher.invalidate();
+                            queue_io.invalidate();
+                            fetcher.set_processor(renderer.image_processor());
                             if !queue.is_empty() {
                                 cursor = (current_queue_idx + 1) % queue.len();
                             }
@@ -978,6 +987,8 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
+                            fetcher.invalidate();
+                            queue_io.invalidate();
                             shown_ids.iter_mut().for_each(HashSet::clear);
                             shown_count = 0;
                             if gallery_mode {
@@ -994,6 +1005,9 @@ impl Slideshow {
                             cursor = 0;
                             current_queue_idx = 0;
                             prefetched.clear();
+                            fetcher.set_plugins(self.plugins.clone());
+                            fetcher.set_processor(renderer.image_processor());
+                            queue_io.invalidate();
                             shown_ids = (0..self.plugins.len()).map(|_| HashSet::new()).collect();
                             shown_count = 0;
                             current_meta = None;
@@ -1066,61 +1080,54 @@ impl Slideshow {
                     let grid = &mut gallery_ctl.grid;
                     grid.clamp_scroll(queue.len(), renderer.height());
                     let sel = grid.selected.min(queue.len().saturating_sub(1));
-                    if self
-                        .try_extend_queue(&mut queue, &mut queue_ids, &mut queue_loader, sel, &remote_status)
-                        .await
+                    self.request_extend(
+                        &mut queue_io,
+                        &queue_loader,
+                        &queue_ids,
+                        false,
+                        sel,
+                        queue.len(),
+                    );
+                    // Spawn gallery thumbs (no await). Skip while a fullscreen
+                    // open is in flight so the priority slide keeps a slot.
+                    let mut spawned = 0usize;
+                    if fullscreen_ctl.awaiting_open.is_none()
+                        && !queue.is_empty()
+                        && grid.needs_thumb(sel)
+                        && fetcher.has_capacity()
                     {
-                        gallery_ctl.dirty = true;
-                    }
-                    // Always load the selected thumb first so it is visible.
-                    if !queue.is_empty() && grid.thumb(sel).is_none() {
                         let (pidx, meta) = &queue[sel];
-                        let thumb_px = grid.cell;
-                        if let Some(bytes) = self
-                            .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
-                            .await
-                        {
-                            let processor = renderer.image_processor();
-                            let decoded = tokio::task::spawn_blocking(move || {
-                                processor.decode_thumbnail(&bytes, thumb_px)
-                            })
-                            .await;
-                            if let Ok(Ok(img)) = decoded {
-                                grid.insert_thumb(sel, img);
-                                gallery_ctl.dirty = true;
-                            }
+                        if fetcher.try_spawn(FetchJob::Thumb {
+                            queue_idx: sel,
+                            plugin_idx: *pidx,
+                            meta: meta.clone(),
+                            cell_px: grid.cell,
+                        }) {
+                            grid.mark_thumb_pending(sel);
+                            spawned += 1;
                         }
                     }
-                    // Load missing thumbs for visible cells (batched per tick).
                     let visible = grid.visible_indices(renderer.height(), queue.len());
-                    if !visible.is_empty() {
+                    if fullscreen_ctl.awaiting_open.is_none() && !visible.is_empty() {
                         let start = gallery_thumb_cursor % visible.len();
-                        let mut loaded = 0usize;
                         for offset in 0..visible.len() {
-                            if loaded >= GALLERY_THUMBS_PER_TICK {
+                            if spawned >= GALLERY_THUMBS_PER_TICK || !fetcher.has_capacity() {
                                 break;
                             }
                             let pick = visible[(start + offset) % visible.len()];
-                            if grid.thumb(pick).is_some() {
+                            if !grid.needs_thumb(pick) {
                                 continue;
                             }
                             gallery_thumb_cursor = (start + offset + 1) % visible.len();
                             let (pidx, meta) = &queue[pick];
-                            let thumb_px = grid.cell;
-                            if let Some(bytes) = self
-                                .fetch_photo_thumb(*pidx, meta, thumb_px, renderer)
-                                .await
-                            {
-                                let processor = renderer.image_processor();
-                                let decoded = tokio::task::spawn_blocking(move || {
-                                    processor.decode_thumbnail(&bytes, thumb_px)
-                                })
-                                .await;
-                                if let Ok(Ok(img)) = decoded {
-                                    grid.insert_thumb(pick, img);
-                                    gallery_ctl.dirty = true;
-                                    loaded += 1;
-                                }
+                            if fetcher.try_spawn(FetchJob::Thumb {
+                                queue_idx: pick,
+                                plugin_idx: *pidx,
+                                meta: meta.clone(),
+                                cell_px: grid.cell,
+                            }) {
+                                grid.mark_thumb_pending(pick);
+                                spawned += 1;
                             }
                         }
                     }
@@ -1141,31 +1148,23 @@ impl Slideshow {
             // Recovery: if the ring is empty (failed fetches, just opened with
             // a bad photo, etc.) try to refill before the advance path.
             if prefetched.is_empty() && !queue.is_empty() {
-                if queue_loader.near_end(current_queue_idx, queue.len()) {
-                    self.try_extend_queue(
-                        &mut queue,
-                        &mut queue_ids,
-                        &mut queue_loader,
-                        current_queue_idx,
-                        &remote_status,
-                    )
-                    .await;
-                }
-                for _ in 0..prefetch_n {
-                    self.prefetch_one(
-                        &queue,
-                        &mut cursor,
-                        &mut prefetched,
-                        prefetch_n,
-                        renderer,
-                        no_repeat_shown,
-                        &shown_ids,
-                    )
-                    .await;
-                    if !prefetched.is_empty() {
-                        break;
-                    }
-                }
+                self.request_extend(
+                    &mut queue_io,
+                    &queue_loader,
+                    &queue_ids,
+                    false,
+                    current_queue_idx,
+                    queue.len(),
+                );
+                Self::pump_slide_fetches(
+                    &mut fetcher,
+                    &queue,
+                    &mut cursor,
+                    &prefetched,
+                    prefetch_n,
+                    no_repeat_shown,
+                    &shown_ids,
+                );
             }
 
             // ── Display schedule ───────────────────────────────────────────
@@ -1253,26 +1252,29 @@ impl Slideshow {
             }
 
             if last_advance.elapsed() < current_slide_dur {
-                if queue_loader.near_end(cursor, queue.len()) {
-                    self.try_extend_queue(&mut queue, &mut queue_ids, &mut queue_loader, cursor, &remote_status)
-                        .await;
-                }
-                self.prefetch_one(
+                self.request_extend(
+                    &mut queue_io,
+                    &queue_loader,
+                    &queue_ids,
+                    false,
+                    cursor,
+                    queue.len(),
+                );
+                Self::pump_slide_fetches(
+                    &mut fetcher,
                     &queue,
                     &mut cursor,
-                    &mut prefetched,
+                    &prefetched,
                     prefetch_n,
-                    renderer,
                     no_repeat_shown,
                     &shown_ids,
-                )
-                .await;
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
 
             // ── Display next photo ────────────────────────────────────────
-            // The image is already decoded and scaled (done in prefetch_one),
+            // The image is already decoded and scaled (done in the fetcher),
             // so all that's left are the cheap per-slide pixel passes and the
             // transition itself.
             if let Some((q_idx, meta, mut rgba, exif_date)) = prefetched.pop_front() {
@@ -1387,77 +1389,34 @@ impl Slideshow {
             // Top up again straight after the advance so a zero/short slide
             // duration (which never enters the idle branch above) still keeps
             // the buffer fed.
-            self.prefetch_one(
+            Self::pump_slide_fetches(
+                &mut fetcher,
                 &queue,
                 &mut cursor,
-                &mut prefetched,
+                &prefetched,
                 prefetch_n,
-                renderer,
                 no_repeat_shown,
                 &shown_ids,
-            )
-            .await;
+            );
         }
     }
 
-    /// Fetch *and decode* the next queued photo into the prefetch ring if
-    /// there's room.
-    ///
-    /// No-op when the buffer is already at `prefetch_n` (just the length
-    /// check — cheap to call every idle tick) or the queue is empty. `cursor`
-    /// is a read-ahead pointer that wraps around the queue, so the ring keeps
-    /// reading forward forever without ever exceeding `prefetch_n` entries.
-    ///
-    /// The cursor is advanced before the (slow) fetch+decode so a photo that
-    /// fails to download or decode is simply dropped — it never wedges the
-    /// ring, and the next tick moves on to the following photo.
-    /// Fetch + decode a specific queue index into the front of the prefetch
-    /// ring. Used when opening a photo from the gallery so the clicked photo
-    /// is what appears — not a neighbour that happened to decode first.
-    async fn load_photo_into_prefetch(
-        &mut self,
-        queue: &[(usize, PhotoMeta)],
-        idx: usize,
-        prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
-        renderer: &Renderer,
-    ) {
-        if idx >= queue.len() {
-            return;
-        }
-        let (pidx, meta) = &queue[idx];
-        let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
-            return;
-        };
-        // Decode off the async runtime — a full-res decode is CPU-heavy and
-        // would otherwise stall events, the HTTP remote, and gallery loading
-        // on the single-threaded executor.
-        let processor = renderer.image_processor();
-        match tokio::task::spawn_blocking(move || processor.decode_and_scale(&bytes)).await {
-            Ok(Ok((rgba, exif_date))) => {
-                prefetched.push_front((idx, meta.clone(), rgba, exif_date));
-            }
-            Ok(Err(e)) => warn!("Decode error ({}): {}", meta.filename, e),
-            Err(e) => warn!("Decode task failed ({}): {}", meta.filename, e),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)] // prefetch-ring state fan-out; a struct would only add ceremony
-    async fn prefetch_one(
-        &mut self,
+    fn pump_slide_fetches(
+        fetcher: &mut Fetcher,
         queue: &[(usize, PhotoMeta)],
         cursor: &mut usize,
-        prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
+        prefetched: &VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
         prefetch_n: usize,
-        renderer: &Renderer,
         no_repeat: bool,
         shown_ids: &[HashSet<String>],
     ) {
-        if prefetched.len() >= prefetch_n || queue.is_empty() {
+        if queue.is_empty() || prefetched.len() >= prefetch_n {
             return;
         }
         let start = *cursor;
         let mut attempts = 0usize;
         while prefetched.len() < prefetch_n
+            && fetcher.has_capacity()
             && attempts < queue.len().min(MAX_PREFETCH_ATTEMPTS_PER_TICK)
         {
             let idx = *cursor;
@@ -1467,83 +1426,106 @@ impl Slideshow {
                 *cursor = 0;
             }
             attempts += 1;
-
             if no_repeat && shown_ids[*pidx].contains(meta.id.as_str()) {
                 continue;
             }
-
-            let Some(bytes) = self.fetch_photo(*pidx, meta, renderer).await else {
+            if prefetched.iter().any(|(i, _, _, _)| *i == idx) {
                 if *cursor == start {
                     break;
                 }
                 continue;
-            };
-            // Decode on a blocking thread (see load_photo_into_prefetch).
-            let processor = renderer.image_processor();
-            let decode_start = Instant::now();
-            match tokio::task::spawn_blocking(move || processor.decode_and_scale(&bytes)).await {
-                Ok(Ok((rgba, exif_date))) => {
-                    debug!("Decoded {} in {:?}", meta.filename, decode_start.elapsed());
-                    prefetched.push_back((idx, meta.clone(), rgba, exif_date));
-                    return;
-                }
-                Ok(Err(e)) => warn!("Decode error ({}): {}", meta.filename, e),
-                Err(e) => warn!("Decode task failed ({}): {}", meta.filename, e),
             }
+            let _ = fetcher.try_spawn(FetchJob::Slide {
+                queue_idx: idx,
+                plugin_idx: *pidx,
+                meta: meta.clone(),
+                priority: false,
+            });
             if *cursor == start {
                 break;
             }
         }
     }
 
-    // ── Favourites ──────────────────────────────────────────────────────────
-
-    /// Toggle the favourite state of the on-screen photo via its source plugin.
-    ///
-    /// On success the local metadata and the remote status are updated so the
-    /// next render shows the ♥ and the phone remote reflects the change. The
-    /// on-disk image already displayed is not re-rendered — the indicator
-    /// appears when the photo next comes around. Plugins that don't support
-    /// favourites return an error, which is logged and otherwise ignored.
-    async fn toggle_favorite(
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fetch_result(
         &self,
-        current_meta: &mut Option<(usize, PhotoMeta)>,
-        remote_status: &Option<SharedStatus>,
+        done: FetchDone,
+        prefetched: &mut VecDeque<(usize, PhotoMeta, RgbaImage, Option<String>)>,
+        gallery_ctl: &mut GalleryController,
+        fullscreen_ctl: &mut FullscreenController,
+        mode: &mut Mode,
+        current_queue_idx: &mut usize,
+        cursor: &mut usize,
+        open_cut_once: &mut bool,
+        last_advance: &mut Instant,
+        paused: &mut bool,
+        slide_dur: Duration,
+        queue: &[(usize, PhotoMeta)],
     ) {
-        let Some((plugin_idx, meta)) = current_meta.as_mut() else {
-            debug!("Favourite toggle ignored — no photo on screen yet");
-            return;
-        };
-        // Skip sources that don't advertise a per-photo favourite toggle —
-        // calling set_favorite would just hit the trait's "unsupported" default
-        // and log a misleading failure warning for e.g. directory / WebDAV.
-        if !self.plugins[*plugin_idx].capabilities().favorite_toggle {
-            debug!(
-                "Favourite toggle ignored — source '{}' has no favourite support",
-                self.plugins[*plugin_idx].name()
-            );
-            return;
-        }
-        let currently = meta.is_favorite;
-        let target = !currently;
-
-        match self.plugins[*plugin_idx].set_favorite(&*meta, target).await {
-            Ok(()) => {
-                meta.is_favorite = target;
-                info!(
-                    "{} photo: {}",
-                    if target {
-                        "Favourited"
-                    } else {
-                        "Un-favourited"
-                    },
-                    meta.filename
-                );
-                if let Some(status) = &remote_status {
-                    status.lock().await.favorite = target;
+        match done {
+            FetchDone::Slide {
+                queue_idx,
+                meta,
+                priority,
+                rgba,
+                exif_date,
+                ..
+            } => {
+                if fullscreen_ctl.awaiting_open == Some(queue_idx) {
+                    prefetched.push_front((queue_idx, meta, rgba, exif_date));
+                    *mode = Mode::Fullscreen;
+                    *paused = false;
+                    fullscreen_ctl.awaiting_open = None;
+                    *current_queue_idx = queue_idx;
+                    if !queue.is_empty() {
+                        *cursor = (queue_idx + 1) % queue.len();
+                    }
+                    *open_cut_once = true;
+                    *last_advance = Instant::now()
+                        .checked_sub(slide_dur)
+                        .unwrap_or_else(Instant::now);
+                    info!("Opened slideshow at photo {}.", queue_idx + 1);
+                } else if priority {
+                    prefetched.push_front((queue_idx, meta, rgba, exif_date));
+                } else {
+                    prefetched.push_back((queue_idx, meta, rgba, exif_date));
                 }
             }
-            Err(e) => warn!("Favourite toggle failed: {e}"),
+            FetchDone::Thumb {
+                queue_idx, rgba, ..
+            } => {
+                gallery_ctl.grid.insert_thumb(queue_idx, rgba);
+                gallery_ctl.dirty = true;
+            }
+            FetchDone::Failed {
+                queue_idx,
+                kind: JobKind::Slide,
+                reason,
+                ..
+            } => {
+                if fullscreen_ctl.awaiting_open == Some(queue_idx) {
+                    *mode = Mode::Gallery;
+                    gallery_ctl.enter();
+                    let name = queue
+                        .get(queue_idx)
+                        .map(|(_, m)| m.filename.as_str())
+                        .unwrap_or("?");
+                    warn!(
+                        "Could not open photo {} ({name}) ({reason:?}) — staying in gallery",
+                        queue_idx + 1
+                    );
+                    fullscreen_ctl.awaiting_open = None;
+                }
+            }
+            FetchDone::Failed {
+                queue_idx,
+                kind: JobKind::Thumb,
+                ..
+            } => {
+                gallery_ctl.grid.mark_thumb_failed(queue_idx);
+                gallery_ctl.dirty = true;
+            }
         }
     }
 
@@ -1589,12 +1571,6 @@ impl Slideshow {
             .iter()
             .map(|p| (p.name().to_string(), p.capabilities().targeting))
             .collect()
-    }
-
-    fn apply_targeting_now(&mut self) {
-        let adapters = self.targeting_adapters();
-        let refs: Vec<_> = adapters.iter().map(|(n, a)| (n.as_str(), *a)).collect();
-        self.config.apply_targeting(&refs);
     }
 
     /// Targeting section for the menu when any active plugin supports it.
@@ -1750,12 +1726,18 @@ impl Slideshow {
             }
             MenuAction::CycleOrder => {
                 self.config.display.order = next_order(&self.config.display.order);
-                match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
-                    Ok(q) => MenuOutcome::NewQueue(q),
-                    Err(e) => {
+                match pump_sdl_until(
+                    renderer,
+                    Self::build_queue_with(&self.plugins, &self.config.display, true),
+                )
+                .await
+                {
+                    Ok(Ok(q)) => MenuOutcome::NewQueue(q),
+                    Ok(Err(e)) => {
                         warn!("Re-order failed: {e}");
                         MenuOutcome::Stay
                     }
+                    Err(quit) => quit,
                 }
             }
             MenuAction::ToggleNoRepeatShown => {
@@ -1774,8 +1756,8 @@ impl Slideshow {
                     MenuOutcome::Stay
                 }
             }
-            MenuAction::CycleAlbum => self.cycle_album_target().await,
-            MenuAction::ToggleFavoritesFilter => self.toggle_favorites_target().await,
+            MenuAction::CycleAlbum => self.cycle_album_target(renderer).await,
+            MenuAction::ToggleFavoritesFilter => self.toggle_favorites_target(renderer).await,
             MenuAction::SwitchSource(idx) => self.switch_source(idx, renderer).await,
             // BeginEdit is intercepted by the caller (it needs the loop-local
             // menu state); reaching here means nothing to do.
@@ -1793,9 +1775,10 @@ impl Slideshow {
                 MenuOutcome::Stay
             }
             MenuAction::ApplyWifi => {
-                match crate::wifi::apply(&self.config.wifi).await {
-                    Ok(()) => info!("Wi-Fi: applied (SSID '{}')", self.config.wifi.ssid),
-                    Err(e) => warn!("Wi-Fi apply failed: {e}"),
+                match pump_sdl_until(renderer, crate::wifi::apply(&self.config.wifi)).await {
+                    Ok(Ok(())) => info!("Wi-Fi: applied (SSID '{}')", self.config.wifi.ssid),
+                    Ok(Err(e)) => warn!("Wi-Fi apply failed: {e}"),
+                    Err(quit) => return quit,
                 }
                 MenuOutcome::Stay
             }
@@ -1824,45 +1807,86 @@ impl Slideshow {
         }
     }
 
-    async fn reload_plugins_after_targeting(
+    async fn apply_trial_config(
         &mut self,
-        old_targeting: Option<crate::config::TargetingConfig>,
-    ) -> Result<()> {
-        let mut errors = Vec::new();
-        for plugin in &mut self.plugins {
-            let pcfg = self
-                .config
-                .plugin_config(plugin.name())
-                .cloned()
-                .unwrap_or_default();
-            if let Err(e) = plugin.init(&pcfg).await {
-                errors.push(format!("{} init error: {}", plugin.name(), e));
-                continue;
-            }
-            if let Err(e) = plugin.refresh_auth().await {
-                errors.push(format!("{} auth error: {}", plugin.name(), e));
-            }
+        mut trial: crate::config::Config,
+        renderer: &mut Renderer,
+    ) -> MenuOutcome {
+        let adapters = self.targeting_adapters();
+        let refs: Vec<_> = adapters.iter().map(|(n, a)| (n.as_str(), *a)).collect();
+        trial.apply_targeting(&refs);
+
+        let new_plugins = (self.factory)(&trial);
+        if new_plugins.is_empty() {
+            return MenuOutcome::Stay;
         }
-        if !errors.is_empty() {
-            if let Some(old) = old_targeting {
-                self.config.targeting = old;
-                self.apply_targeting_now();
-                for plugin in &mut self.plugins {
-                    let pcfg = self
-                        .config
-                        .plugin_config(plugin.name())
-                        .cloned()
-                        .unwrap_or_default();
-                    let _ = plugin.init(&pcfg).await;
-                    let _ = plugin.refresh_auth().await;
+
+        let mut ready =
+            match pump_sdl_until(renderer, init_plugins_stop_on_error(new_plugins, &trial)).await {
+                Ok(Some(ready)) => ready,
+                Ok(None) => return MenuOutcome::Stay,
+                Err(quit) => return quit,
+            };
+        for plugin in &mut ready {
+            match pump_sdl_until(
+                renderer,
+                tokio::time::timeout(AUTH_CALL_TIMEOUT, plugin.refresh_auth()),
+            )
+            .await
+            {
+                Err(quit) => {
+                    shutdown_boxed(&ready).await;
+                    return quit;
                 }
+                Ok(Err(_)) => {
+                    warn!(
+                        "{} auth timed out after {:?}",
+                        plugin.name(),
+                        AUTH_CALL_TIMEOUT
+                    );
+                    shutdown_boxed(&ready).await;
+                    return MenuOutcome::Stay;
+                }
+                Ok(Ok(Err(e))) => {
+                    warn!("{} auth error: {}", plugin.name(), e);
+                    shutdown_boxed(&ready).await;
+                    return MenuOutcome::Stay;
+                }
+                Ok(Ok(Ok(()))) => {}
             }
-            return Err(anyhow::anyhow!("targeting application failed: {}", errors.join(", ")));
         }
-        Ok(())
+        let shared = share_plugins(ready);
+        match pump_sdl_until(
+            renderer,
+            Self::build_queue_with(&shared, &trial.display, true),
+        )
+        .await
+        {
+            Err(quit) => {
+                shutdown_shared(&shared).await;
+                quit
+            }
+            Ok(Ok(queue)) if !queue.is_empty() => {
+                let old = std::mem::replace(&mut self.plugins, shared);
+                self.config = trial;
+                renderer.set_display_config(self.config.display.clone());
+                shutdown_shared(&old).await;
+                MenuOutcome::Switched(queue)
+            }
+            Ok(Ok(_)) => {
+                warn!("Targeting filter returned no photos");
+                shutdown_shared(&shared).await;
+                MenuOutcome::Stay
+            }
+            Ok(Err(e)) => {
+                warn!("Queue rebuild failed: {e}");
+                shutdown_shared(&shared).await;
+                MenuOutcome::Stay
+            }
+        }
     }
 
-    async fn cycle_album_target(&mut self) -> MenuOutcome {
+    async fn cycle_album_target(&mut self, renderer: &mut Renderer) -> MenuOutcome {
         let Some(plugin_idx) = self.plugins.iter().position(|p| {
             p.capabilities().targeting.supports_albums()
                 && self
@@ -1873,12 +1897,14 @@ impl Slideshow {
         }) else {
             return MenuOutcome::Stay;
         };
-        let albums = match self.plugins[plugin_idx].list_albums().await {
-            Ok(a) => a,
-            Err(e) => {
+        let plugin = Arc::clone(&self.plugins[plugin_idx]);
+        let albums = match pump_sdl_until(renderer, plugin.list_albums()).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 warn!("Album list failed: {e}");
                 return MenuOutcome::Stay;
             }
+            Err(quit) => return quit,
         };
         let mut options: Vec<Option<String>> = vec![None];
         options.extend(albums.into_iter().map(|(id, _)| Some(id)));
@@ -1892,30 +1918,16 @@ impl Slideshow {
             .position(|o| o.as_ref() == current.as_ref())
             .unwrap_or(0);
         let next = options[(pos + 1) % options.len()].clone();
-        let old_targeting = self.config.targeting.clone();
-        self.config.targeting.album = next.unwrap_or_default();
-        self.apply_targeting_now();
-        if let Err(e) = self.reload_plugins_after_targeting(Some(old_targeting)).await {
-            warn!("Reload after album change failed: {e}");
-            return MenuOutcome::Stay;
+        let mut trial = self.config.clone();
+        trial.targeting.album = next.unwrap_or_default();
+        let out = self.apply_trial_config(trial, renderer).await;
+        if matches!(out, MenuOutcome::Switched(_)) {
+            info!("Album target: {}", self.config.targeting.album_label());
         }
-        match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
-            Ok(q) if !q.is_empty() => {
-                info!("Album target: {}", self.config.targeting.album_label());
-                MenuOutcome::NewQueue(q)
-            }
-            Ok(_) => {
-                warn!("Album filter returned no photos");
-                MenuOutcome::Stay
-            }
-            Err(e) => {
-                warn!("Queue rebuild failed: {e}");
-                MenuOutcome::Stay
-            }
-        }
+        out
     }
 
-    async fn toggle_favorites_target(&mut self) -> MenuOutcome {
+    async fn toggle_favorites_target(&mut self, renderer: &mut Renderer) -> MenuOutcome {
         if !self.plugins.iter().any(|p| {
             p.capabilities().targeting.supports_favorites_filter()
                 && self
@@ -1926,34 +1938,20 @@ impl Slideshow {
         }) {
             return MenuOutcome::Stay;
         }
-        let old_targeting = self.config.targeting.clone();
-        self.config.targeting.favorites_only = !self.config.targeting.favorites_only;
-        self.apply_targeting_now();
-        if let Err(e) = self.reload_plugins_after_targeting(Some(old_targeting)).await {
-            warn!("Reload after favourites toggle failed: {e}");
-            return MenuOutcome::Stay;
+        let mut trial = self.config.clone();
+        trial.targeting.favorites_only = !trial.targeting.favorites_only;
+        let out = self.apply_trial_config(trial, renderer).await;
+        if matches!(out, MenuOutcome::Switched(_)) {
+            info!(
+                "Favourites-only {}",
+                if self.config.targeting.favorites_only {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         }
-        match Self::build_queue_with(&self.plugins, &self.config.display, true).await {
-            Ok(q) if !q.is_empty() => {
-                info!(
-                    "Favourites-only {}",
-                    if self.config.targeting.favorites_only {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                MenuOutcome::NewQueue(q)
-            }
-            Ok(_) => {
-                warn!("Favourites filter returned no photos");
-                MenuOutcome::Stay
-            }
-            Err(e) => {
-                warn!("Queue rebuild failed: {e}");
-                MenuOutcome::Stay
-            }
-        }
+        out
     }
 
     /// Switch the active photo source to `config.plugins[idx]`, end to end:
@@ -1965,63 +1963,90 @@ impl Slideshow {
         if idx >= self.config.plugins.len() {
             return MenuOutcome::Stay;
         }
-        // Trial config: enable only the chosen source (immutable update — the
-        // live config is untouched until the switch fully succeeds).
         let mut trial = self.config.clone();
         for (i, p) in trial.plugins.iter_mut().enumerate() {
             p.enabled = i == idx;
         }
         let name = trial.plugins[idx].name.clone();
 
-        let mut new_plugins = (self.factory)(&trial);
+        let new_plugins = (self.factory)(&trial);
         if new_plugins.is_empty() {
             warn!("Cannot switch to '{name}': not compiled into this build");
             return MenuOutcome::Stay;
         }
 
-        for plugin in &mut new_plugins {
-            let pcfg = trial
-                .plugin_config(plugin.name())
-                .cloned()
-                .unwrap_or_default();
-            if let Err(e) = plugin.init(&pcfg).await {
-                warn!("Cannot switch to '{name}': init failed: {e}");
-                return MenuOutcome::Stay;
-            }
-            match plugin.authenticate().await {
-                Ok(AuthStatus::Authenticated) => {}
-                Ok(AuthStatus::NotAuthenticated) => {
+        let mut ready =
+            match pump_sdl_until(renderer, init_plugins_stop_on_error(new_plugins, &trial)).await {
+                Ok(Some(ready)) => ready,
+                Ok(None) => return MenuOutcome::Stay,
+                Err(quit) => return quit,
+            };
+        for plugin in &mut ready {
+            match pump_sdl_until(
+                renderer,
+                tokio::time::timeout(AUTH_CALL_TIMEOUT, plugin.authenticate()),
+            )
+            .await
+            {
+                Err(quit) => {
+                    shutdown_boxed(&ready).await;
+                    return quit;
+                }
+                Ok(Ok(Ok(AuthStatus::Authenticated))) => {}
+                Ok(Ok(Ok(AuthStatus::NotAuthenticated))) => {
                     warn!("Cannot switch to '{name}': not authenticated");
+                    shutdown_boxed(&ready).await;
                     return MenuOutcome::Stay;
                 }
-                Ok(AuthStatus::PendingUserAction { .. }) => {
+                Ok(Ok(Ok(AuthStatus::PendingUserAction { .. }))) => {
                     warn!(
-                        "Cannot switch to '{name}': needs interactive setup — \
-                         configure it and restart"
+                        "Cannot switch to '{name}': needs interactive setup — configure it and restart"
                     );
+                    shutdown_boxed(&ready).await;
                     return MenuOutcome::Stay;
                 }
-                Err(e) => {
+                Ok(Ok(Err(e))) => {
                     warn!("Cannot switch to '{name}': auth error: {e}");
+                    shutdown_boxed(&ready).await;
+                    return MenuOutcome::Stay;
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        "Cannot switch to '{name}': authenticate timed out after {:?}",
+                        AUTH_CALL_TIMEOUT
+                    );
+                    shutdown_boxed(&ready).await;
                     return MenuOutcome::Stay;
                 }
             }
         }
-
-        match Self::build_queue_with(&new_plugins, &trial.display, true).await {
-            Ok(queue) if !queue.is_empty() => {
+        let shared = share_plugins(ready);
+        match pump_sdl_until(
+            renderer,
+            Self::build_queue_with(&shared, &trial.display, true),
+        )
+        .await
+        {
+            Err(quit) => {
+                shutdown_shared(&shared).await;
+                quit
+            }
+            Ok(Ok(queue)) if !queue.is_empty() => {
                 info!("Switched source to '{name}' ({} photos)", queue.len());
+                let old = std::mem::replace(&mut self.plugins, shared);
                 self.config = trial;
-                self.plugins = new_plugins;
                 renderer.set_display_config(self.config.display.clone());
+                shutdown_shared(&old).await;
                 MenuOutcome::Switched(queue)
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 warn!("Cannot switch to '{name}': source returned no photos");
+                shutdown_shared(&shared).await;
                 MenuOutcome::Stay
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Cannot switch to '{name}': listing failed: {e}");
+                shutdown_shared(&shared).await;
                 MenuOutcome::Stay
             }
         }
@@ -2033,7 +2058,7 @@ impl Slideshow {
     /// explanatory comments: the settings survive, the prose does not.
     fn save_config(&self) -> Result<()> {
         let mut to_write = self.config.clone();
-        to_write.redact_file_backed_secrets();
+        to_write.redact_secrets_for_persistence();
         let text = toml::to_string_pretty(&to_write).context("serialising config to TOML")?;
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -2044,78 +2069,6 @@ impl Slideshow {
             .with_context(|| format!("writing config {}", self.config_path.display()))?;
         Config::restrict_private_permissions(&self.config_path);
         Ok(())
-    }
-
-    // ── Fetching ──────────────────────────────────────────────────────────
-
-    async fn fetch_photo_thumb(
-        &mut self,
-        plugin_idx: usize,
-        meta: &PhotoMeta,
-        thumb_px: u32,
-        _renderer: &Renderer,
-    ) -> Option<Vec<u8>> {
-        let plugin_name = self.plugins.get(plugin_idx)?.name().to_owned();
-        let cache_key = format!("{plugin_name}/thumb/{}", meta.id);
-
-        if let Some(bytes) = self.cache.lock().await.get(&cache_key).await {
-            return Some(bytes);
-        }
-
-        let fetch = self
-            .plugins
-            .get_mut(plugin_idx)?
-            .get_photo_bytes(meta, thumb_px, thumb_px);
-        match tokio::time::timeout(Duration::from_secs(30), fetch).await {
-            Ok(Ok(bytes)) => {
-                let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
-                Some(bytes)
-            }
-            Ok(Err(e)) => {
-                warn!("fetch_photo_thumb {} error: {}", meta.filename, e);
-                None
-            }
-            Err(_) => {
-                warn!("fetch_photo_thumb {} timed out after 30 s", meta.filename);
-                None
-            }
-        }
-    }
-
-    async fn fetch_photo(
-        &mut self,
-        plugin_idx: usize,
-        meta: &PhotoMeta,
-        renderer: &Renderer,
-    ) -> Option<Vec<u8>> {
-        let plugin_name = self.plugins.get(plugin_idx)?.name().to_owned();
-        let cache_key = meta.cache_key(&plugin_name);
-
-        // Check disk cache first.
-        if let Some(bytes) = self.cache.lock().await.get(&cache_key).await {
-            return Some(bytes);
-        }
-
-        // Fetch from remote — 30 s timeout prevents a hung plugin from stalling the slideshow.
-        let fetch = self.plugins.get_mut(plugin_idx)?.get_photo_bytes(
-            meta,
-            renderer.width(),
-            renderer.height(),
-        );
-        match tokio::time::timeout(Duration::from_secs(30), fetch).await {
-            Ok(Ok(bytes)) => {
-                let _ = self.cache.lock().await.put(&cache_key, &bytes).await;
-                Some(bytes)
-            }
-            Ok(Err(e)) => {
-                warn!("fetch_photo {} error: {}", meta.filename, e);
-                None
-            }
-            Err(_) => {
-                warn!("fetch_photo {} timed out after 30 s", meta.filename);
-                None
-            }
-        }
     }
 }
 
@@ -2182,18 +2135,6 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-/// Keep only `(plugin_idx, id)` pairs not already recorded in `seen`.
-/// Inserts kept keys into `seen` so callers can chain multiple batches.
-fn filter_unseen_photos(
-    batch: Vec<(usize, PhotoMeta)>,
-    seen: &mut HashSet<(usize, String)>,
-) -> Vec<(usize, PhotoMeta)> {
-    batch
-        .into_iter()
-        .filter(|(pi, m)| seen.insert((*pi, m.id.clone())))
-        .collect()
-}
-
 // ── Fisher-Yates shuffle (no_std-safe, no rand dep) ──────────────────────────
 
 fn shuffle<T>(v: &mut [T], seed: u64) {
@@ -2208,13 +2149,6 @@ fn shuffle<T>(v: &mut [T], seed: u64) {
 }
 
 // ── Queue ordering helpers ────────────────────────────────────────────────────
-
-fn shuffle_seed_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(42)
-}
 
 fn apply_order(queue: &mut Vec<(usize, PhotoMeta)>, display: &DisplayConfig, seed: u64) {
     match display.order {
@@ -2369,6 +2303,317 @@ fn read_cpu_temp() -> Option<f32> {
     None
 }
 
+fn share_plugins(plugins: Vec<BoxedPlugin>) -> Vec<SharedPlugin> {
+    plugins.into_iter().map(Arc::from).collect()
+}
+
+async fn shutdown_plugin(plugin: &dyn PhotoPlugin) {
+    if let Err(e) = plugin.shutdown().await {
+        warn!("{} shutdown failed: {e}", plugin.name());
+    }
+}
+
+async fn shutdown_shared(plugins: &[SharedPlugin]) {
+    for plugin in plugins {
+        shutdown_plugin(plugin.as_ref()).await;
+    }
+}
+
+async fn shutdown_boxed(plugins: &[BoxedPlugin]) {
+    for plugin in plugins {
+        shutdown_plugin(plugin.as_ref()).await;
+    }
+}
+
+/// Init plugins one-by-one. On failure, shut down only plugins that reached
+/// `init` (including the failing one) and leave the never-inited tail alone.
+pub(crate) async fn init_plugins_stop_on_error(
+    new_plugins: Vec<BoxedPlugin>,
+    trial: &Config,
+) -> Option<Vec<BoxedPlugin>> {
+    let mut ready = Vec::new();
+    for mut plugin in new_plugins {
+        let name = plugin.name().to_string();
+        let pcfg = trial.plugin_config(&name).cloned().unwrap_or_default();
+        match plugin.init(&pcfg).await {
+            Ok(()) => ready.push(plugin),
+            Err(e) => {
+                warn!("{name} init error: {e}");
+                shutdown_plugin(plugin.as_ref()).await;
+                shutdown_boxed(&ready).await;
+                return None;
+            }
+        }
+    }
+    Some(ready)
+}
+
+fn draw_sign_in_osd(
+    renderer: &mut Renderer,
+    display_name: &str,
+    message: &str,
+    remaining: Option<u64>,
+) {
+    let tc = renderer.texture_creator();
+    let mut frame = RgbaImage::from_pixel(
+        renderer.width().max(1),
+        renderer.height().max(1),
+        Rgba([0, 0, 0, 255]),
+    );
+    let wait = match remaining {
+        Some(secs) => format!("Waiting… {secs}s left"),
+        None => "Waiting…".to_string(),
+    };
+    let mut labels: Vec<String> = vec![display_name.to_string()];
+    labels.extend(message.lines().map(str::to_string));
+    labels.push(wait);
+    let rows: Vec<crate::osd::MenuItem> = labels
+        .iter()
+        .map(|l| crate::osd::MenuItem {
+            label: l,
+            is_header: true,
+        })
+        .collect();
+    crate::osd::draw_menu(
+        &mut frame,
+        "PicoGallery — sign-in required",
+        &rows,
+        usize::MAX,
+    );
+    if let Err(e) = renderer.show_cut(&frame, &tc) {
+        warn!("sign-in OSD: {e}");
+    }
+}
+
+fn draw_stall_osd(
+    renderer: &mut Renderer,
+    tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+) {
+    let mut frame = RgbaImage::from_pixel(
+        renderer.width().max(1),
+        renderer.height().max(1),
+        Rgba([0, 0, 0, 255]),
+    );
+    let labels = [
+        "Prefetch stalled".to_string(),
+        "Retrying photo sources…".to_string(),
+    ];
+    let rows: Vec<crate::osd::MenuItem> = labels
+        .iter()
+        .map(|l| crate::osd::MenuItem {
+            label: l,
+            is_header: true,
+        })
+        .collect();
+    crate::osd::draw_menu(&mut frame, "PicoGallery", &rows, usize::MAX);
+    if let Err(e) = renderer.show_cut(&frame, tc) {
+        warn!("stall OSD: {e}");
+    }
+}
+
+enum AuthCall {
+    Authenticated,
+    Skip,
+    Pending {
+        message: String,
+        poll_interval_secs: u64,
+    },
+}
+
+/// One `authenticate()` attempt with the exclusive-call timeout. Caller must
+/// hold the only `Arc` strong reference (`Arc::get_mut`).
+async fn auth_call_once(
+    plugin: &mut dyn PhotoPlugin,
+    display_name: &str,
+    auth_call_timeout: Duration,
+) -> AuthCall {
+    match tokio::time::timeout(auth_call_timeout, plugin.authenticate()).await {
+        Err(_) => {
+            warn!(
+                "  {display_name} authenticate timed out after {:?} — source disabled",
+                auth_call_timeout
+            );
+            shutdown_plugin(plugin).await;
+            AuthCall::Skip
+        }
+        Ok(Err(e)) => {
+            warn!("  {display_name} authentication failed: {e:#}");
+            shutdown_plugin(plugin).await;
+            AuthCall::Skip
+        }
+        Ok(Ok(AuthStatus::Authenticated)) => {
+            info!("  {display_name} authenticated.");
+            AuthCall::Authenticated
+        }
+        Ok(Ok(AuthStatus::NotAuthenticated)) => {
+            warn!("  {display_name} is not authenticated; source disabled.");
+            shutdown_plugin(plugin).await;
+            AuthCall::Skip
+        }
+        Ok(Ok(AuthStatus::PendingUserAction {
+            message,
+            poll_interval_secs,
+        })) => AuthCall::Pending {
+            message,
+            poll_interval_secs,
+        },
+    }
+}
+
+/// Sleep until the next pending-auth poll, driving OSD via `on_pending`.
+/// Returns `Ok(true)` if the user quit.
+async fn wait_pending_poll(
+    display_name: &str,
+    message: &str,
+    poll_interval_secs: u64,
+    pending_start: Instant,
+    pending_timeout: Duration,
+    on_pending: &mut impl FnMut(&str, &str, Option<u64>) -> bool,
+) -> Result<bool> {
+    println!("\n=== {display_name} ===\n{message}");
+    println!(
+        "Checking again in {} seconds…",
+        poll_interval_secs.clamp(1, 60)
+    );
+    let deadline = if pending_timeout.is_zero() {
+        None
+    } else {
+        Some(pending_start + pending_timeout)
+    };
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Ok(false);
+    }
+    let sleep_cap = Duration::from_secs(poll_interval_secs.clamp(1, 60));
+    let sleep_until = Instant::now() + sleep_cap;
+    loop {
+        let now = Instant::now();
+        let remaining = deadline.map(|d| d.saturating_duration_since(now).as_secs());
+        if on_pending(display_name, message, remaining) {
+            return Ok(true);
+        }
+        if deadline.is_some_and(|d| now >= d) || now >= sleep_until {
+            return Ok(false);
+        }
+        let mut slice = Duration::from_millis(50);
+        if let Some(d) = deadline {
+            slice = slice.min(d.saturating_duration_since(Instant::now()));
+        }
+        slice = slice.min(sleep_until.saturating_duration_since(Instant::now()));
+        if slice.is_zero() {
+            return Ok(false);
+        }
+        tokio::time::sleep(slice).await;
+    }
+}
+
+/// Authenticate a plugin set. `on_pending` is called while waiting for a
+/// device-code / user action; return `true` to abort (Quit).
+///
+/// Two-pass: every plugin gets one `authenticate()` call first so a healthy
+/// source is kept even when another plugin burns the pending-user-action
+/// budget. Only then do we poll the pending set.
+pub(crate) async fn authenticate_plugin_set(
+    plugins: Vec<SharedPlugin>,
+    auth_call_timeout: Duration,
+    pending_timeout: Duration,
+    mut on_pending: impl FnMut(&str, &str, Option<u64>) -> bool,
+) -> Result<Vec<SharedPlugin>> {
+    let mut authenticated = Vec::with_capacity(plugins.len());
+    // (plugin, display_name, message, poll_interval_secs, pending_start)
+    let mut pending: Vec<(SharedPlugin, String, String, u64, Instant)> = Vec::new();
+
+    // ── Pass 1: one authenticate() per plugin ─────────────────────────────
+    for mut arc in plugins {
+        let display_name = arc.display_name().to_string();
+        info!("Authenticating plugin: {display_name}");
+        let Some(plugin) = Arc::get_mut(&mut arc) else {
+            warn!("  {display_name} is already shared; cannot authenticate — source disabled");
+            shutdown_plugin(arc.as_ref()).await;
+            continue;
+        };
+        match auth_call_once(plugin, &display_name, auth_call_timeout).await {
+            AuthCall::Authenticated => authenticated.push(arc),
+            AuthCall::Skip => {}
+            AuthCall::Pending {
+                message,
+                poll_interval_secs,
+            } => {
+                pending.push((
+                    arc,
+                    display_name,
+                    message,
+                    poll_interval_secs,
+                    Instant::now(),
+                ));
+            }
+        }
+    }
+
+    // ── Pass 2: poll only plugins that need user action ───────────────────
+    for (mut arc, display_name, mut message, mut poll_interval_secs, pending_start) in pending {
+        let mut kept = false;
+        loop {
+            let deadline = if pending_timeout.is_zero() {
+                None
+            } else {
+                Some(pending_start + pending_timeout)
+            };
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                warn!("  {display_name} pending user action exceeded timeout — source disabled");
+                shutdown_plugin(arc.as_ref()).await;
+                break;
+            }
+            let quit = wait_pending_poll(
+                &display_name,
+                &message,
+                poll_interval_secs,
+                pending_start,
+                pending_timeout,
+                &mut on_pending,
+            )
+            .await?;
+            if quit {
+                shutdown_plugin(arc.as_ref()).await;
+                shutdown_shared(&authenticated).await;
+                anyhow::bail!("quit during sign-in");
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                warn!("  {display_name} pending user action exceeded timeout — source disabled");
+                shutdown_plugin(arc.as_ref()).await;
+                break;
+            }
+
+            let Some(plugin) = Arc::get_mut(&mut arc) else {
+                warn!("  {display_name} is already shared; cannot authenticate — source disabled");
+                shutdown_plugin(arc.as_ref()).await;
+                break;
+            };
+            match auth_call_once(plugin, &display_name, auth_call_timeout).await {
+                AuthCall::Authenticated => {
+                    kept = true;
+                    break;
+                }
+                AuthCall::Skip => break,
+                AuthCall::Pending {
+                    message: next_msg,
+                    poll_interval_secs: next_poll,
+                } => {
+                    message = next_msg;
+                    poll_interval_secs = next_poll;
+                }
+            }
+        }
+        if kept {
+            authenticated.push(arc);
+        }
+    }
+
+    if authenticated.is_empty() {
+        anyhow::bail!("No providers authenticated successfully")
+    }
+    Ok(authenticated)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2491,5 +2736,512 @@ mod tests {
         let ids: Vec<_> = fresh.iter().map(|(pi, m)| (*pi, m.id.as_str())).collect();
         assert_eq!(ids, vec![(0, "b"), (1, "a")]);
         assert!(seen.contains(&(0, "b".into())));
+    }
+
+    #[test]
+    fn test_queue_loader_mark_fully_loaded() {
+        let mut loader = QueueLoader::new(3);
+        assert!(!loader.all_exhausted());
+
+        loader.mark_fully_loaded();
+        assert!(loader.all_exhausted());
+        assert!(loader.plugin_exhausted[0]);
+        assert!(loader.plugin_exhausted[1]);
+        assert!(loader.plugin_exhausted[2]);
+    }
+
+    #[test]
+    fn test_read_cpu_temp() {
+        // Just verify it compiles and doesn't panic on the current platform
+        let _temp = read_cpu_temp();
+    }
+
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dummy_meta() -> PhotoMeta {
+        PhotoMeta {
+            id: "p1".into(),
+            filename: "p1.jpg".into(),
+            width: 10,
+            height: 10,
+            taken_at: None,
+            download_url: None,
+            album: None,
+            title: None,
+            location: None,
+            is_favorite: false,
+            extra: Default::default(),
+        }
+    }
+
+    struct AuthSpy {
+        name: &'static str,
+        kind: AuthKind,
+        shutdowns: Arc<AtomicUsize>,
+        /// Optional log of Instant at each authenticate() entry (ordering tests).
+        auth_calls: Option<Arc<std::sync::Mutex<Vec<Instant>>>>,
+    }
+
+    enum AuthKind {
+        Pending,
+        Slow,
+        Ok,
+        FailInit,
+    }
+
+    impl AuthSpy {
+        fn new(name: &'static str, kind: AuthKind, shutdowns: Arc<AtomicUsize>) -> Self {
+            Self {
+                name,
+                kind,
+                shutdowns,
+                auth_calls: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PhotoPlugin for AuthSpy {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn init(&mut self, _config: &picogallery_core::PluginConfig) -> Result<()> {
+            if matches!(self.kind, AuthKind::FailInit) {
+                anyhow::bail!("init failed");
+            }
+            Ok(())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::Authenticated
+        }
+        async fn authenticate(&mut self) -> Result<AuthStatus> {
+            if let Some(log) = &self.auth_calls {
+                log.lock().unwrap().push(Instant::now());
+            }
+            match self.kind {
+                AuthKind::Pending => Ok(AuthStatus::PendingUserAction {
+                    message: "visit example".into(),
+                    poll_interval_secs: 1,
+                }),
+                AuthKind::Slow => {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(AuthStatus::Authenticated)
+                }
+                AuthKind::Ok | AuthKind::FailInit => Ok(AuthStatus::Authenticated),
+            }
+        }
+        async fn list_photos(&self, _limit: usize, _offset: usize) -> Result<Vec<PhotoMeta>> {
+            Ok(vec![dummy_meta()])
+        }
+        async fn get_photo_bytes(
+            &self,
+            _meta: &PhotoMeta,
+            _intent: picogallery_core::FetchIntent,
+        ) -> Result<Vec<u8>> {
+            Ok(vec![0xFF, 0xD8, 0xFF, 0xD9])
+        }
+        async fn shutdown(&self) -> Result<()> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn no_osd(_: &str, _: &str, _: Option<u64>) -> bool {
+        false
+    }
+
+    #[tokio::test]
+    async fn pending_user_action_gives_up_at_the_deadline() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let plugins = share_plugins(vec![Box::new(AuthSpy::new(
+            "pending",
+            AuthKind::Pending,
+            Arc::clone(&shutdowns),
+        ))]);
+        let run = authenticate_plugin_set(
+            plugins,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            no_osd,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("authenticate_plugin_set hung");
+        assert!(result.is_err(), "sole pending plugin must fail auth");
+        assert!(shutdowns.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn slow_authenticate_call_is_timed_out() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let plugins = share_plugins(vec![Box::new(AuthSpy::new(
+            "slow",
+            AuthKind::Slow,
+            Arc::clone(&shutdowns),
+        ))]);
+        let run = authenticate_plugin_set(
+            plugins,
+            Duration::from_millis(50),
+            Duration::from_secs(180),
+            no_osd,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("slow authenticate hung the suite");
+        assert!(result.is_err());
+        assert!(shutdowns.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn one_pending_plugin_does_not_block_a_healthy_one() {
+        let pending_sd = Arc::new(AtomicUsize::new(0));
+        let ok_sd = Arc::new(AtomicUsize::new(0));
+        let plugins = share_plugins(vec![
+            Box::new(AuthSpy::new(
+                "pending",
+                AuthKind::Pending,
+                Arc::clone(&pending_sd),
+            )),
+            Box::new(AuthSpy::new("healthy", AuthKind::Ok, Arc::clone(&ok_sd))),
+        ]);
+        let run = authenticate_plugin_set(
+            plugins,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            no_osd,
+        );
+        let kept = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("authenticate_plugin_set hung")
+            .expect("healthy plugin should keep the set alive");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name(), "healthy");
+        assert!(pending_sd.load(Ordering::SeqCst) >= 1);
+        assert_eq!(ok_sd.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn healthy_plugin_authenticated_before_pending_wait() {
+        // Pass 1 must finish B's authenticate before pass 2 sleeps on A.
+        let pending_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let healthy_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending_sd = Arc::new(AtomicUsize::new(0));
+        let ok_sd = Arc::new(AtomicUsize::new(0));
+        let mut pending_spy = AuthSpy::new("pending", AuthKind::Pending, Arc::clone(&pending_sd));
+        pending_spy.auth_calls = Some(Arc::clone(&pending_calls));
+        let mut healthy_spy = AuthSpy::new("healthy", AuthKind::Ok, Arc::clone(&ok_sd));
+        healthy_spy.auth_calls = Some(Arc::clone(&healthy_calls));
+        let plugins = share_plugins(vec![Box::new(pending_spy), Box::new(healthy_spy)]);
+        let _kept = authenticate_plugin_set(
+            plugins,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            no_osd,
+        )
+        .await
+        .expect("healthy plugin should keep the set alive");
+        let p = pending_calls.lock().unwrap().clone();
+        let h = healthy_calls.lock().unwrap().clone();
+        assert!(!h.is_empty(), "healthy authenticate must run");
+        assert!(!p.is_empty(), "pending authenticate must run");
+        // B's first authenticate completes in pass 1 before A's second call
+        // (which only happens after pass-2 pending sleep).
+        assert!(
+            h[0] < p
+                .get(1)
+                .copied()
+                .unwrap_or(Instant::now() + Duration::from_secs(60)),
+            "healthy first auth ({:?}) must precede pending's second call / end of wait",
+            h[0]
+        );
+        // Stronger: healthy finished before any pending re-poll.
+        if p.len() >= 2 {
+            assert!(
+                h[0] < p[1],
+                "healthy first auth must complete before pending's second authenticate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trial_config_shuts_down_only_initialized_plugins() {
+        let s0 = Arc::new(AtomicUsize::new(0));
+        let s1 = Arc::new(AtomicUsize::new(0));
+        let s2 = Arc::new(AtomicUsize::new(0));
+        let plugins: Vec<BoxedPlugin> = vec![
+            Box::new(AuthSpy::new("p0", AuthKind::Ok, Arc::clone(&s0))),
+            Box::new(AuthSpy::new("p1", AuthKind::FailInit, Arc::clone(&s1))),
+            Box::new(AuthSpy::new("p2", AuthKind::Ok, Arc::clone(&s2))),
+        ];
+        let result = init_plugins_stop_on_error(plugins, &Config::default()).await;
+        assert!(result.is_none());
+        assert_eq!(s0.load(Ordering::SeqCst), 1);
+        assert_eq!(s1.load(Ordering::SeqCst), 1);
+        assert_eq!(s2.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn slideshow_new_starts_with_unwritable_cache_dir() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "picogallery-ss-unwritable-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let as_file = tmp.join("not-a-dir");
+        std::fs::write(&as_file, b"x").unwrap();
+        let mut config = Config::default();
+        config.cache.dir = Some(as_file.join("cache"));
+        let slideshow = Slideshow::new(
+            config,
+            Vec::new(),
+            tmp.join("config.toml"),
+            Box::new(|_: &Config| Vec::new()),
+            DisplayEnv::default(),
+        )
+        .await
+        .expect("unwritable cache must not fail startup");
+        assert!(!slideshow.cache.is_enabled());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct MockFetchPlugin {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        pages: Arc<tokio::sync::Mutex<Vec<Result<Vec<PhotoMeta>>>>>,
+    }
+
+    #[async_trait]
+    impl PhotoPlugin for MockFetchPlugin {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn init(&mut self, _config: &picogallery_core::PluginConfig) -> Result<()> {
+            Ok(())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::Authenticated
+        }
+        async fn authenticate(&mut self) -> Result<AuthStatus> {
+            Ok(AuthStatus::Authenticated)
+        }
+        async fn list_photos(&self, _limit: usize, _offset: usize) -> Result<Vec<PhotoMeta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut pages = self.pages.lock().await;
+            if pages.is_empty() {
+                Ok(vec![])
+            } else {
+                pages.remove(0)
+            }
+        }
+        async fn get_photo_bytes(
+            &self,
+            _meta: &PhotoMeta,
+            _intent: picogallery_core::FetchIntent,
+        ) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_round_skips_exhausted_plugins() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(tokio::sync::Mutex::new(vec![Ok(vec![dummy_meta()])]));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+        let mut loader = QueueLoader::new(1);
+        loader.plugin_exhausted[0] = true;
+        let plugins: Vec<SharedPlugin> = vec![Arc::new(p)];
+        let batch = Slideshow::fetch_queue_round(&plugins, &mut loader).await;
+        assert!(batch.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_round_marks_exhausted_on_empty_page() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(tokio::sync::Mutex::new(vec![Ok(vec![])]));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+        let mut loader = QueueLoader::new(1);
+        let plugins: Vec<SharedPlugin> = vec![Arc::new(p)];
+        let batch = Slideshow::fetch_queue_round(&plugins, &mut loader).await;
+        assert!(batch.is_empty());
+        assert!(loader.plugin_exhausted[0]);
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_round_backs_off_on_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(tokio::sync::Mutex::new(vec![Err(anyhow::anyhow!(
+            "network error"
+        ))]));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+        let mut loader = QueueLoader::new(1);
+        let plugins: Vec<SharedPlugin> = vec![Arc::new(p)];
+
+        // First call errors out
+        let batch = Slideshow::fetch_queue_round(&plugins, &mut loader).await;
+        assert!(batch.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!loader.plugin_exhausted[0]);
+        assert!(loader.plugin_retryable_error[0]);
+        assert!(!loader.ready_to_retry(0));
+
+        // Immediate second call should be skipped due to backoff
+        let batch2 = Slideshow::fetch_queue_round(&plugins, &mut loader).await;
+        assert!(batch2.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Plugin should not be called while in backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_queue_round_fetches_until_max_photos() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut p_pages = vec![];
+        // 2000 photos per plugin is the max. PAGE_SIZE is 50.
+        // We'll simulate fetching 2000 items.
+        for _ in 0..41 {
+            p_pages.push(Ok(vec![dummy_meta(); 50]));
+        }
+        let pages = Arc::new(tokio::sync::Mutex::new(p_pages));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+        let mut loader = QueueLoader::new(1);
+        let plugins: Vec<SharedPlugin> = vec![Arc::new(p)];
+
+        for _ in 0..40 {
+            let batch = Slideshow::fetch_queue_round(&plugins, &mut loader).await;
+            assert_eq!(batch.len(), 50);
+        }
+
+        assert!(
+            loader.plugin_exhausted[0],
+            "Should be marked exhausted at 2000"
+        );
+    }
+    #[tokio::test]
+    async fn try_spawn_extend_merges_into_queue() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(tokio::sync::Mutex::new(vec![Ok(vec![dummy_meta()])]));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+
+        let config = Config::default();
+        let cache_dir = std::env::temp_dir().join("picogallery-cache-test");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache = crate::cache::CacheHandle::open_or_degrade(&cache_dir, 100).await;
+
+        let slideshow = Slideshow {
+            config,
+            plugins: vec![Arc::new(p)],
+            cache,
+            config_path: "dummy.toml".into(),
+            factory: Box::new(|_| vec![]),
+            display_env: DisplayEnv::default(),
+        };
+
+        let mut queue = Vec::new();
+        let mut queue_ids = HashSet::new();
+        let mut loader = QueueLoader::new(1);
+        let mut queue_io = QueueIo::new();
+
+        assert!(queue_io.try_spawn_extend(
+            slideshow.plugins.clone(),
+            loader.clone(),
+            queue_ids.clone(),
+            EXTEND_MAX_ROUNDS,
+            PAGE_SIZE,
+            MAX_PHOTOS_PER_PLUGIN,
+        ));
+
+        let mut done = None;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(r) = queue_io.drain_extend() {
+                done = Some(r);
+                break;
+            }
+        }
+        let done = done.expect("extend should complete");
+        let extended = slideshow
+            .apply_extend_result(done, &mut queue, &mut queue_ids, &mut loader, &None)
+            .await;
+        assert!(extended, "Should successfully extend the queue");
+        assert_eq!(queue.len(), 1);
+
+        // Exhausted loader: force request must not spawn.
+        assert!(loader.all_exhausted());
+        slideshow.request_extend(&mut queue_io, &loader, &queue_ids, true, 0, queue.len());
+        assert!(!queue_io.extend_in_flight());
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn try_spawn_extend_skips_when_not_near_end() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pages = Arc::new(tokio::sync::Mutex::new(vec![Ok(vec![dummy_meta()])]));
+        let p = MockFetchPlugin {
+            name: "test".into(),
+            calls: Arc::clone(&calls),
+            pages,
+        };
+
+        let config = Config::default();
+        let cache_dir = std::env::temp_dir().join("picogallery-cache-test-not-near-end");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache = crate::cache::CacheHandle::open_or_degrade(&cache_dir, 100).await;
+
+        let slideshow = Slideshow {
+            config,
+            plugins: vec![Arc::new(p)],
+            cache,
+            config_path: "dummy.toml".into(),
+            factory: Box::new(|_| vec![]),
+            display_env: DisplayEnv::default(),
+        };
+
+        let queue = vec![(0, dummy_meta()); 100];
+        let queue_ids = HashSet::new();
+        let loader = QueueLoader::new(1);
+        let mut queue_io = QueueIo::new();
+
+        slideshow.request_extend(&mut queue_io, &loader, &queue_ids, false, 0, queue.len());
+        assert!(
+            !queue_io.extend_in_flight(),
+            "Should not spawn extend when not near end"
+        );
+        assert_eq!(queue.len(), 100);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

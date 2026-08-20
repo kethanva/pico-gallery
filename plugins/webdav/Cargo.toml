@@ -17,3 +17,6 @@ tokio            = { workspace = true }
 reqwest          = { workspace = true }
 dirs             = { workspace = true }
 quick-xml        = "0.41"
+
+[dev-dependencies]
+wiremock = "0.6.5"

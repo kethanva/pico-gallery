@@ -3,11 +3,18 @@
 > Lightweight, plugin-based photo slideshow for Raspberry Pi — no desktop environment required.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
-![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20Zero%2F1%2F2%2F3%2F4-red)
+![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange)
+![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20Zero%202%20W%2F2%2F3%2F4%2F5-red)
 [![Build & Release](https://github.com/kethanva/pico-gallery/actions/workflows/release.yml/badge.svg)](https://github.com/kethanva/pico-gallery/actions/workflows/release.yml)
 
-Renders straight to the KMS/DRM framebuffer via SDL2. Runs on a Pi Zero W with ~8 MB RSS.
+Renders straight to the KMS/DRM framebuffer via SDL2. It is designed for a
+headless Raspberry Pi Zero 2 W and its tight CPU/RAM budget.
+
+This repo is the Rust appliance (`picogallery.service`,
+`/usr/local/bin/picogallery`, `~/.config/picogallery/config.toml`). It is
+not the Node `pico-gallery-photoprism` project (`picogallery-photoprism.service`,
+`/etc/picogallery/config.toml`) — do not install both on one Pi without
+resolving the name overlap.
 
 > **JPEG only.** The decoder is built with JPEG support alone — every source filters to `.jpg`/`.jpeg`, and videos are skipped. This keeps the binary and RAM footprint minimal on a Pi Zero. Non-JPEG files (PNG/WebP/GIF/HEIC) are ignored.
 
@@ -21,8 +28,16 @@ Renders straight to the KMS/DRM framebuffer via SDL2. Runs on a Pi Zero W with ~
 | `webdav` | Nextcloud, Synology, ownCloud — upload from phone | Network |
 | `photoprism` | Another Pi (4/5) running PhotoPrism — AI tagging, faces, albums | Network |
 | `google-photos` | Google Drive folder | rclone |
-| `amazon-photos` | Amazon Photos library | LWA developer app |
+| `amazon-photos` (opt-in) | Amazon Photos library | LWA developer app |
 | `local` | Multiple root paths | Nothing extra |
+| `usb` | USB sticks/drives auto-mounted on the Pi | Linux + udisks2 (or mount) |
+
+The normal Cargo build and pre-built release include `directory`, `local`,
+`usb`, `webdav`, `photoprism`, and `google-photos`. The installer's low-RAM
+source-build path intentionally compiles only `directory` unless you use
+`--mode all` or set `PICOGALLERY_FEATURES`. `amazon-photos` is deliberately
+opt-in; compile with `--features plugin-amazon-photos` before enabling that
+entry in the config.
 
 ---
 
@@ -100,7 +115,8 @@ password    = "your-app-password"     # use an app password, not your login
 remote_path = "/Photos"
 sync_dir    = "/tmp/picogallery-webdav"
 sync_interval_secs = 3600             # 0 = startup only
-# skip_tls_verify = true              # self-signed LAN cert
+# skip_tls_verify = true              # self-signed LAN cert (LAN only)
+# allowed_hosts = ["cloud.example.com"] # required when skip_tls_verify=true
 ```
 
 Upload from anywhere: Nextcloud mobile / web / desktop apps, Finder (`Go → Connect to Server`), Windows mapped network drive, or `rclone copy`.
@@ -109,7 +125,7 @@ Upload from anywhere: Nextcloud mobile / web / desktop apps, Finder (`Go → Con
 
 ## Plugin: `photoprism` (stream from a PhotoPrism server)
 
-Thin REST client for a [PhotoPrism](https://www.photoprism.app) server — typically a Pi 4/5 (or any always-on host) running PhotoPrism in Docker, with the Pi Zero as the display "client". No local sync and no SD-card writes: the plugin opens one session, lists photos via `GET /api/v1/photos`, and streams the smallest pre-generated thumbnail that still fills the display. RAM-cheap enough for a Pi Zero 2 W.
+Thin REST client for a [PhotoPrism](https://www.photoprism.app) server — typically a Pi 4/5 (or any always-on host) running PhotoPrism in Docker, with the Pi Zero 2 W as the display "client". It does not maintain a source-side sync directory: the plugin opens one session, lists photos via `GET /api/v1/photos`, and streams the smallest pre-generated thumbnail that still fills the display. The engine disk cache remains configurable and may write thumbnails locally. RAM-cheap enough for a Pi Zero 2 W.
 
 ```
 ┌─────────────────┐        LAN / HTTP         ┌──────────────────────┐
@@ -237,6 +253,7 @@ password = "CHANGE-ME"
 
 # ── Transport ──────────────────────────────────────────────────────────────
 # skip_tls_verify      = false           # true only for self-signed HTTPS on the LAN
+# allowed_hosts        = ["photoprism.local"] # required when skip_tls_verify=true
 # request_timeout_secs = 30
 ```
 
@@ -300,6 +317,13 @@ First run opens a browser sign-in (`drive.readonly` scope, no Google Cloud proje
 
 ## Plugin: `amazon-photos`
 
+This plugin is not in the stock build. Compile it explicitly, then enable the
+entry below:
+
+```bash
+cargo build --release --features plugin-amazon-photos
+```
+
 ```toml
 [[plugins]]
 name          = "amazon-photos"
@@ -309,6 +333,8 @@ client_secret = "YOUR_LWA_CLIENT_SECRET"
 ```
 
 Requires a Login with Amazon developer app — see developer.amazon.com.
+Keep the client secret out of the config file when possible; use the supported
+secret-file or `PICOGALLERY_AMAZON_PHOTOS_CLIENT_SECRET` override.
 
 ---
 
@@ -373,16 +399,25 @@ See `config.example.toml` for every key with inline comments.
 
 ## Remote control (optional)
 
-A built-in, dependency-free HTTP remote: a phone-friendly page with prev / pause / next / **favourite** buttons plus a JSON status endpoint. No authentication — only enable on a trusted LAN.
+A built-in, dependency-free HTTP remote: a phone-friendly page with prev /
+pause / next / **favourite** buttons plus a JSON status endpoint. A bearer
+token is mandatory whenever the remote is enabled. Bind it to a trusted LAN
+interface and keep the token file readable only by the service user.
 
 ```toml
 [remote]
 enabled = true
 port    = 8188
 bind    = "0.0.0.0"   # use "127.0.0.1" to restrict to local-only access
+token_file = "/etc/picogallery/remote.token"
 ```
 
-Open `http://<pi-ip>:8188/` from any phone on the LAN. The ♥ button favourites the current photo on sources that support it (e.g. `photoprism`). `GET /api/status` returns `{paused, index, total, filename, album, favorite}`.
+Create a random token (at least 16 characters), store it in the configured
+file with mode `0600`, and make the file readable by the account running the
+service. Open `http://<pi-ip>:8188/#<token>` from a phone on the LAN. The ♥
+button favourites the current photo on sources that support it (e.g.
+`photoprism`). `GET /api/status` returns
+`{paused, index, total, filename, album, favorite}`.
 
 ### HDMI CEC remote (Linux)
 
@@ -403,7 +438,7 @@ Mapped keys: left/right or channel +/- for prev/next, play/pause for pause toggl
 
 | Device | Notes |
 |---|---|
-| Pi Zero W / 2W | Tested; `--jobs 1` when cross-compiling |
+| Pi Zero 2 W | Primary target; use `--jobs 1` when cross-compiling |
 | Pi 2/3/4/5 | Full speed |
 
 **Required:** display connected before boot (HDMI or DSI). **Not required:** keyboard, mouse, X, desktop.
@@ -422,7 +457,7 @@ Photos are decoded → scaled → EXIF-rotated → displayed. Peak RAM ≈ `MP �
 | 24 MP | 96 MB | ~104 MB |
 | 48 MP | 192 MB | ~200 MB |
 
-Pi Zero W has 512 MB shared with the GPU. With `gpu_mem=64` (installer default) ~448 MB is free. Recommended lean config:
+Pi Zero 2 W has 512 MB shared with the GPU. With `gpu_mem=64` (installer default) ~448 MB is free. Recommended lean config:
 
 ```toml
 [display]
@@ -515,6 +550,7 @@ picogallery/
     ├── webdav/       Nextcloud/Synology/ownCloud → local sync
     ├── photoprism/   PhotoPrism REST client (streaming, thumbnail-aware)
     ├── google-photos/  Google Drive via rclone
+    ├── usb/           USB auto-mount and local scan
     └── amazon-photos/  Amazon Photos via LWA
 ```
 

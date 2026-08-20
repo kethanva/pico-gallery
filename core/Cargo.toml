@@ -1,6 +1,6 @@
 [package]
 name        = "picogallery-core"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2021"
 description = "Plugin trait definitions shared by all PicoGallery plugins"
 license     = "MIT"
@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 chrono      = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+kamadak-exif = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

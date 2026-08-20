@@ -22,13 +22,15 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 
 use picogallery_core::{
-    AuthStatus, PhotoMeta, PhotoPlugin, PluginCapabilities, PluginConfig, TargetingAdapter,
+    exif_thumb_from_head, AuthStatus, FetchIntent, PhotoMeta, PhotoPlugin, PluginCapabilities,
+    PluginConfig, TargetingAdapter, EXIF_HEAD_SCAN_BYTES,
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB guard (matches other plugins)
@@ -109,7 +111,7 @@ pub struct DirectoryPlugin {
     /// Sorted/shuffled list of photos, refreshed by `init` and the rescan task.
     photos: Arc<RwLock<Vec<ScannedPhoto>>>,
     /// Abort handle for the background rescan task (cancelled on re-init).
-    rescan_abort: Option<tokio::task::AbortHandle>,
+    rescan_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl DirectoryPlugin {
@@ -118,7 +120,7 @@ impl DirectoryPlugin {
             cfg,
             root: None,
             photos: Arc::new(RwLock::new(Vec::new())),
-            rescan_abort: None,
+            rescan_abort: Mutex::new(None),
         }
     }
 
@@ -224,22 +226,20 @@ impl DirectoryPlugin {
                     recursive, root, &canonical, new_album, allowed, visited, out,
                 ))
                 .await;
-            } else if is_image(&canonical) {
-                if out.len() < MAX_FILES {
-                    let modified_secs = fs::metadata(&canonical)
-                        .await
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+            } else if is_image(&canonical) && out.len() < MAX_FILES {
+                let modified_secs = fs::metadata(&canonical)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
 
-                    out.push(ScannedPhoto {
-                        path: canonical,
-                        album: album.map(str::to_string),
-                        modified_secs,
-                    });
-                }
+                out.push(ScannedPhoto {
+                    path: canonical,
+                    album: album.map(str::to_string),
+                    modified_secs,
+                });
             }
         }
     }
@@ -336,6 +336,9 @@ impl PhotoPlugin for DirectoryPlugin {
     fn name(&self) -> &str {
         "directory"
     }
+    fn uses_engine_image_cache(&self) -> bool {
+        false
+    }
     fn display_name(&self) -> &str {
         "Local Directory"
     }
@@ -393,7 +396,12 @@ impl PhotoPlugin for DirectoryPlugin {
         *self.photos.write().await = photos;
 
         // Cancel any previous rescan task (re-init / targeting reload).
-        if let Some(h) = self.rescan_abort.take() {
+        if let Some(h) = self
+            .rescan_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             h.abort();
         }
 
@@ -417,7 +425,8 @@ impl PhotoPlugin for DirectoryPlugin {
                     info!("Directory plugin: background rescan complete ({n} photos, order preserved)");
                 }
             });
-            self.rescan_abort = Some(handle.abort_handle());
+            *self.rescan_abort.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(handle.abort_handle());
             info!("Directory plugin: rescanning every {interval}s in the background");
         }
 
@@ -442,6 +451,22 @@ impl PhotoPlugin for DirectoryPlugin {
         Ok(())
     }
 
+    async fn shutdown(&self) -> Result<()> {
+        // The optional periodic rescan owns an Arc to the photo list and keeps
+        // waking even after the engine has switched away from this source
+        // unless it is explicitly aborted.  Stop it before the plugin is
+        // dropped so source switches/reconnects do not leak tasks and scans.
+        if let Some(handle) = self
+            .rescan_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+        Ok(())
+    }
+
     async fn list_albums(&self) -> Result<Vec<(String, String)>> {
         let Some(root) = self.root.as_ref() else {
             return Ok(Vec::new());
@@ -449,8 +474,12 @@ impl PhotoPlugin for DirectoryPlugin {
         let mut rd = fs::read_dir(root).await?;
         let mut albums = Vec::new();
         while let Some(entry) = rd.next_entry().await? {
-            let ft = entry.file_type().await?;
-            if ft.is_dir() {
+            // Follow symlink-to-dir so album folders that are links still appear.
+            let is_dir = fs::metadata(entry.path())
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !name.starts_with('.') {
                     albums.push((name.clone(), name));
@@ -473,12 +502,7 @@ impl PhotoPlugin for DirectoryPlugin {
         Ok(page)
     }
 
-    async fn get_photo_bytes(
-        &mut self,
-        meta: &PhotoMeta,
-        _display_width: u32,
-        _display_height: u32,
-    ) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>> {
         let path_str = meta.download_url.as_deref().ok_or_else(|| {
             anyhow::anyhow!("directory plugin: no path stored for '{}'", meta.filename)
         })?;
@@ -512,6 +536,10 @@ impl PhotoPlugin for DirectoryPlugin {
                 file_size / 1_048_576,
                 canonical.display()
             ));
+        }
+
+        if let Some(thumb) = try_gallery_exif_thumb(&canonical, file_size, intent).await? {
+            return Ok(thumb);
         }
 
         let bytes = fs::read(&canonical)
@@ -569,6 +597,31 @@ fn is_image(p: &Path) -> bool {
 /// First-bytes check — JPEG signature only.
 fn has_image_magic(bytes: &[u8]) -> bool {
     matches!(bytes, [0xFF, 0xD8, 0xFF, ..])
+}
+
+/// Gallery-thumb shortcut: read the JPEG head and return an embedded EXIF
+/// thumbnail when one is large enough. `None` means "read the whole file".
+async fn try_gallery_exif_thumb(
+    path: &Path,
+    file_size: u64,
+    intent: FetchIntent,
+) -> Result<Option<Vec<u8>>> {
+    if !intent.is_thumb() || file_size < 3 {
+        return Ok(None);
+    }
+    let n = (EXIF_HEAD_SCAN_BYTES as u64).min(file_size) as usize;
+    let mut file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut head = vec![0u8; n];
+    if file.read_exact(&mut head).await.is_err() {
+        return Ok(None);
+    }
+    if !has_image_magic(&head) {
+        return Ok(None);
+    }
+    Ok(exif_thumb_from_head(&head, intent.target_edge()))
 }
 
 // ── Fisher-Yates shuffle (no rand dep) ────────────────────────────────────────
@@ -763,5 +816,222 @@ mod tests {
         let plugin = DirectoryPlugin::new(PluginConfig::default());
         let photos = plugin.list_photos(10, 0).await.unwrap();
         assert!(photos.is_empty());
+    }
+    #[tokio::test]
+    async fn test_expand_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("/foo/bar"), PathBuf::from("/foo/bar"));
+        assert_eq!(expand_home("~foo/bar"), PathBuf::from("~foo/bar")); // not expanded by design
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_with_allowed_albums() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = &fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let album1 = root.join("Album1");
+        fs::create_dir(&album1).await.unwrap();
+        let album2 = root.join("Album2");
+        fs::create_dir(&album2).await.unwrap();
+
+        let f1 = album1.join("1.jpg");
+        let f2 = album2.join("2.jpg");
+        fs::write(&f1, b"jpg").await.unwrap();
+        fs::write(&f2, b"jpg").await.unwrap();
+
+        let allowed = vec!["Album1".to_string()];
+
+        let mut visited = HashSet::new();
+        let mut out = Vec::new();
+
+        DirectoryPlugin::scan_dir(true, root, root, None, &allowed, &mut visited, &mut out).await;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path.file_name().unwrap(), "1.jpg");
+        assert_eq!(out[0].album.as_deref(), Some("Album1"));
+    }
+
+    #[tokio::test]
+    async fn test_build_photo_list_at_ordering() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = &fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let f1 = root.join("a.jpg");
+        let f2 = root.join("z.jpg");
+        fs::write(&f1, b"").await.unwrap();
+        fs::write(&f2, b"").await.unwrap();
+
+        // alphabetical
+        let mut cfg = PluginConfig::default();
+        cfg.values
+            .insert("order".to_string(), serde_json::json!("alphabetical"));
+        let photos = DirectoryPlugin::build_photo_list_at(root, &cfg).await;
+        assert_eq!(photos.len(), 2);
+        assert_eq!(photos[0].path.file_name().unwrap(), "a.jpg");
+        assert_eq!(photos[1].path.file_name().unwrap(), "z.jpg");
+    }
+
+    #[tokio::test]
+    async fn test_list_albums() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = &fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let album1 = root.join("Album1");
+        let album2 = root.join("Album2");
+        fs::create_dir(&album1).await.unwrap();
+        fs::create_dir(&album2).await.unwrap();
+
+        let mut plugin = DirectoryPlugin::new(PluginConfig::default());
+        plugin.root = Some(root.to_path_buf());
+
+        let albums = plugin.list_albums().await.unwrap();
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].0, "Album1");
+        assert_eq!(albums[1].0, "Album2");
+    }
+
+    #[tokio::test]
+    async fn test_get_photo_bytes_success() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let f1 = root.join("1.jpg");
+        fs::write(&f1, [0xFF, 0xD8, 0xFF, 0x11, 0x22])
+            .await
+            .unwrap();
+
+        let mut cfg = PluginConfig::default();
+        cfg.values.insert(
+            "path".to_string(),
+            serde_json::json!(root.to_string_lossy().to_string()),
+        );
+        let mut plugin = DirectoryPlugin::new(cfg.clone());
+        plugin.init(&cfg).await.unwrap();
+
+        let meta = plugin.list_photos(10, 0).await.unwrap();
+        assert_eq!(meta.len(), 1);
+
+        let bytes = plugin
+            .get_photo_bytes(
+                &meta[0],
+                FetchIntent::Fullscreen {
+                    display_width: 1920,
+                    display_height: 1080,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![0xFF, 0xD8, 0xFF, 0x11, 0x22]);
+    }
+
+    #[tokio::test]
+    async fn test_get_photo_bytes_gallery_thumb_falls_back_without_exif() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let f1 = root.join("1.jpg");
+        let tiny = [0xFF, 0xD8, 0xFF, 0x11, 0x22];
+        fs::write(&f1, tiny).await.unwrap();
+
+        let mut cfg = PluginConfig::default();
+        cfg.values.insert(
+            "path".to_string(),
+            serde_json::json!(root.to_string_lossy().to_string()),
+        );
+        let mut plugin = DirectoryPlugin::new(cfg.clone());
+        plugin.init(&cfg).await.unwrap();
+
+        let meta = plugin.list_photos(10, 0).await.unwrap();
+        let bytes = plugin
+            .get_photo_bytes(&meta[0], FetchIntent::GalleryThumb { cell_px: 140 })
+            .await
+            .unwrap();
+        assert_eq!(bytes, tiny);
+    }
+
+    #[tokio::test]
+    async fn test_get_photo_bytes_rejects_non_magic() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let f1 = root.join("1.jpg");
+        fs::write(&f1, [0x00, 0x00, 0x00]).await.unwrap(); // non-jpeg magic
+
+        let mut cfg = PluginConfig::default();
+        cfg.values.insert(
+            "path".to_string(),
+            serde_json::json!(root.to_string_lossy().to_string()),
+        );
+        let mut plugin = DirectoryPlugin::new(cfg.clone());
+        plugin.init(&cfg).await.unwrap();
+
+        let meta = plugin.list_photos(10, 0).await.unwrap();
+        let err = plugin
+            .get_photo_bytes(
+                &meta[0],
+                FetchIntent::Fullscreen {
+                    display_width: 1920,
+                    display_height: 1080,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a recognised image format"));
+    }
+
+    #[tokio::test]
+    async fn test_get_photo_bytes_rejects_outside_root() {
+        use tempfile::TempDir;
+        let temp_dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp_dir.path()).await.unwrap();
+
+        let outside_dir = TempDir::new().unwrap();
+        let outside_root = fs::canonicalize(outside_dir.path()).await.unwrap();
+        let f1 = outside_root.join("1.jpg");
+        fs::write(&f1, [0xFF, 0xD8, 0xFF, 0x11, 0x22])
+            .await
+            .unwrap();
+
+        let mut cfg = PluginConfig::default();
+        cfg.values.insert(
+            "path".to_string(),
+            serde_json::json!(root.to_string_lossy().to_string()),
+        );
+        let mut plugin = DirectoryPlugin::new(cfg.clone());
+        plugin.init(&cfg).await.unwrap();
+
+        let meta = PhotoMeta {
+            id: "fake".to_string(),
+            filename: "1.jpg".to_string(),
+            width: 0,
+            height: 0,
+            taken_at: None,
+            download_url: Some(f1.to_string_lossy().to_string()),
+            album: None,
+            title: None,
+            location: None,
+            is_favorite: false,
+            extra: HashMap::new(),
+        };
+
+        let err = plugin
+            .get_photo_bytes(
+                &meta,
+                FetchIntent::Fullscreen {
+                    display_width: 1920,
+                    display_height: 1080,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("outside the configured directory"));
     }
 }

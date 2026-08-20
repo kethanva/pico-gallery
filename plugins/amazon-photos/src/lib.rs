@@ -18,12 +18,33 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
 
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{AuthStatus, FetchIntent, PhotoMeta, PhotoPlugin, PluginConfig};
 
 const TOKEN_FILE: &str = "amazon-photos-token.json";
-const LWA_AUTH_URL: &str = "https://api.amazon.com/auth/o2/create/codepair";
-const LWA_TOKEN_URL: &str = "https://api.amazon.com/auth/o2/token";
-const DRIVE_API: &str = "https://drive.amazonaws.com/drive/v1";
+
+fn lwa_auth_url() -> String {
+    #[cfg(test)]
+    if let Ok(url) = std::env::var("LWA_AUTH_URL") {
+        return url;
+    }
+    "https://api.amazon.com/auth/o2/create/codepair".to_string()
+}
+
+fn lwa_token_url() -> String {
+    #[cfg(test)]
+    if let Ok(url) = std::env::var("LWA_TOKEN_URL") {
+        return url;
+    }
+    "https://api.amazon.com/auth/o2/token".to_string()
+}
+
+fn drive_api() -> String {
+    #[cfg(test)]
+    if let Ok(url) = std::env::var("DRIVE_API") {
+        return url;
+    }
+    "https://drive.amazonaws.com/drive/v1".to_string()
+}
 /// Reject images larger than this before buffering into memory (Pi Zero RAM guard).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 /// HTTP timeouts — a stalled request would otherwise hang the
@@ -32,7 +53,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -126,7 +148,7 @@ struct PageCache {
 pub struct AmazonPhotosPlugin {
     cfg: PluginConfig,
     client: Option<reqwest::Client>,
-    token: Option<StoredToken>,
+    token: tokio::sync::RwLock<Option<StoredToken>>,
     token_dir: PathBuf,
     pending: Option<PendingAuth>,
     page_cache: tokio::sync::Mutex<PageCache>,
@@ -137,7 +159,7 @@ impl AmazonPhotosPlugin {
         Self {
             cfg,
             client: None,
-            token: None,
+            token: tokio::sync::RwLock::new(None),
             token_dir: dirs::config_dir().unwrap_or_default().join("picogallery"),
             pending: None,
             page_cache: tokio::sync::Mutex::new(PageCache::default()),
@@ -195,24 +217,36 @@ impl AmazonPhotosPlugin {
         Ok(())
     }
 
-    async fn load_token(&mut self) {
-        if let Ok(data) = fs::read(self.token_path()).await {
-            if let Ok(t) = serde_json::from_slice::<StoredToken>(&data) {
-                self.token = Some(t);
+    async fn clear_stored_token(&self) {
+        *self.token.write().await = None;
+        let path = self.token_path();
+        if let Err(e) = fs::remove_file(&path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Amazon Photos: failed to remove token file: {e:#}");
             }
         }
     }
 
-    async fn refresh_token_now(&mut self) -> Result<()> {
+    async fn load_token(&mut self) {
+        if let Ok(data) = fs::read(self.token_path()).await {
+            if let Ok(t) = serde_json::from_slice::<StoredToken>(&data) {
+                *self.token.write().await = Some(t);
+            }
+        }
+    }
+
+    async fn refresh_token_now(&self) -> Result<()> {
         let rt = self
             .token
+            .read()
+            .await
             .as_ref()
             .and_then(|t| t.refresh_token.clone())
             .context("no refresh token")?;
 
         let resp = self
             .client()?
-            .post(LWA_TOKEN_URL)
+            .post(lwa_token_url())
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &rt),
@@ -247,14 +281,27 @@ impl AmazonPhotosPlugin {
         if let Err(e) = self.save_token(&token).await {
             warn!("Amazon Photos: failed to persist refreshed token (auth still valid this session): {e:#}");
         }
-        self.token = Some(token);
+        *self.token.write().await = Some(token);
         Ok(())
     }
 
-    fn access_token(&self) -> Result<&str> {
+    async fn access_token(&self) -> Result<String> {
+        {
+            let guard = self.token.read().await;
+            match guard.as_ref() {
+                Some(t) if !t.is_expired() => return Ok(t.access_token.clone()),
+                Some(t) if t.refresh_token.is_some() => {}
+                _ => {
+                    return Err(anyhow::anyhow!("amazon-photos: not authenticated"));
+                }
+            }
+        }
+        self.refresh_token_now().await?;
         self.token
+            .read()
+            .await
             .as_ref()
-            .map(|t| t.access_token.as_str())
+            .map(|t| t.access_token.clone())
             .ok_or_else(|| anyhow::anyhow!("amazon-photos: not authenticated"))
     }
 }
@@ -284,7 +331,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        match &self.token {
+        match self.token.read().await.as_ref() {
             None => AuthStatus::NotAuthenticated,
             // Any expired token reports NotAuthenticated so the engine calls
             // authenticate(), which performs the refresh when a refresh token
@@ -296,13 +343,24 @@ impl PhotoPlugin for AmazonPhotosPlugin {
     }
 
     async fn authenticate(&mut self) -> Result<AuthStatus> {
-        if let Some(t) = &self.token {
-            if !t.is_expired() {
-                return Ok(AuthStatus::Authenticated);
-            }
-            if t.refresh_token.is_some() {
-                self.refresh_token_now().await?;
-                return Ok(AuthStatus::Authenticated);
+        {
+            let guard = self.token.read().await;
+            if let Some(t) = guard.as_ref() {
+                if !t.is_expired() {
+                    return Ok(AuthStatus::Authenticated);
+                }
+                if t.refresh_token.is_some() {
+                    drop(guard);
+                    match self.refresh_token_now().await {
+                        Ok(()) => return Ok(AuthStatus::Authenticated),
+                        Err(e) => {
+                            warn!(
+                                "Amazon Photos: refresh failed ({e:#}) — starting device-code flow"
+                            );
+                            self.clear_stored_token().await;
+                        }
+                    }
+                }
             }
         }
 
@@ -310,19 +368,30 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         // instead of requesting a new code (which would invalidate the code
         // the user is currently typing in).
         if let Some(pending) = self.pending.take() {
-            let res = self
-                .client()?
-                .post(LWA_TOKEN_URL)
-                .form(&[
-                    ("grant_type", "device_code"),
-                    ("device_code", pending.device_code.as_str()),
-                    ("client_id", self.client_id()?),
-                    ("client_secret", self.client_secret()?),
-                ])
-                .send()
-                .await?
-                .json::<LwaToken>()
-                .await?;
+            let res = match async {
+                Ok::<_, anyhow::Error>(
+                    self.client()?
+                        .post(lwa_token_url())
+                        .form(&[
+                            ("grant_type", "device_code"),
+                            ("device_code", pending.device_code.as_str()),
+                            ("client_id", self.client_id()?),
+                            ("client_secret", self.client_secret()?),
+                        ])
+                        .send()
+                        .await?
+                        .json::<LwaToken>()
+                        .await?,
+                )
+            }
+            .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    self.pending = Some(pending);
+                    return Err(e);
+                }
+            };
 
             if let Some(at) = res.access_token {
                 let t = StoredToken {
@@ -334,7 +403,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
                 if let Err(e) = self.save_token(&t).await {
                     warn!("Amazon Photos: failed to persist token (auth still valid this session): {e:#}");
                 }
-                self.token = Some(t);
+                *self.token.write().await = Some(t);
                 info!("Amazon Photos: device authorized!");
                 return Ok(AuthStatus::Authenticated);
             }
@@ -375,7 +444,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         // LWA device code request.
         let res = self
             .client()?
-            .post(LWA_AUTH_URL)
+            .post(lwa_auth_url())
             .form(&[
                 ("response_type", "device_code"),
                 ("client_id", self.client_id()?),
@@ -403,10 +472,15 @@ impl PhotoPlugin for AmazonPhotosPlugin {
     }
 
     async fn refresh_auth(&mut self) -> Result<()> {
-        if let Some(t) = &self.token {
-            if t.is_expired() && t.refresh_token.is_some() {
-                self.refresh_token_now().await?;
-            }
+        let needs_refresh = {
+            let guard = self.token.read().await;
+            matches!(
+                guard.as_ref(),
+                Some(t) if t.is_expired() && t.refresh_token.is_some()
+            )
+        };
+        if needs_refresh {
+            self.refresh_token_now().await?;
         }
         Ok(())
     }
@@ -425,21 +499,28 @@ impl PhotoPlugin for AmazonPhotosPlugin {
             const PAGE_SIZE: usize = 200;
             let mut url = format!(
                 "{}/nodes?filters=kind:PHOTOS&limit={}&asset=ALL&tempLink=true",
-                DRIVE_API, PAGE_SIZE
+                drive_api(),
+                PAGE_SIZE
             );
             if let Some(token) = cache.next_token.as_deref() {
                 url.push_str(&format!("&startToken={}", urlencoding_encode(token)));
             }
 
-            let res = self
-                .client()?
-                .get(&url)
-                .bearer_auth(self.access_token()?)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<NodeList>()
-                .await?;
+            let mut refreshed = false;
+            let res = loop {
+                let resp = self
+                    .client()?
+                    .get(&url)
+                    .bearer_auth(self.access_token().await?)
+                    .send()
+                    .await?;
+                if resp.status() == StatusCode::UNAUTHORIZED && !refreshed {
+                    self.refresh_token_now().await?;
+                    refreshed = true;
+                    continue;
+                }
+                break resp.error_for_status()?.json::<NodeList>().await?;
+            };
 
             let batch_len = res.data.len();
             for node in res.data {
@@ -465,7 +546,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
                     width: w,
                     height: h,
                     taken_at: taken,
-                    download_url: Some(format!("{}/nodes/{}/content", DRIVE_API, node.id)),
+                    download_url: Some(format!("{}/nodes/{}/content", drive_api(), node.id)),
                     album: None,
                     title: None,
                     location: None,
@@ -488,7 +569,8 @@ impl PhotoPlugin for AmazonPhotosPlugin {
         }
     }
 
-    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>> {
+        let (dw, dh) = intent.dimensions();
         let base = meta
             .download_url
             .as_deref()
@@ -504,7 +586,7 @@ impl PhotoPlugin for AmazonPhotosPlugin {
             let resp = self
                 .client()?
                 .get(&url)
-                .bearer_auth(self.access_token()?)
+                .bearer_auth(self.access_token().await?)
                 .send()
                 .await
                 .context("amazon-photos: image request failed")?;
@@ -585,7 +667,20 @@ mod tests {
 
     #[tokio::test]
     async fn init_clears_stale_page_cache() {
-        let mut plugin = AmazonPhotosPlugin::new(PluginConfig::default());
+        let mut plugin = AmazonPhotosPlugin::new(PluginConfig {
+            values: [
+                (
+                    "client_id".to_string(),
+                    serde_json::Value::String("dummy".into()),
+                ),
+                (
+                    "client_secret".to_string(),
+                    serde_json::Value::String("dummy".into()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
         // Seed a prior library walk, as a live instance accumulates over time.
         {
             let cache = plugin.page_cache.get_mut();
@@ -608,11 +703,108 @@ mod tests {
 
         // Re-init (the targeting / credential reload path on a live instance)
         // must start from a clean slate, not serve the previous filter's photos.
-        plugin.init(&PluginConfig::default()).await.unwrap();
+        plugin
+            .init(&PluginConfig {
+                values: [
+                    (
+                        "client_id".to_string(),
+                        serde_json::Value::String("dummy".into()),
+                    ),
+                    (
+                        "client_secret".to_string(),
+                        serde_json::Value::String("dummy".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .await
+            .unwrap();
 
         let cache = plugin.page_cache.get_mut();
         assert!(cache.photos.is_empty(), "stale photos must be cleared");
         assert!(cache.next_token.is_none(), "page token must be cleared");
         assert!(!cache.exhausted, "exhaustion flag must reset");
     }
+}
+
+#[test]
+fn test_urlencoding_encode() {
+    assert_eq!(urlencoding_encode("hello world"), "hello%20world");
+    assert_eq!(urlencoding_encode("a-b_c.d~e"), "a-b_c.d~e");
+    assert_eq!(urlencoding_encode("foo+bar"), "foo%2Bbar");
+    assert_eq!(urlencoding_encode("token123=/"), "token123%3D%2F");
+}
+
+#[test]
+fn test_stored_token_is_expired() {
+    let t_future = StoredToken {
+        access_token: "a".into(),
+        refresh_token: None,
+        expires_at: Utc::now() + chrono::Duration::minutes(10),
+    };
+    assert!(!t_future.is_expired());
+
+    let t_past = StoredToken {
+        access_token: "b".into(),
+        refresh_token: None,
+        expires_at: Utc::now() - chrono::Duration::minutes(10),
+    };
+    assert!(t_past.is_expired());
+
+    // Less than 5 mins in future -> expired (refresh early)
+    let t_edge = StoredToken {
+        access_token: "c".into(),
+        refresh_token: None,
+        expires_at: Utc::now() + chrono::Duration::minutes(3),
+    };
+    assert!(t_edge.is_expired());
+}
+
+#[test]
+fn test_node_list_deserialization() {
+    let json = r#"{
+            "data": [
+                {
+                    "id": "123",
+                    "name": "photo.jpg",
+                    "contentProperties": {
+                        "size": 1024,
+                        "image": {
+                            "width": 800,
+                            "height": 600,
+                            "dateTimeOriginal": "2023-01-01T12:00:00Z"
+                        }
+                    }
+                }
+            ],
+            "nextToken": "abc-def"
+        }"#;
+
+    let list: NodeList = serde_json::from_str(json).unwrap();
+    assert_eq!(list.data.len(), 1);
+    let n = &list.data[0];
+    assert_eq!(n.id, "123");
+    assert_eq!(n.name, "photo.jpg");
+    let img = n.content.as_ref().unwrap().image.as_ref().unwrap();
+    assert_eq!(img.width, Some(800));
+    assert_eq!(img.height, Some(600));
+    assert_eq!(img.taken.as_deref(), Some("2023-01-01T12:00:00Z"));
+    assert_eq!(list.next_token.as_deref(), Some("abc-def"));
+}
+
+#[test]
+fn test_node_list_deserialization_empty_content() {
+    let json = r#"{
+            "data": [
+                {
+                    "id": "456",
+                    "name": "folder"
+                }
+            ]
+        }"#;
+    let list: NodeList = serde_json::from_str(json).unwrap();
+    assert_eq!(list.data.len(), 1);
+    assert!(list.data[0].content.is_none());
+    assert!(list.next_token.is_none());
 }

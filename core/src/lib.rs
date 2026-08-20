@@ -3,11 +3,23 @@
 /// Every photo source (Google Photos, Amazon Photos, local filesystem, etc.)
 /// implements this trait. The main engine interacts exclusively through
 /// `dyn PhotoPlugin`, so new sources can be added without touching core code.
+///
+/// # 0.2.0
+/// `get_photo_bytes` takes `&self` and a [`FetchIntent`] instead of
+/// `&mut self, display_width, display_height`. Use `intent.dimensions()` when
+/// migrating a plugin that already reasoned in width/height. `Fullscreen` is
+/// never a thumbnail request, even on a 480×320 LCD.
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+pub mod thumb;
+pub use thumb::{
+    exif_thumb_from_head, extract_exif_jpeg_thumbnail, prefer_gallery_exif_thumb,
+    EXIF_HEAD_SCAN_BYTES,
+};
 
 /// Metadata about a single photo, returned by the plugin.
 /// No pixel data — actual bytes are fetched on demand.
@@ -92,7 +104,7 @@ impl PluginConfig {
 
     /// Apply env override `PICOGALLERY_{PLUGIN}_{KEY}` (uppercased, `-` → `_`)
     /// when set. Does not clear existing values when the env var is unset.
-    pub fn apply_env_secret(&mut self, plugin_name: &str, key: &str) -> Result<()> {
+    pub fn apply_env_secret(&mut self, plugin_name: &str, key: &str) -> Result<bool> {
         let env_key = format!(
             "PICOGALLERY_{}_{}",
             plugin_name.replace('-', "_").to_uppercase(),
@@ -101,10 +113,10 @@ impl PluginConfig {
         match std::env::var(&env_key) {
             Ok(v) if !v.is_empty() => {
                 self.values.insert(key.into(), serde_json::Value::String(v));
-                Ok(())
+                Ok(true)
             }
             Ok(_) => Err(anyhow::anyhow!("{env_key} is set but empty")),
-            Err(std::env::VarError::NotPresent) => Ok(()),
+            Err(std::env::VarError::NotPresent) => Ok(false),
             Err(e) => Err(anyhow::anyhow!("reading {env_key}: {e}")),
         }
     }
@@ -252,6 +264,54 @@ pub enum AuthStatus {
     NotAuthenticated,
 }
 
+/// Why the engine wants pixel bytes.
+///
+/// Exists so a plugin can pick a CDN/thumbnail size without the engine's
+/// *display* dimensions ever being mistaken for a thumbnail request. A 480×320
+/// LCD passes `Fullscreen { 480, 320 }`; only `GalleryThumb` may be served by
+/// an embedded IFD1 thumbnail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchIntent {
+    /// A fullscreen slide on a panel of this pixel size. Never a thumb request,
+    /// however small the panel is.
+    Fullscreen {
+        display_width: u32,
+        display_height: u32,
+    },
+    /// One gallery grid cell, `cell_px` on its longest edge.
+    GalleryThumb { cell_px: u32 },
+}
+
+impl FetchIntent {
+    /// Smallest acceptable longest-edge, in pixels. Never 0.
+    pub fn target_edge(self) -> u32 {
+        match self {
+            Self::Fullscreen {
+                display_width,
+                display_height,
+            } => display_width.max(display_height).max(1),
+            Self::GalleryThumb { cell_px } => cell_px.max(1),
+        }
+    }
+
+    /// True only for `GalleryThumb`. The single gate for EXIF-thumb substitution.
+    pub fn is_thumb(self) -> bool {
+        matches!(self, Self::GalleryThumb { .. })
+    }
+
+    /// Compatibility shim: the `(display_width, display_height)` pair the old
+    /// signature took. `GalleryThumb` reports a square of `cell_px`.
+    pub fn dimensions(self) -> (u32, u32) {
+        match self {
+            Self::Fullscreen {
+                display_width,
+                display_height,
+            } => (display_width, display_height),
+            Self::GalleryThumb { cell_px } => (cell_px, cell_px),
+        }
+    }
+}
+
 /// The single trait every photo source plugin must implement.
 ///
 /// # Thread safety
@@ -266,6 +326,15 @@ pub trait PhotoPlugin: Send + Sync {
     /// Short, lowercase, stable identifier used for config keys and cache paths.
     /// Example: `"google-photos"`, `"local"`.
     fn name(&self) -> &str;
+
+    /// Whether the engine should keep another on-disk copy of bytes returned
+    /// by this plugin. Direct HTTP providers benefit from the default cache.
+    /// Filesystem and sync-backed providers should return false: their source
+    /// file is already a durable local cache, and duplicating it adds an SD-card
+    /// write to the first-display critical path.
+    fn uses_engine_image_cache(&self) -> bool {
+        true
+    }
 
     /// Human-readable display name.
     fn display_name(&self) -> &str {
@@ -306,17 +375,18 @@ pub trait PhotoPlugin: Send + Sync {
     /// possible end-of-library, not as an error.
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>>;
 
-    /// Fetch raw image bytes for a photo at a given display resolution.
+    /// Fetch raw image bytes for a photo.
     ///
-    /// `display_width` / `display_height` are the screen dimensions. Plugins
-    /// should request the smallest version from their CDN that is ≥ those
-    /// dimensions (saves bandwidth on Pi Zero's slow connection).
-    async fn get_photo_bytes(
-        &mut self,
-        meta: &PhotoMeta,
-        display_width: u32,
-        display_height: u32,
-    ) -> Result<Vec<u8>>;
+    /// Takes `&self` — the engine holds plugins behind `Arc` and may fetch
+    /// concurrently, so a fetch must not need exclusive access. Implementations
+    /// use interior mutability for session state.
+    ///
+    /// Plugins should return the smallest representation that is ≥
+    /// `intent.target_edge()`. For [`FetchIntent::GalleryThumb`], a filesystem
+    /// plugin may return an embedded EXIF thumbnail read from the file header
+    /// instead of the whole original. Never treat `Fullscreen` as a thumb
+    /// request, even on a small LCD.
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>>;
 
     /// Return browseable albums as `(id, title)` pairs. Empty when unsupported.
     async fn list_albums(&self) -> Result<Vec<(String, String)>> {
@@ -338,13 +408,18 @@ pub trait PhotoPlugin: Send + Sync {
         ))
     }
 
-    /// Called by the engine once per day to refresh tokens or do housekeeping.
-    async fn refresh_auth(&mut self) -> Result<()> {
+    /// Gracefully shutdown the plugin, aborting any background tasks.
+    ///
+    /// Takes `&self` so the engine can hold plugins in `Arc`. Implementations
+    /// that own abort handles keep them behind a `Mutex`.
+    ///
+    /// Called when switching to a different plugin or on application exit.
+    async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Called when the engine is shutting down gracefully.
-    async fn shutdown(&mut self) -> Result<()> {
+    /// Called by the engine once per day to refresh tokens or do housekeeping.
+    async fn refresh_auth(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -473,13 +548,27 @@ mod tests {
         }
 
         async fn get_photo_bytes(
-            &mut self,
+            &self,
             _meta: &PhotoMeta,
-            _dw: u32,
-            _dh: u32,
+            _intent: FetchIntent,
         ) -> Result<Vec<u8>> {
             Ok(vec![0xFF, 0xD8, 0xFF])
         }
+    }
+
+    #[test]
+    fn fetch_intent_never_reports_small_display_as_thumb() {
+        let small = FetchIntent::Fullscreen {
+            display_width: 480,
+            display_height: 320,
+        };
+        assert!(!small.is_thumb());
+        assert_eq!(small.target_edge(), 480);
+        assert_eq!(small.dimensions(), (480, 320));
+        let thumb = FetchIntent::GalleryThumb { cell_px: 140 };
+        assert!(thumb.is_thumb());
+        assert_eq!(thumb.target_edge(), 140);
+        assert_eq!(thumb.dimensions(), (140, 140));
     }
 
     #[tokio::test]
@@ -492,5 +581,25 @@ mod tests {
         let photos = plugin.list_photos(10, 0).await.unwrap();
         assert_eq!(photos[0].album.as_deref(), Some("A"));
         assert!(photos[0].is_favorite);
+    }
+
+    #[tokio::test]
+    async fn boxed_plugin_converts_to_arc_and_fetches_shared() {
+        use std::sync::Arc;
+        let arc: Arc<dyn PhotoPlugin> = Arc::from(Box::new(MockPlugin) as BoxedPlugin);
+        let a = Arc::clone(&arc);
+        let b = Arc::clone(&arc);
+        let meta = a.list_photos(1, 0).await.expect("list")[0].clone();
+        let (r1, r2) = tokio::join!(
+            a.get_photo_bytes(
+                &meta,
+                FetchIntent::Fullscreen {
+                    display_width: 1920,
+                    display_height: 1080
+                }
+            ),
+            b.get_photo_bytes(&meta, FetchIntent::GalleryThumb { cell_px: 140 }),
+        );
+        assert!(r1.is_ok() && r2.is_ok());
     }
 }

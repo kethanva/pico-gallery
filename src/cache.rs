@@ -13,7 +13,9 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 const INDEX_FILE: &str = "index.json";
 const MAX_ENTRY_BYTES: u64 = 20 * 1024 * 1024; // never cache a single item > 20 MB
@@ -65,7 +67,9 @@ impl ImageCache {
         {
             use std::os::unix::fs::PermissionsExt;
             if dir.ends_with("picogallery") {
-                if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                if let Err(e) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                {
                     warn!(
                         "Could not restrict cache dir {} to 0700: {} — cached photos may be world-readable",
                         dir.display(), e
@@ -90,9 +94,13 @@ impl ImageCache {
         };
 
         cache.load_index().await;
+        let mut stale_paths = Vec::new();
         while cache.used_bytes > cache.max_bytes && cache.head.is_some() {
-            cache.evict_oldest().await;
+            if let Some(path) = cache.take_oldest() {
+                stale_paths.push(path);
+            }
         }
+        remove_cache_files(stale_paths).await;
         cache.save_index().await;
         info!(
             "Cache opened: {} MB used / {} MB limit",
@@ -164,9 +172,16 @@ impl ImageCache {
         // fails, the evicted entries are gone for good (re-downloaded on next
         // showing) — acceptable on this single-user device; not worth the
         // complexity of a two-phase evict.
+        let mut stale_paths = Vec::new();
         while self.used_bytes + size > self.max_bytes && self.head.is_some() {
-            self.evict_oldest().await;
+            if let Some(path) = self.take_oldest() {
+                stale_paths.push(path);
+            }
         }
+        // Delete a whole eviction run inside one blocking task. Reducing a
+        // cache budget can remove hundreds of files; dispatching one Tokio
+        // blocking job per unlink made startup cleanup needlessly slow.
+        remove_cache_files(stale_paths).await;
 
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
@@ -207,6 +222,28 @@ impl ImageCache {
     /// True if the key is present (without promoting in LRU).
     pub fn contains(&self, key: &str) -> bool {
         self.map.contains_key(key)
+    }
+
+    /// Remove one entry immediately. Used when a cached file can be read but
+    /// fails image decoding, so a damaged download does not poison every
+    /// future slideshow cycle. Returns whether an indexed entry existed.
+    pub async fn remove(&mut self, key: &str) -> bool {
+        let Some(&idx) = self.map.get(key) else {
+            return false;
+        };
+        let path = self.nodes[idx].entry.path.clone();
+        let size = self.nodes[idx].entry.size_bytes;
+        self.remove_node(idx);
+        self.used_bytes = self.used_bytes.saturating_sub(size);
+        if let Err(error) = fs::remove_file(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!("Could not remove cache entry {}: {}", path.display(), error);
+            }
+        }
+        // Bad entries must not return after restart even when the normal index
+        // writer is currently inside its eight-put batching window.
+        self.save_index().await;
+        true
     }
 
     // ── Intrusive LRU list helpers (all O(1)) ────────────────────────────────
@@ -283,15 +320,14 @@ impl ImageCache {
             .join(format!("{}-{:016x}.jpg", safe, fnv1a_64(key)))
     }
 
-    async fn evict_oldest(&mut self) {
-        if let Some(idx) = self.head {
-            let path = self.nodes[idx].entry.path.clone();
-            let size = self.nodes[idx].entry.size_bytes;
-            debug!("Cache evict: {}", self.nodes[idx].entry.key);
-            self.remove_node(idx);
-            let _ = fs::remove_file(&path).await;
-            self.used_bytes = self.used_bytes.saturating_sub(size);
-        }
+    fn take_oldest(&mut self) -> Option<PathBuf> {
+        let idx = self.head?;
+        let path = self.nodes[idx].entry.path.clone();
+        let size = self.nodes[idx].entry.size_bytes;
+        debug!("Cache evict: {}", self.nodes[idx].entry.key);
+        self.remove_node(idx);
+        self.used_bytes = self.used_bytes.saturating_sub(size);
+        Some(path)
     }
 
     async fn save_index(&self) {
@@ -366,13 +402,20 @@ impl ImageCache {
                 for entry in read_dir.flatten() {
                     let path = entry.path();
                     let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if fname.ends_with(".jpg") && fname.len() >= 21 {
-                        let hex_part = &fname[fname.len() - 21 .. fname.len() - 4];
-                        if hex_part.starts_with('-') && hex_part[1..].chars().all(|c| c.is_ascii_hexdigit()) {
-                            if !known.contains(&path) {
-                                let _ = std::fs::remove_file(path);
-                            }
+                    if let Some(stem) = fname.strip_suffix(".jpg") {
+                        let bytes = stem.as_bytes();
+                        if bytes.len() >= 17
+                            && bytes[bytes.len() - 17] == b'-'
+                            && bytes[bytes.len() - 16..].iter().all(u8::is_ascii_hexdigit)
+                            && !known.contains(&path)
+                        {
+                            let _ = std::fs::remove_file(&path);
                         }
+                    } else if fname.starts_with('.')
+                        && fname.contains(INDEX_FILE)
+                        && fname.ends_with(".tmp")
+                    {
+                        let _ = std::fs::remove_file(&path);
                     }
                 }
             }
@@ -423,6 +466,31 @@ async fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
+async fn remove_cache_files(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter_map(|path| match std::fs::remove_file(&path) {
+                Ok(()) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some((path, error)),
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match result {
+        Ok(errors) => {
+            for (path, error) in errors {
+                warn!("Could not evict cache entry {}: {}", path.display(), error);
+            }
+        }
+        Err(error) => warn!("Cache eviction task failed: {error}"),
+    }
+}
+
 /// Stable 64-bit FNV-1a hash. Hand-rolled (~6 lines) because std's
 /// `DefaultHasher` is not guaranteed stable across Rust releases and cache
 /// filenames must survive upgrades; not worth a dependency.
@@ -433,6 +501,66 @@ fn fnv1a_64(s: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
     hash
+}
+
+/// The engine's handle to the disk LRU. `None` inside means the cache could not
+/// be opened (unwritable dir, full SD card) and every operation is a no-op —
+/// spec §5 requires degrading to no-cache operation, not failing startup.
+#[derive(Clone)]
+pub struct CacheHandle(Option<Arc<Mutex<ImageCache>>>);
+
+impl CacheHandle {
+    /// Open the cache, degrading to a disabled handle on any failure.
+    /// Logs once at `warn` with the cause; never returns `Err`.
+    pub async fn open_or_degrade(dir: &Path, max_mb: u64) -> Self {
+        match ImageCache::open(dir, max_mb).await {
+            Ok(cache) => Self(Some(Arc::new(Mutex::new(cache)))),
+            Err(e) => {
+                warn!(
+                    "Cache disabled (could not open {}): {e:#} — photos will be fetched every time",
+                    dir.display()
+                );
+                Self(None)
+            }
+        }
+    }
+
+    /// Explicitly disabled handle (tests, or when the operator set max_mb = 0
+    /// and we still want a typed object rather than skipping construction).
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
+        match &self.0 {
+            Some(cache) => cache.lock().await.get(key).await,
+            None => None,
+        }
+    }
+
+    pub async fn put(&self, key: &str, bytes: &[u8]) {
+        if let Some(cache) = &self.0 {
+            if let Err(e) = cache.lock().await.put(key, bytes).await {
+                warn!("Cache put failed ({key}): {e}");
+            }
+        }
+    }
+
+    pub async fn remove(&self, key: &str) {
+        if let Some(cache) = &self.0 {
+            let _ = cache.lock().await.remove(key).await;
+        }
+    }
+
+    pub async fn flush(&self) {
+        if let Some(cache) = &self.0 {
+            cache.lock().await.flush().await;
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -570,5 +698,131 @@ mod tests {
         let cache = ImageCache::open(&tmp.0, 4).await.unwrap();
         assert!(!orphan.exists());
         assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn reopen_does_not_panic_on_non_ascii_jpg_names() {
+        let tmp = TempDir::new("utf8_orphan");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        // Byte index len-21 lands inside `é` (2-byte UTF-8) for the old
+        // `&fname[len-21..]` scan — must not panic.
+        let junk = tmp.0.join("éaaaaaaaaaaaaaaaa.jpg");
+        std::fs::write(&junk, b"junk").unwrap();
+        let cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert!(junk.exists(), "non-engine jpg names must be left alone");
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn reopen_prunes_stale_index_tmp_files() {
+        let tmp = TempDir::new("index_tmp");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let stale = tmp.0.join(format!(".{INDEX_FILE}.1.tmp"));
+        std::fs::write(&stale, b"{}").unwrap();
+        let _cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn test_fnv1a_64() {
+        // Known stable hashes for these inputs
+        assert_eq!(fnv1a_64("hello"), 0xa430d84680aabd0b);
+        assert_eq!(fnv1a_64("picogallery/photo1"), 4730821401576092488);
+    }
+
+    #[tokio::test]
+    async fn atomic_write_creates_file_properly() {
+        let tmp = TempDir::new("atomic_write");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let file_path = tmp.0.join("test.json");
+
+        atomic_write(&file_path, b"test_data").await.unwrap();
+        let read = std::fs::read(&file_path).unwrap();
+        assert_eq!(read, b"test_data");
+    }
+
+    #[tokio::test]
+    async fn atomic_write_fails_gracefully_on_missing_parent() {
+        let path = PathBuf::from("/this/path/does/not/exist/test.json");
+        let result = atomic_write(&path, b"data").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_index_recovers_from_corrupt_json() {
+        let tmp = TempDir::new("corrupt_json");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        let index_path = tmp.0.join(INDEX_FILE);
+        std::fs::write(&index_path, b"{invalid_json}").unwrap();
+
+        let cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert_eq!(cache.used_bytes, 0);
+        assert_eq!(cache.map.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_removes_entry_when_file_deleted_externally() {
+        let tmp = TempDir::new("external_delete");
+        let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        cache.put("k/a", &vec![1u8; 1024]).await.unwrap();
+
+        // Find the actual path and delete it manually
+        let path = cache.path_for("k/a");
+        std::fs::remove_file(&path).unwrap();
+
+        // This should fail to get and remove the entry
+        let result = cache.get("k/a").await;
+        assert!(result.is_none());
+        assert!(!cache.contains("k/a"));
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_drops_index_and_file() {
+        let tmp = TempDir::new("remove");
+        let mut cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        cache.put("bad/photo", b"corrupt-jpeg").await.unwrap();
+        let path = cache.path_for("bad/photo");
+
+        assert!(cache.remove("bad/photo").await);
+        assert!(!cache.contains("bad/photo"));
+        assert!(!path.exists());
+        assert_eq!(cache.used_bytes, 0);
+        assert!(!cache.remove("bad/photo").await);
+    }
+
+    #[tokio::test]
+    async fn open_or_degrade_returns_disabled_handle_on_unwritable_dir() {
+        let tmp = TempDir::new("degrade");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        // Parent is a regular file, so create_dir_all of a child must fail.
+        let as_file = tmp.0.join("not-a-dir");
+        std::fs::write(&as_file, b"x").unwrap();
+        let handle = CacheHandle::open_or_degrade(&as_file.join("cache"), 4).await;
+        assert!(!handle.is_enabled());
+        assert!(handle.get("k").await.is_none());
+        handle.put("k", b"bytes").await;
+        handle.remove("k").await;
+        handle.flush().await;
+    }
+
+    #[tokio::test]
+    async fn load_index_handles_non_ascii_and_cleans_orphans() {
+        let tmp = TempDir::new("non_ascii_orphans");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+
+        // Write a file with multibyte UTF-8 characters and valid-looking suffix
+        let utf8_file = tmp.0.join("café_küche_été-0123456789abcdef.jpg");
+        std::fs::write(&utf8_file, b"dummy data").unwrap();
+
+        // Write an orphan .index.json.nonce.tmp file
+        let orphan_tmp = tmp.0.join(".index.json.12345.tmp");
+        std::fs::write(&orphan_tmp, b"temp content").unwrap();
+
+        // Opening the cache scans the directory, shouldn't panic on UTF-8, and should remove the unindexed file & orphan tmp
+        let cache = ImageCache::open(&tmp.0, 4).await.unwrap();
+        assert_eq!(cache.used_bytes, 0);
+        assert!(!utf8_file.exists());
+        assert!(!orphan_tmp.exists());
     }
 }

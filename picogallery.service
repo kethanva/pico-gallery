@@ -25,7 +25,7 @@ LockPersonality=yes
 RestrictSUIDSGID=yes
 TasksMax=128
 MemoryMax=384M
-ReadWritePaths=/etc/wpa_supplicant /etc/NetworkManager/system-connections /media
+ReadWritePaths=-/etc/wpa_supplicant -/etc/NetworkManager/system-connections -/media
 
 # Allow DRM/input access without root. Wi-Fi and USB mounting require host
 # policy (NetworkManager/udisks) and are deliberately not granted privileges.

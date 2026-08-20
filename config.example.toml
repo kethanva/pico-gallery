@@ -82,7 +82,7 @@ resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | 
 #
 #   "Peak" = decoded RGBA + display-sized copy (~8 MB at 1080p).
 #
-# Pi Zero W has 512 MB RAM shared with the GPU.  With gpu_mem=64 that leaves
+# Pi Zero 2 W has 512 MB RAM shared with the GPU.  With gpu_mem=64 that leaves
 # ~448 MB for the OS + process.  A 24 MP photo briefly needs ~104 MB, which is
 # fine; 48 MP photos (~200 MB) can cause the OOM killer to terminate the process.
 #
@@ -117,9 +117,18 @@ prefetch_count = 3     # photos pre-fetched while current photo is on screen
 # dir = "/tmp/picogallery-cache"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auth (headless OAuth / device-code)
+# A plugin that sits in PendingUserAction longer than this is disabled so the
+# slideshow can still start from other sources. 0 = wait forever.
+# ─────────────────────────────────────────────────────────────────────────────
+[auth]
+pending_timeout_secs = 180
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP remote control (optional)
-# Phone-friendly prev/pause/next/favourite. Set token_file to a root-owned
-# random token; open http://<pi-ip>:8188/#<token> from the controlling phone.
+# Phone-friendly prev/pause/next/favourite. Set token_file to a random token
+# readable only by the service user; open http://<pi-ip>:8188/#<token> from the
+# controlling phone.
 # ─────────────────────────────────────────────────────────────────────────────
 [remote]
 enabled = false

@@ -126,7 +126,7 @@ pub struct DisplayConfig {
     //   max_image_mb   = 20    (raw JPEG file size)
     //   max_megapixels = 12    (decoded pixel count; 12 MP → ~56 MB peak)
     //
-    // Leave at 0 to use the built-in defaults (50 MB / no MP limit).
+    // Leave at 0 to use the built-in defaults (50 MB / 24 MP).
     /// Maximum raw image file size in megabytes.
     /// 0 = use built-in default of 50 MB.
     #[serde(default)]
@@ -385,6 +385,70 @@ impl CacheConfig {
     }
 }
 
+// ── Auth (headless OAuth / device-code) ──────────────────────────────────────
+
+/// Bounds for plugin sign-in at startup. A plugin that sits in
+/// `PendingUserAction` longer than `pending_timeout_secs` is disabled so the
+/// frame can still start from other sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Wall-clock a plugin may sit in `PendingUserAction` at startup before
+    /// the source is dropped. 0 = wait forever (only sensible with a console).
+    #[serde(default = "default_auth_pending_timeout_secs")]
+    pub pending_timeout_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            pending_timeout_secs: default_auth_pending_timeout_secs(),
+        }
+    }
+}
+
+fn default_auth_pending_timeout_secs() -> u64 {
+    180
+}
+
+/// Peak RSS estimate for the decode/prefetch/gallery working set, in MiB.
+///
+/// `max_image_mb == 0` still hard-caps fetches at 50 MB; the estimator uses
+/// 20 MB (the documented Pi Zero recommendation) so stock auto-4K + gallery
+/// still boots. Gallery thumbs are counted only when `gallery_mode` is on.
+pub(crate) fn estimated_peak_image_mb(
+    source_mp: u32,
+    budget_w: u64,
+    budget_h: u64,
+    prefetch_count: usize,
+    max_image_mb: u64,
+    gallery_mode: bool,
+) -> u64 {
+    let frame_mb = (budget_w
+        .saturating_mul(budget_h)
+        .saturating_mul(4)
+        .saturating_add(1_048_575))
+        / 1_048_576;
+    let decode_peak_mb = u64::from(source_mp) * 3;
+    let inflight_mb = if max_image_mb == 0 { 20 } else { max_image_mb };
+    let thumb_cache_mb = if gallery_mode {
+        let cell = u64::from(crate::gallery::cell_px_for_width(budget_w as u32).max(1));
+        (crate::gallery::THUMB_CACHE_CAP as u64)
+            .saturating_mul(cell)
+            .saturating_mul(cell)
+            .saturating_mul(4)
+            .saturating_add(1_048_575)
+            / 1_048_576
+    } else {
+        0
+    };
+    let ring_mb = frame_mb.saturating_mul(prefetch_count as u64 + 3);
+    decode_peak_mb
+        .saturating_add(inflight_mb)
+        .saturating_add(thumb_cache_mb)
+        .saturating_add(ring_mb)
+        .saturating_add(32)
+}
+
 // ── Web remote ───────────────────────────────────────────────────────────────
 
 /// Built-in HTTP remote control: a phone-friendly page with next / prev /
@@ -551,13 +615,27 @@ impl TargetingConfig {
 
 // ── Root config ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Default)]
+pub struct SecretOrigins {
+    pub wifi_from_external: bool,
+    pub remote_token_external: bool,
+    pub plugin_external: std::collections::HashSet<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub secret_origins: SecretOrigins,
+
     #[serde(default)]
     pub display: DisplayConfig,
 
     #[serde(default)]
     pub cache: CacheConfig,
+
+    /// Headless OAuth / device-code sign-in bounds.
+    #[serde(default)]
+    pub auth: AuthConfig,
 
     /// Optional HTTP remote control.
     #[serde(default)]
@@ -631,7 +709,10 @@ impl Config {
             self.wifi.password = value;
         }
         match std::env::var("PICOGALLERY_WIFI_PASSWORD") {
-            Ok(v) if !v.is_empty() => self.wifi.password = v,
+            Ok(v) if !v.is_empty() => {
+                self.wifi.password = v;
+                self.secret_origins.wifi_from_external = true;
+            }
             Ok(_) => {
                 return Err(anyhow::anyhow!(
                     "PICOGALLERY_WIFI_PASSWORD is set but empty"
@@ -652,7 +733,10 @@ impl Config {
             self.remote.token = Some(value);
         }
         match std::env::var("PICOGALLERY_REMOTE_TOKEN") {
-            Ok(v) if !v.is_empty() => self.remote.token = Some(v),
+            Ok(v) if !v.is_empty() => {
+                self.remote.token = Some(v);
+                self.secret_origins.remote_token_external = true;
+            }
             Ok(_) => return Err(anyhow::anyhow!("PICOGALLERY_REMOTE_TOKEN is set but empty")),
             Err(std::env::VarError::NotPresent) => {}
             Err(e) => return Err(anyhow::anyhow!("reading PICOGALLERY_REMOTE_TOKEN: {e}")),
@@ -661,7 +745,11 @@ impl Config {
         for entry in &mut self.plugins {
             for key in PLUGIN_SECRETS {
                 entry.config.resolve_secret_file(key)?;
-                entry.config.apply_env_secret(&entry.name, key)?;
+                if entry.config.apply_env_secret(&entry.name, key)? {
+                    self.secret_origins
+                        .plugin_external
+                        .insert((entry.name.clone(), key.to_string()));
+                }
             }
         }
         Ok(())
@@ -705,6 +793,54 @@ impl Config {
         if self.cache.prefetch_count == 0 || self.cache.prefetch_count > 8 {
             return Err(anyhow::anyhow!(
                 "cache.prefetch_count must be between 1 and 8"
+            ));
+        }
+        let source_mp = if self.display.max_megapixels == 0 {
+            24
+        } else {
+            self.display.max_megapixels
+        };
+        // Only the image currently being decoded has a source-resolution RGB
+        // buffer. Prefetched entries are cropped/scaled RGBA frames, so the
+        // old `MP * 3 * (1 + prefetch)` formula over-counted every slot as a
+        // full camera image and rejected safe 1080p configurations. Include
+        // current/menu/resize transients plus 32 MiB of process headroom.
+        // Auto resolution assumes a conservative 4K panel; an explicit 1080p
+        // setting can safely use a deeper prefetch ring.
+        //
+        // Gallery thumbs (up to THUMB_CACHE_CAP cells) and one in-flight
+        // compressed JPEG were missing from the original estimate. Default
+        // `max_image_mb = 0` still hard-caps fetches at 50 MB, but the
+        // estimator uses 20 MB (the documented Pi Zero recommendation) so
+        // stock auto-4K + gallery + prefetch 3 still starts. An explicit
+        // `max_image_mb = 50` at 4K is rejected — that combination really
+        // does not fit in 384 MiB.
+        let (budget_w, budget_h) = if dimensions_are_auto {
+            (3840u64, 2160u64)
+        } else {
+            (self.display.width as u64, self.display.height as u64)
+        };
+        let footprint = estimated_peak_image_mb(
+            source_mp,
+            budget_w,
+            budget_h,
+            self.cache.prefetch_count,
+            self.display.max_image_mb,
+            self.display.gallery_mode,
+        );
+        if footprint > 350 {
+            return Err(anyhow::anyhow!(
+                "max_megapixels ({source_mp}), display budget ({budget_w}x{budget_h}), prefetch_count ({}), max_image_mb ({}), gallery_mode ({}) result in an estimated peak image footprint ({footprint} MB) exceeding the memory limit",
+                self.cache.prefetch_count,
+                self.display.max_image_mb,
+                self.display.gallery_mode
+            ));
+        }
+        if self.auth.pending_timeout_secs != 0
+            && !(10..=3600).contains(&self.auth.pending_timeout_secs)
+        {
+            return Err(anyhow::anyhow!(
+                "auth.pending_timeout_secs must be 0 (wait forever) or between 10 and 3600"
             ));
         }
         if self.remote.bind.trim().is_empty() {
@@ -753,20 +889,31 @@ impl Config {
 
     /// Before writing config.toml, drop inline secret values that are backed
     /// by a `*_file` path so Save does not re-embed file contents into TOML.
-    pub fn redact_file_backed_secrets(&mut self) {
+    pub fn redact_secrets_for_persistence(&mut self) {
         const PLUGIN_SECRETS: &[&str] = &["password", "app_password", "client_secret"];
-        if self
+
+        let has_wifi_file = self
             .wifi
             .password_file
             .as_ref()
-            .is_some_and(|p| !p.is_empty())
-        {
+            .is_some_and(|p| !p.is_empty());
+        if has_wifi_file || self.secret_origins.wifi_from_external {
             self.wifi.password.clear();
         }
+
+        if self.secret_origins.remote_token_external {
+            self.remote.token = None;
+        }
+
         for entry in &mut self.plugins {
             for key in PLUGIN_SECRETS {
                 let file_key = format!("{key}_file");
-                if entry.config.get_str(&file_key).is_some() {
+                if entry.config.get_str(&file_key).is_some()
+                    || self
+                        .secret_origins
+                        .plugin_external
+                        .contains(&(entry.name.clone(), key.to_string()))
+                {
                     entry.config.values.remove(*key);
                 }
             }
@@ -782,7 +929,7 @@ impl Config {
         {
             use log::warn;
             use std::os::unix::fs::PermissionsExt;
-            if path == &Config::default_path() {
+            if path == Config::default_path() {
                 if let Some(parent) = path.parent() {
                     if let Err(e) =
                         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
@@ -819,9 +966,17 @@ impl Config {
             .join("config.toml")
     }
 
-    /// Ensure all required directories exist.
+    /// Ensure directories exist. Cache-dir failure is non-fatal: the engine
+    /// degrades to [`crate::cache::CacheHandle`] disabled rather than refusing
+    /// to start (spec §5). Config-dir creation stays with `--generate-config`.
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(self.cache.resolved_dir()).context("creating cache dir")?;
+        let dir = self.cache.resolved_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(
+                "Could not create cache dir {}: {e} — running without disk cache",
+                dir.display()
+            );
+        }
         Ok(())
     }
 
@@ -1119,6 +1274,88 @@ mod tests {
     }
 
     #[test]
+    fn image_budget_counts_prefetch_as_display_sized_frames() {
+        let mut cfg = Config::default();
+        cfg.display.width = 1920;
+        cfg.display.height = 1080;
+        cfg.cache.prefetch_count = 8;
+        assert!(cfg.validate().is_ok());
+
+        // At an explicit 8K resolution even one prefetched RGBA frame exceeds
+        // the appliance's 384 MiB service envelope once decode transients are
+        // included.
+        cfg.display.width = 8192;
+        cfg.display.height = 8192;
+        cfg.cache.prefetch_count = 1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("peak image footprint"));
+    }
+
+    #[test]
+    fn estimator_still_accepts_pi_zero_baseline() {
+        let mut cfg = Config::default();
+        cfg.display.width = 1920;
+        cfg.display.height = 1080;
+        cfg.cache.prefetch_count = 3;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn estimator_counts_gallery_thumbs_and_inflight_jpeg() {
+        // Old formula (decode + ring + 32) accepted explicit 4K + prefetch 3
+        // at ~296 MB. Counting gallery thumbs + a 50 MB JPEG pushes it over.
+        let mut cfg = Config::default();
+        cfg.display.width = 3840;
+        cfg.display.height = 2160;
+        cfg.cache.prefetch_count = 3;
+        cfg.display.max_megapixels = 24;
+        cfg.display.max_image_mb = 50;
+        cfg.display.gallery_mode = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("peak image footprint"),
+            "expected 4K+gallery+50MB JPEG to exceed 350 MB, got: {err}"
+        );
+        assert!(err.contains("gallery_mode"));
+        assert!(err.contains("max_image_mb"));
+    }
+
+    #[test]
+    fn auth_pending_timeout_defaults_to_180() {
+        assert_eq!(AuthConfig::default().pending_timeout_secs, 180);
+        let mut cfg = Config::default();
+        cfg.auth.pending_timeout_secs = 5;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("pending_timeout_secs"));
+        cfg.auth.pending_timeout_secs = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn installed_unit_matches_install_path() {
+        let unit = include_str!("../picogallery.service");
+        let exec: Vec<&str> = unit
+            .lines()
+            .filter(|l| l.starts_with("ExecStart="))
+            .collect();
+        assert_eq!(exec, ["ExecStart=/usr/bin/picogallery"]);
+        assert!(unit.contains("ReadWritePaths=-"));
+        assert!(unit.contains("MemoryMax=384M"));
+        assert!(unit.contains("TasksMax=128"));
+        let install = include_str!("../install.sh");
+        assert!(
+            !install.contains("[Service]"),
+            "install.sh must not author a second unit; render from picogallery.service"
+        );
+    }
+
+    #[test]
     fn remote_defaults_to_loopback() {
         assert_eq!(RemoteConfig::default().bind, "127.0.0.1");
     }
@@ -1194,12 +1431,131 @@ mod tests {
             enabled: true,
             config: pc,
         });
-        cfg.redact_file_backed_secrets();
+        cfg.redact_secrets_for_persistence();
         assert!(cfg.wifi.password.is_empty());
         assert!(cfg.plugins[0].config.get_str("password").is_none());
         assert_eq!(
             cfg.plugins[0].config.get_str("password_file"),
             Some("/run/pp.pass")
         );
+    }
+
+    #[test]
+    fn config_validation_expanded_edge_cases() {
+        // slide_duration_secs
+        let mut cfg = Config::default();
+        cfg.display.slide_duration_secs = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("slide_duration_secs"));
+        cfg.display.slide_duration_secs = 3601;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("slide_duration_secs"));
+
+        // transition_ms
+        cfg = Config::default();
+        cfg.display.transition_ms = 10_001;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("transition_ms"));
+
+        // width and height
+        cfg = Config::default();
+        cfg.display.width = 1920; // One set, one 0
+        cfg.display.height = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("width/height must both be auto"));
+        cfg.display.width = 100; // Out of bounds
+        cfg.display.height = 100;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("within 320x240"));
+
+        // image size limits
+        cfg = Config::default();
+        cfg.display.max_image_mb = 51;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("image limits exceed"));
+
+        // night mode percentages
+        cfg = Config::default();
+        cfg.display.night_dim_percent = 91;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("night percentages"));
+        cfg.display.night_dim_percent = 50;
+        cfg.display.night_warmth = 101;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("night percentages"));
+
+        // cache limits
+        cfg = Config::default();
+        cfg.cache.max_mb = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache.max_mb"));
+        cfg.cache.max_mb = 5000;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache.max_mb"));
+
+        cfg = Config::default();
+        cfg.cache.prefetch_count = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache.prefetch_count"));
+
+        // remote port
+        cfg = Config::default();
+        cfg.remote.enabled = true;
+        cfg.remote.token = Some("1234567890123456".to_string());
+        cfg.remote.port = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("remote.port"));
+
+        // cec poll
+        cfg = Config::default();
+        cfg.cec.enabled = true;
+        cfg.cec.poll_ms = 49;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cec.poll_ms"));
+        cfg.cec.poll_ms = 5001;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cec.poll_ms"));
     }
 }

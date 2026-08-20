@@ -10,9 +10,9 @@
 /// All pixel writes go through the raw `RgbaImage::as_mut()` byte slice with
 /// a precomputed row stride — no `get_pixel`/`put_pixel` per-pixel bounds
 /// checks.  Darkening uses `(c * 7) >> 4` instead of `(c * 45) / 100` to
-/// avoid integer division in the hot loop (especially costly on the original
-/// Pi Zero / Pi Zero W ARM11 core; Pi Zero 2 W has hardware divide but the
-/// shift form is still cheaper).  On 1080p, shift-based dimming is roughly an
+/// avoid integer division in the hot loop (the Pi Zero 2 W has a one-core
+/// performance budget even though the SoC exposes four cores; the shift form
+/// is still cheaper).  On 1080p, shift-based dimming is roughly an
 /// order of magnitude faster than per-pixel division in local profiling on
 /// Pi Zero — treat exact timings as hardware-dependent estimates.
 use font8x8::UnicodeFonts;
@@ -382,7 +382,7 @@ const CLOSE_BTN: u32 = 44;
 
 /// Draw an × close pill in the top-right corner (PhotoPrism kiosk style).
 pub fn draw_close_button(img: &mut RgbaImage) {
-    let (iw, _ih) = img.dimensions();
+    let (iw, ih) = img.dimensions();
     let bx = iw.saturating_sub(CLOSE_BTN + EDGE);
     let by = EDGE;
     darken_rect(img, bx, by, CLOSE_BTN, CLOSE_BTN);
@@ -392,11 +392,11 @@ pub fn draw_close_button(img: &mut RgbaImage) {
     for d in -arm..=arm {
         for t in 0..2 {
             let (px, py) = (cx + d, cy + d + t);
-            if px >= 0 && py >= 0 && (px as u32) < iw {
+            if px >= 0 && py >= 0 && (px as u32) < iw && (py as u32) < ih {
                 img.put_pixel(px as u32, py as u32, Rgba(FG));
             }
             let (px, py) = (cx + d, cy - d + t);
-            if px >= 0 && py >= 0 && (px as u32) < iw {
+            if px >= 0 && py >= 0 && (px as u32) < iw && (py as u32) < ih {
                 img.put_pixel(px as u32, py as u32, Rgba(FG));
             }
         }
@@ -720,6 +720,12 @@ mod tests {
     }
 
     #[test]
+    fn draw_close_button_does_not_panic_on_tiny_image() {
+        let mut img = white_img(20, 20);
+        draw_close_button(&mut img);
+    }
+
+    #[test]
     fn left_arrow_pixels_darkened() {
         let (w, h) = (320u32, 240u32);
         let mut img = white_img(w, h);
@@ -886,5 +892,15 @@ mod tests {
         assert!(!close_button_hit(cx, by + CLOSE_BTN as i32 + 4, w, h));
         // Right-half click outside the close pill should not register as close.
         assert!(!close_button_hit(w as i32 / 2 + 100, cy, w, h));
+    }
+
+    #[test]
+    fn draw_close_button_small_bounds_does_not_panic() {
+        // Image height smaller than CLOSE_BTN (44px) + EDGE (12px)
+        let mut img = white_img(100, 30);
+        draw_close_button(&mut img);
+        // Image with 0 width or height
+        let mut img_empty = white_img(0, 0);
+        draw_close_button(&mut img_empty);
     }
 }

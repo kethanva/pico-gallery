@@ -23,12 +23,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
-use picogallery_core::{AuthStatus, PhotoMeta, PhotoPlugin, PluginConfig};
+use picogallery_core::{
+    exif_thumb_from_head, AuthStatus, FetchIntent, PhotoMeta, PhotoPlugin, PluginConfig,
+    EXIF_HEAD_SCAN_BYTES,
+};
 
 /// Reject images larger than this before passing to the decoder.
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
+/// Wall-clock cap for rclone copy. Without this, a hung child parks the
+/// current-thread runtime (and the display loop) until the process exits.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Name of the rclone remote written into our private config file.
 const REMOTE: &str = "picogallery-gdrive";
@@ -108,6 +117,11 @@ impl GooglePhotosPlugin {
         format!("{}M", self.cfg.get_str("max_transfer").unwrap_or("500"))
     }
 
+    /// rclone copy flags sized for a Pi Zero SD bus: one transfer, few checkers.
+    fn rclone_copy_limit_args() -> [&'static str; 6] {
+        ["--transfers", "1", "--checkers", "2", "--tpslimit", "4"]
+    }
+
     // ── Auth ──────────────────────────────────────────────────────────────────
 
     fn token_saved(&self) -> bool {
@@ -122,11 +136,25 @@ impl GooglePhotosPlugin {
         println!("A browser window is opening. Sign in to Google and approve access.");
         println!("(On a headless Pi, visit the printed URL from another device.)\n");
 
-        let output = Command::new("rclone")
+        const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(300);
+        let child = Command::new("rclone")
             .args(["authorize", "drive", "--drive-scope", "drive.readonly"])
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .context("running 'rclone authorize drive' — is rclone installed?")?;
+
+        let output = match timeout(AUTHORIZE_TIMEOUT, child.wait_with_output()).await {
+            Ok(result) => result.context("rclone authorize wait")?,
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "rclone authorize timed out after {}s. \
+                     Run 'rclone authorize drive' manually to inspect.",
+                    AUTHORIZE_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         // rclone prints the token to stdout between markers; some versions use stderr.
         // Never log the output itself — it contains the OAuth refresh token.
@@ -159,7 +187,13 @@ impl GooglePhotosPlugin {
             "[{}]\ntype = drive\nscope = drive.readonly\ntoken = {}\n",
             REMOTE, token_json
         );
-        fs::create_dir_all(self.conf_path.parent().unwrap()).await?;
+        let parent = self.conf_path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "google-photos: conf_path has no parent: {}",
+                self.conf_path.display()
+            )
+        })?;
+        fs::create_dir_all(parent).await?;
         fs::write(&self.conf_path, conf)
             .await
             .with_context(|| format!("writing {}", self.conf_path.display()))?;
@@ -205,16 +239,16 @@ impl GooglePhotosPlugin {
             dst_str.to_string(),
             "--max-transfer".to_string(),
             "100M".to_string(),
-            "--transfers".to_string(),
-            "4".to_string(),
-            "--include".to_string(),
-            "*.{jpg,jpeg,JPG,JPEG}".to_string(),
         ];
+        cmd_args.extend(
+            Self::rclone_copy_limit_args()
+                .into_iter()
+                .map(str::to_string),
+        );
+        cmd_args.extend(["--include".to_string(), "*.{jpg,jpeg,JPG,JPEG}".to_string()]);
         cmd_args.extend(root_args);
 
-        let out = Command::new("rclone")
-            .args(&cmd_args)
-            .output()
+        let out = rclone_copy_with_timeout(&cmd_args)
             .await
             .context("rclone initial sync (google drive)")?;
 
@@ -260,16 +294,19 @@ impl GooglePhotosPlugin {
                 dst.to_str().unwrap_or("").to_string(),
                 "--max-transfer".to_string(),
                 max_mb,
-                "--transfers".to_string(),
-                "2".to_string(),
-                "--checkers".to_string(),
-                "4".to_string(),
+            ];
+            args.extend(
+                GooglePhotosPlugin::rclone_copy_limit_args()
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            args.extend([
                 "--no-traverse".to_string(),
                 "--include".to_string(),
                 "*.{jpg,jpeg,JPG,JPEG}".to_string(),
-            ];
+            ]);
             args.extend(root_args);
-            let result = Command::new("rclone").args(&args).output().await;
+            let result = rclone_copy_with_timeout(&args).await;
 
             match result {
                 Ok(o) if o.status.success() => info!("rclone background sync complete."),
@@ -316,12 +353,39 @@ impl GooglePhotosPlugin {
     }
 }
 
+async fn rclone_copy_with_timeout(args: &[String]) -> Result<std::process::Output> {
+    let child = Command::new("rclone")
+        .args(args)
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning rclone")?;
+    match timeout(SYNC_TIMEOUT, child.wait_with_output()).await {
+        Ok(result) => result.context("rclone wait"),
+        Err(_) => Err(anyhow::anyhow!(
+            "rclone timed out after {}s",
+            SYNC_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn file_mtime_utc(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
+}
+
 // ── PhotoPlugin impl ──────────────────────────────────────────────────────────
 
 #[async_trait]
 impl PhotoPlugin for GooglePhotosPlugin {
     fn name(&self) -> &str {
         "google-photos"
+    }
+    fn uses_engine_image_cache(&self) -> bool {
+        false
     }
     fn display_name(&self) -> &str {
         "Google Drive (Photos)"
@@ -348,22 +412,23 @@ impl PhotoPlugin for GooglePhotosPlugin {
 
     async fn authenticate(&mut self) -> Result<AuthStatus> {
         // Check rclone is present.
-        let rclone_ok = Command::new("rclone")
-            .arg("version")
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let rclone_ok = timeout(
+            Duration::from_secs(10),
+            Command::new("rclone").arg("version").output(),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
         if !rclone_ok {
-            return Ok(AuthStatus::PendingUserAction {
-                message: "rclone is not installed.\n\
-                          macOS: brew install rclone\n\
-                          Pi:    sudo apt install rclone\n\
-                          Then restart picogallery — it will sign in automatically."
-                    .to_string(),
-                poll_interval_secs: 10,
-            });
+            warn!(
+                "rclone is not installed (or did not respond). \
+                 macOS: brew install rclone; Pi: sudo apt install rclone. \
+                 Google Drive source disabled until rclone is present."
+            );
+            return Ok(AuthStatus::NotAuthenticated);
         }
 
         // Already have a saved token — nothing to do.
@@ -407,42 +472,35 @@ impl PhotoPlugin for GooglePhotosPlugin {
         // and restarts.
         paths.sort();
 
-        let photos: Vec<PhotoMeta> = paths
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|path| {
-                let filename = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let taken_at = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
-                    });
-                PhotoMeta {
-                    // Absolute path as id: stable across restarts and background
-                    // syncs, so disk-cache entries always map back to the same
-                    // photo. A positional index would remap cache entries to
-                    // different photos whenever the synced file set changes.
-                    id: path.to_string_lossy().to_string(),
-                    filename,
-                    width: 0,
-                    height: 0,
-                    taken_at,
-                    download_url: Some(path.to_string_lossy().to_string()),
-                    album: None,
-                    title: None,
-                    location: None,
-                    is_favorite: false,
-                    extra: Default::default(),
-                }
-            })
-            .collect();
+        let mut photos = Vec::new();
+        for path in paths.into_iter().skip(offset).take(limit) {
+            let Some(id) = path.to_str().map(str::to_string) else {
+                continue;
+            };
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&id)
+                .to_string();
+            let taken_at = file_mtime_utc(&path).await;
+            photos.push(PhotoMeta {
+                // Absolute path as id: stable across restarts and background
+                // syncs, so disk-cache entries always map back to the same
+                // photo. A positional index would remap cache entries to
+                // different photos whenever the synced file set changes.
+                id: id.clone(),
+                filename,
+                width: 0,
+                height: 0,
+                taken_at,
+                download_url: Some(id),
+                album: None,
+                title: None,
+                location: None,
+                is_favorite: false,
+                extra: Default::default(),
+            });
+        }
 
         info!(
             "Google Drive: {} photos at offset {}.",
@@ -452,7 +510,7 @@ impl PhotoPlugin for GooglePhotosPlugin {
         Ok(photos)
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         if let Some(abort) = self
             .sync_abort
             .lock()
@@ -465,7 +523,7 @@ impl PhotoPlugin for GooglePhotosPlugin {
         Ok(())
     }
 
-    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, _dw: u32, _dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>> {
         let path_str = meta
             .download_url
             .as_deref()
@@ -497,6 +555,10 @@ impl PhotoPlugin for GooglePhotosPlugin {
             ));
         }
 
+        if let Some(thumb) = try_gallery_exif_thumb(&canonical, file_meta.len(), intent).await? {
+            return Ok(thumb);
+        }
+
         let bytes = fs::read(&canonical)
             .await
             .with_context(|| format!("reading local photo {}", path_str))?;
@@ -508,6 +570,31 @@ impl PhotoPlugin for GooglePhotosPlugin {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Gallery-thumb shortcut: read the JPEG head and return an embedded EXIF
+/// thumbnail when one is large enough. `None` means "read the whole file".
+async fn try_gallery_exif_thumb(
+    path: &Path,
+    file_size: u64,
+    intent: FetchIntent,
+) -> Result<Option<Vec<u8>>> {
+    if !intent.is_thumb() || file_size < 3 {
+        return Ok(None);
+    }
+    let n = (EXIF_HEAD_SCAN_BYTES as u64).min(file_size) as usize;
+    let mut file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut head = vec![0u8; n];
+    if file.read_exact(&mut head).await.is_err() {
+        return Ok(None);
+    }
+    if head.len() < 3 || head[0] != 0xFF || head[1] != 0xD8 || head[2] != 0xFF {
+        return Ok(None);
+    }
+    Ok(exif_thumb_from_head(&head, intent.target_edge()))
+}
 
 /// Extract the token JSON that rclone prints between its paste markers.
 /// Handles both stdout and stderr across rclone versions.
@@ -562,4 +649,101 @@ fn is_image(p: &Path) -> bool {
             .as_deref(),
         Some("jpg" | "jpeg")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use picogallery_core::PluginConfig;
+    use serde_json::json;
+
+    fn build_cfg(map: serde_json::Value) -> PluginConfig {
+        let mut cfg = PluginConfig::default();
+        if let serde_json::Value::Object(obj) = map {
+            cfg.values = obj.into_iter().collect();
+        }
+        cfg
+    }
+
+    #[test]
+    fn test_extract_token_json_primary() {
+        let out = "Some text\n--->\n{\"access_token\":\"abc\",\"refresh_token\":\"def\"}\n<---End paste\nMore text";
+        assert_eq!(
+            extract_token_json(out).unwrap(),
+            "{\"access_token\":\"abc\",\"refresh_token\":\"def\"}"
+        );
+    }
+
+    #[test]
+    fn test_extract_token_json_fallback() {
+        let out = "Some output\n{\"access_token\":\"foo\",\"refresh_token\":\"bar\"}\nDone";
+        assert_eq!(
+            extract_token_json(out).unwrap(),
+            "{\"access_token\":\"foo\",\"refresh_token\":\"bar\"}"
+        );
+    }
+
+    #[test]
+    fn test_extract_token_json_none() {
+        let out = "No json here";
+        assert!(extract_token_json(out).is_none());
+    }
+
+    #[test]
+    fn test_is_image() {
+        assert!(is_image(Path::new("test.jpg")));
+        assert!(is_image(Path::new("test.jpeg")));
+        assert!(is_image(Path::new("test.JPG")));
+        assert!(is_image(Path::new("test.JPEG")));
+        assert!(!is_image(Path::new("test.png")));
+        assert!(!is_image(Path::new("test.txt")));
+        assert!(!is_image(Path::new("test")));
+    }
+
+    #[test]
+    fn test_config_helpers() {
+        let cfg = build_cfg(json!({
+            "sync_dir": "/custom/sync",
+            "drive_folder_id": "123-ABC_456",
+            "max_transfer": "100"
+        }));
+        let plugin = GooglePhotosPlugin::new(cfg);
+        assert_eq!(plugin.sync_dir(), PathBuf::from("/custom/sync"));
+        assert_eq!(
+            plugin.drive_root_args(),
+            vec!["--drive-root-folder-id", "123-ABC_456"]
+        );
+        assert_eq!(plugin.max_transfer_mb(), "100M");
+    }
+
+    #[test]
+    fn test_config_helpers_defaults() {
+        let plugin = GooglePhotosPlugin::new(PluginConfig::default());
+        assert_eq!(plugin.sync_dir(), PathBuf::from("/tmp/picogallery-gdrive"));
+        assert_eq!(plugin.drive_root_args(), Vec::<String>::new());
+        assert_eq!(plugin.max_transfer_mb(), "500M");
+    }
+
+    #[test]
+    fn test_drive_root_args_sanitization() {
+        let cfg = build_cfg(json!({
+            "drive_folder_id": "123-ABC_456!@#$%^&*()_+{}|:\"<>?~`-=[]\\;',./"
+        }));
+        let plugin = GooglePhotosPlugin::new(cfg);
+        // Strips invalid characters
+        assert_eq!(
+            plugin.drive_root_args(),
+            vec!["--drive-root-folder-id", "123-ABC_456_-"]
+        );
+    }
+
+    #[test]
+    fn rclone_sync_args_are_pi_zero_safe() {
+        let args = GooglePhotosPlugin::rclone_copy_limit_args();
+        let joined = args.join(" ");
+        assert!(joined.contains("--transfers 1"));
+        assert!(!joined.contains("--transfers 4"));
+        assert!(joined.contains("--checkers 2"));
+        assert!(joined.contains("--tpslimit 4"));
+    }
 }

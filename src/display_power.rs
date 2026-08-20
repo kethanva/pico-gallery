@@ -78,3 +78,14 @@ pub async fn set_power(on: bool) {
     #[cfg(not(target_os = "linux"))]
     let _ = on;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_set_power() {
+        set_power(true).await;
+        set_power(false).await;
+    }
+}

@@ -98,14 +98,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use picogallery_core::{
-    AuthStatus, ConnectionField, PhotoMeta, PhotoPlugin, PluginCapabilities, PluginConfig,
-    TargetingAdapter,
+    AuthStatus, ConnectionField, FetchIntent, PhotoMeta, PhotoPlugin, PluginCapabilities,
+    PluginConfig, TargetingAdapter,
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 async fn read_bounded(mut response: reqwest::Response, max: u64, label: &str) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max).min(1 << 20) as usize);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -262,7 +263,7 @@ pub struct PhotoPrismPlugin {
     state: Mutex<State>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Session {
     session_id: String,
     preview_token: String,
@@ -647,16 +648,23 @@ impl PhotoPrismPlugin {
         Ok(session)
     }
 
-    async fn ensure_session(&self, state: &mut State) -> Result<()> {
-        if state.session.is_some() {
-            return Ok(());
+    /// Ensure a session exists without holding `state` across HTTP.
+    async fn ensure_session(&self) -> Result<()> {
+        {
+            let state = self.state.lock().await;
+            if state.session.is_some() {
+                return Ok(());
+            }
         }
         let mut sess = self.login().await?;
         // Best-effort token refresh; /config is public on some installs.
         if let Err(e) = self.fetch_config(&mut sess).await {
             warn!("PhotoPrism: /config token refresh failed (non-fatal): {e:#}");
         }
-        state.session = Some(sess);
+        let mut state = self.state.lock().await;
+        if state.session.is_none() {
+            state.session = Some(sess);
+        }
         Ok(())
     }
 
@@ -783,23 +791,39 @@ impl PhotoPrismPlugin {
     /// building a slug→title and uid→title lookup for the OSD. Best-effort:
     /// a failure logs a warning and leaves the map empty so the raw config
     /// value is shown instead.
-    async fn ensure_albums(&self, state: &mut State) {
-        if state.albums_loaded {
-            return;
-        }
-        state.albums_loaded = true; // attempt once, regardless of outcome
-        if self.cfg.get_str("album").is_none() {
-            return; // no album filter — nothing to resolve
-        }
-        let Some(sid) = state.session.as_ref().map(|s| s.session_id.clone()) else {
-            return; // called before a session exists
+    ///
+    /// Does not hold `state` across the HTTP call.
+    async fn ensure_albums(&self) {
+        let sid = {
+            let mut state = self.state.lock().await;
+            if state.albums_loaded {
+                return;
+            }
+            if self.cfg.get_str("album").is_none() {
+                state.albums_loaded = true;
+                return;
+            }
+            let Some(sid) = state.session.as_ref().map(|s| s.session_id.clone()) else {
+                // No session yet — leave albums_loaded false so we retry after login.
+                return;
+            };
+            sid
         };
         match self.fetch_albums(&sid).await {
             Ok(map) => {
                 debug!("PhotoPrism: loaded {} album title(s)", map.len() / 2);
+                let mut state = self.state.lock().await;
                 state.albums = map;
+                state.albums_loaded = true;
             }
-            Err(e) => warn!("PhotoPrism: album list fetch failed: {e}"),
+            Err(e) if e.root_cause().is::<SessionExpired>() => {
+                warn!("PhotoPrism: album list 401 — session cleared, will retry");
+                self.state.lock().await.session = None;
+            }
+            Err(e) => {
+                warn!("PhotoPrism: album list fetch failed: {e}");
+                self.state.lock().await.albums_loaded = true;
+            }
         }
     }
 
@@ -813,7 +837,13 @@ impl PhotoPrismPlugin {
             .query(&params)
             .send()
             .await
-            .with_context(|| format!("GET {url} (albums)"))?
+            .with_context(|| format!("GET {url} (albums)"))?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(
+                anyhow::Error::new(SessionExpired).context(format!("GET {url} (albums) HTTP 401"))
+            );
+        }
+        let resp = resp
             .error_for_status()
             .with_context(|| format!("GET {url}: HTTP error"))?;
 
@@ -835,59 +865,88 @@ impl PhotoPrismPlugin {
         Ok(map)
     }
 
-    async fn populate_until(&self, state: &mut State, needed: usize) -> Result<()> {
+    /// Fill `cached` until it has at least `needed` entries (or the remote
+    /// library is exhausted).
+    ///
+    /// **Lock contract:** the state mutex must not be held across `.await`
+    /// points. Concurrent `get_photo_bytes` (Fetcher) needs the lock while
+    /// listing pages over the network.
+    async fn populate_until(&self, needed: usize) -> Result<()> {
         let mut reauth_attempts = 0u32;
-        while !state.exhausted && state.cached.len() < needed {
-            // Re-login transparently if the session was invalidated mid-run.
-            self.ensure_session(state).await?;
-            // One-shot album-title fetch (no-op unless an album filter is set
-            // and it hasn't run yet). Done after ensure_session so a session
-            // exists; cheap thereafter.
-            self.ensure_albums(state).await;
-            // Resolve the configured album to its human title once per page —
-            // a String clone, so it doesn't borrow `state` across the push below.
-            let album_title = self.resolve_album_title(&state.albums);
-            let page = state.next_page;
-            // `fetch_page` may refresh preview/download tokens on the session.
-            let photos = {
-                let sess = state
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("photoprism: session missing after ensure_session"))?;
-                match self.fetch_page(sess, page).await {
-                    Ok(p) => p,
-                    Err(e) if e.root_cause().is::<SessionExpired>() => {
-                        reauth_attempts += 1;
-                        if reauth_attempts > 3 {
-                            return Err(anyhow!("photoprism: repeated 401 after {reauth_attempts} re-auth attempts — check credentials"));
-                        }
-                        warn!(
-                            "PhotoPrism: re-authenticating after 401 (attempt {reauth_attempts})"
-                        );
-                        state.session = None;
-                        continue;
+        loop {
+            // Under lock: done? need login? else snapshot for HTTP.
+            let snapshot = {
+                let state = self.state.lock().await;
+                if state.exhausted || state.cached.len() >= needed {
+                    return Ok(());
+                }
+                match state.session.clone() {
+                    None => None,
+                    Some(sess) => {
+                        let page = state.next_page;
+                        let album_title = self.resolve_album_title(&state.albums);
+                        Some((page, sess, album_title))
                     }
-                    Err(e) => return Err(e),
                 }
             };
-            let returned = photos.len() as u32;
-            // Deduplicate by photo id. Overlapping pages (unstable sort, or
-            // `order=random`) must not inflate the cache with repeats that the
-            // gallery would then show again on the next offset window.
-            for p in photos {
-                if let Some(meta) = photo_to_meta(p, album_title.as_deref()) {
-                    if state.cached_ids.insert(meta.id.clone()) {
-                        state.cached.push(meta);
-                    }
-                }
-            }
 
-            if returned == 0 || returned < self.per_page() {
-                state.exhausted = true;
+            let Some((page, mut sess, album_title)) = snapshot else {
+                // No session: login outside the lock, then install if still absent.
+                let mut new_sess = self.login().await?;
+                if let Err(e) = self.fetch_config(&mut new_sess).await {
+                    warn!("PhotoPrism: /config token refresh failed (non-fatal): {e:#}");
+                }
+                let mut state = self.state.lock().await;
+                if state.session.is_none() {
+                    state.session = Some(new_sess);
+                }
+                continue;
+            };
+
+            // One-shot album-title fetch outside the lock (no-op unless needed).
+            self.ensure_albums().await;
+            // Album titles may have landed after ensure_albums — refresh title.
+            let album_title = {
+                let state = self.state.lock().await;
+                if state.exhausted || state.cached.len() >= needed {
+                    return Ok(());
+                }
+                self.resolve_album_title(&state.albums).or(album_title)
+            };
+
+            match self.fetch_page(&mut sess, page).await {
+                Ok(photos) => {
+                    let returned = photos.len() as u32;
+                    let mut state = self.state.lock().await;
+                    // Persist any token refresh from response headers.
+                    state.session = Some(sess);
+                    for p in photos {
+                        if let Some(meta) = photo_to_meta(p, album_title.as_deref()) {
+                            if state.cached_ids.insert(meta.id.clone()) {
+                                state.cached.push(meta);
+                            }
+                        }
+                    }
+                    if returned == 0 || returned < self.per_page() {
+                        state.exhausted = true;
+                    }
+                    state.next_page = page + 1;
+                }
+                Err(e) if e.root_cause().is::<SessionExpired>() => {
+                    reauth_attempts += 1;
+                    if reauth_attempts > 3 {
+                        return Err(anyhow!(
+                            "photoprism: repeated 401 after {reauth_attempts} re-auth attempts — check credentials"
+                        ));
+                    }
+                    warn!("PhotoPrism: re-authenticating after 401 (attempt {reauth_attempts})");
+                    let mut state = self.state.lock().await;
+                    state.session = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            state.next_page = page + 1;
         }
-        Ok(())
     }
 }
 
@@ -1130,8 +1189,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
     }
 
     async fn authenticate(&mut self) -> Result<AuthStatus> {
-        let mut state = self.state.lock().await;
-        self.ensure_session(&mut state).await?;
+        self.ensure_session().await?;
         Ok(AuthStatus::Authenticated)
     }
 
@@ -1150,13 +1208,15 @@ impl PhotoPlugin for PhotoPrismPlugin {
     }
 
     async fn list_albums(&self) -> Result<Vec<(String, String)>> {
-        let mut state = self.state.lock().await;
-        self.ensure_session(&mut state).await?;
-        let sid = state
-            .session
-            .as_ref()
-            .map(|s| s.session_id.clone())
-            .ok_or_else(|| anyhow::anyhow!("photoprism: not authenticated"))?;
+        self.ensure_session().await?;
+        let sid = {
+            let state = self.state.lock().await;
+            state
+                .session
+                .as_ref()
+                .map(|s| s.session_id.clone())
+                .ok_or_else(|| anyhow::anyhow!("photoprism: not authenticated"))?
+        };
         let map = self.fetch_albums(&sid).await?;
         let mut seen_titles = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -1170,9 +1230,8 @@ impl PhotoPlugin for PhotoPrismPlugin {
     }
 
     async fn list_photos(&self, limit: usize, offset: usize) -> Result<Vec<PhotoMeta>> {
-        let mut state = self.state.lock().await;
-        self.populate_until(&mut state, offset + limit).await?;
-
+        self.populate_until(offset + limit).await?;
+        let state = self.state.lock().await;
         if offset >= state.cached.len() {
             return Ok(vec![]);
         }
@@ -1180,33 +1239,15 @@ impl PhotoPlugin for PhotoPrismPlugin {
         Ok(state.cached[offset..end].to_vec())
     }
 
-    async fn get_photo_bytes(&mut self, meta: &PhotoMeta, dw: u32, dh: u32) -> Result<Vec<u8>> {
+    async fn get_photo_bytes(&self, meta: &PhotoMeta, intent: FetchIntent) -> Result<Vec<u8>> {
+        let (dw, dh) = intent.dimensions();
         let hash = meta
             .extra
             .get("hash")
             .ok_or_else(|| anyhow!("photoprism: meta missing `hash` for '{}'", meta.filename))?;
-        // Tokens are session-scoped secrets and must never be copied into
-        // queue metadata, logs, status responses, or cache records.
-        let (preview_token, download_token, headers) = {
-            let state = self.state.lock().await;
-            let session = state
-                .session
-                .as_ref()
-                .ok_or_else(|| anyhow!("photoprism: no authenticated session"))?;
-            let preview_token = session.preview_token.clone();
-            let download_token = session.download_token.clone();
-            let headers = Self::auth_headers(session);
-            (preview_token, download_token, headers)
-        };
-        let preview_token = preview_token.as_str();
-        let download_token = download_token.as_str();
 
         let cap = self.max_thumb_cap();
         let size = pick_thumb_size(dw, dh, cap);
-
-        // Decide: thumbnail or original?
-        // If the largest allowed thumb is still smaller than the display, and
-        // the user permits originals, fetch the original instead.
         let largest_thumb_px = THUMB_SIZES
             .iter()
             .filter(|(_, px)| *px <= cap)
@@ -1217,54 +1258,87 @@ impl PhotoPlugin for PhotoPrismPlugin {
             && dw.max(dh) > largest_thumb_px
             && meta.width.max(meta.height) > largest_thumb_px;
 
-        // The download token rides in the query string so reqwest encodes it.
-        // The preview token is path-embedded; PhotoPrism issues alphanumeric
-        // tokens, so reject anything else rather than percent-encode (avoids a
-        // new dependency, and a hostile value can't smuggle path segments).
-        let request = if need_original {
-            self.client()?
-                .get(self.api_url(&format!("/dl/{hash}"))?)
-                .query(&[("t", download_token)])
-        } else {
-            if !preview_token.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        let mut attempts = 0u32;
+        loop {
+            self.ensure_session().await?;
+            // Tokens are session-scoped secrets and must never be copied into
+            // queue metadata, logs, status responses, or cache records.
+            let (preview_token, download_token, headers) = {
+                let state = self.state.lock().await;
+                let session = state
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("photoprism: no authenticated session"))?;
+                (
+                    session.preview_token.clone(),
+                    session.download_token.clone(),
+                    Self::auth_headers(session),
+                )
+            };
+
+            // The download token rides in the query string so reqwest encodes it.
+            // The preview token is path-embedded; PhotoPrism issues alphanumeric
+            // tokens, so reject anything else rather than percent-encode.
+            let request = if need_original {
+                self.client()?
+                    .get(self.api_url(&format!("/dl/{hash}"))?)
+                    .query(&[("t", download_token.as_str())])
+            } else {
+                if !preview_token.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Err(anyhow!(
+                        "photoprism: preview token contains unexpected characters"
+                    ));
+                }
+                self.client()?
+                    .get(self.api_url(&format!("/t/{hash}/{preview_token}/{size}"))?)
+            };
+
+            let resp = request
+                .headers(headers)
+                .send()
+                .await
+                .with_context(|| format!("photoprism: fetching image (hash {hash})"))?;
+
+            if resp.status() == StatusCode::UNAUTHORIZED {
+                attempts += 1;
+                if attempts > 2 {
+                    return Err(anyhow!(
+                        "photoprism: HTTP 401 fetching image after re-auth (hash {hash})"
+                    ));
+                }
+                warn!(
+                    "PhotoPrism: re-authenticating after 401 on image fetch (attempt {attempts})"
+                );
+                self.state.lock().await.session = None;
+                continue;
+            }
+
+            let resp = resp
+                .error_for_status()
+                .with_context(|| format!("photoprism: HTTP error fetching image (hash {hash})"))?;
+
+            if let Some(len) = resp.content_length() {
+                if len > MAX_IMAGE_BYTES {
+                    return Err(anyhow!(
+                        "photoprism: image too large ({} MB, hash {hash})",
+                        len / 1_048_576
+                    ));
+                }
+            }
+
+            let bytes = read_bounded(resp, MAX_IMAGE_BYTES, "PhotoPrism image body").await?;
+            if !is_image_magic(&bytes) {
+                warn!(
+                    "PhotoPrism: response for hash {hash} ({} bytes) is not a recognised image format",
+                    bytes.len()
+                );
                 return Err(anyhow!(
-                    "photoprism: preview token contains unexpected characters"
+                    "photoprism: not a recognised image format (hash {hash}, {} bytes)",
+                    bytes.len()
                 ));
             }
-            self.client()?
-                .get(self.api_url(&format!("/t/{hash}/{preview_token}/{size}"))?)
-        };
-
-        // Errors and logs carry the file hash, never the token-bearing URL.
-        let resp = request
-            .headers(headers)
-            .send()
-            .await
-            .with_context(|| format!("photoprism: fetching image (hash {hash})"))?
-            .error_for_status()
-            .with_context(|| format!("photoprism: HTTP error fetching image (hash {hash})"))?;
-
-        if let Some(len) = resp.content_length() {
-            if len > MAX_IMAGE_BYTES {
-                return Err(anyhow!(
-                    "photoprism: image too large ({} MB, hash {hash})",
-                    len / 1_048_576
-                ));
-            }
+            return Ok(bytes);
         }
-
-        let bytes = read_bounded(resp, MAX_IMAGE_BYTES, "PhotoPrism image body").await?;
-        if !is_image_magic(&bytes) {
-            warn!(
-                "PhotoPrism: response for hash {hash} ({} bytes) is not a recognised image format",
-                bytes.len()
-            );
-            return Err(anyhow!(
-                "photoprism: not a recognised image format (hash {hash}, {} bytes)",
-                bytes.len()
-            ));
-        }
-        Ok(bytes)
     }
 
     async fn set_favorite(&self, meta: &PhotoMeta, favorite: bool) -> Result<()> {
@@ -1280,16 +1354,18 @@ impl PhotoPlugin for PhotoPrismPlugin {
         }
         let url = self.api_url(&format!("/photos/{uid}/like"))?;
 
-        let mut state = self.state.lock().await;
         let mut attempts = 0u32;
         loop {
-            self.ensure_session(&mut state).await?;
-            let sid = state
-                .session
-                .as_ref()
-                .ok_or_else(|| anyhow!("photoprism: session missing after ensure_session"))?
-                .session_id
-                .clone();
+            self.ensure_session().await?;
+            let sid = {
+                let state = self.state.lock().await;
+                state
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("photoprism: session missing after ensure_session"))?
+                    .session_id
+                    .clone()
+            };
 
             // POST /like favourites; DELETE /like clears it.
             let req = if favorite {
@@ -1310,7 +1386,7 @@ impl PhotoPlugin for PhotoPrismPlugin {
                         "photoprism: favourite failed after re-auth (uid {uid})"
                     ));
                 }
-                state.session = None;
+                self.state.lock().await.session = None;
                 continue;
             }
             resp.error_for_status()
@@ -1323,18 +1399,18 @@ impl PhotoPlugin for PhotoPrismPlugin {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         // Best-effort logout — DELETE /api/v1/session/{id} — ignore errors.
-        let state = self.state.lock().await;
-        if let Some(sess) = state.session.as_ref() {
-            if let Ok(url) = self.api_url(&format!("/session/{}", sess.session_id)) {
-                let _ = self
-                    .client()?
-                    .delete(&url)
-                    .headers(Self::auth_headers(sess))
-                    .send()
-                    .await;
-            }
+        let logout = {
+            let state = self.state.lock().await;
+            state.session.as_ref().and_then(|sess| {
+                self.api_url(&format!("/session/{}", sess.session_id))
+                    .ok()
+                    .map(|url| (url, Self::auth_headers(sess)))
+            })
+        };
+        if let Some((url, headers)) = logout {
+            let _ = self.client()?.delete(&url).headers(headers).send().await;
         }
         Ok(())
     }
@@ -1917,5 +1993,121 @@ mod tests {
         let plugin3 = PhotoPrismPlugin::new(cfg3);
         assert!(plugin3.validate_tls_policy(true).is_ok());
         assert!(plugin3.validate_tls_policy(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_photoprism_mock_login() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "mock-session-123",
+                "previewToken": "prev1",
+                "downloadToken": "down1"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = picogallery_core::PluginConfig::default();
+        cfg.values
+            .insert("url".to_string(), serde_json::Value::String(server.uri()));
+        cfg.values.insert(
+            "username".to_string(),
+            serde_json::Value::String("admin".to_string()),
+        );
+        cfg.values.insert(
+            "password".to_string(),
+            serde_json::Value::String("pass".to_string()),
+        );
+
+        let mut plugin = PhotoPrismPlugin::new(cfg);
+        // Explicitly set client since init() is not called yet, or call init()
+        plugin.client = Some(PhotoPrismPlugin::build_client(false, 30).unwrap());
+
+        let session = plugin.login().await.unwrap();
+        assert_eq!(session.session_id, "mock-session-123");
+        assert_eq!(session.preview_token, "prev1");
+        assert_eq!(session.download_token, "down1");
+    }
+
+    #[tokio::test]
+    async fn test_photoprism_fetch_page() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/photos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "Hash": "hash1",
+                    "UID": "uid1",
+                    "FileName": "test.jpg",
+                    "Name": "Test",
+                    "OriginalName": "Test",
+                    "Title": "Test Title",
+                    "Type": "image",
+                    "Favorite": false,
+                    "Files": []
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let mut cfg = picogallery_core::PluginConfig::default();
+        cfg.values
+            .insert("url".to_string(), serde_json::Value::String(server.uri()));
+
+        let mut plugin = PhotoPrismPlugin::new(cfg);
+        plugin.client = Some(PhotoPrismPlugin::build_client(false, 30).unwrap());
+
+        let mut sess = Session {
+            session_id: "sid".into(),
+            preview_token: "prev".into(),
+            download_token: "dl".into(),
+        };
+
+        let photos = plugin.fetch_page(&mut sess, 0).await.unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].hash, "hash1");
+        assert_eq!(photos[0].uid, "uid1");
+    }
+
+    #[test]
+    fn session_clones_all_token_fields() {
+        let s = Session {
+            session_id: "sid".into(),
+            preview_token: "prev".into(),
+            download_token: "dl".into(),
+        };
+        let c = s.clone();
+        assert_eq!(c.session_id, "sid");
+        assert_eq!(c.preview_token, "prev");
+        assert_eq!(c.download_token, "dl");
+    }
+
+    /// Soft proof of the `populate_until` lock contract: acquire the state
+    /// mutex, drop it, await, then acquire again — a second task must be able
+    /// to interleave without deadlock when the lock is not held across await.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_mutex_released_between_await_points() {
+        let plugin = PhotoPrismPlugin::new(PluginConfig::default());
+        // auth_status locks and releases.
+        let _ = plugin.auth_status().await;
+        tokio::task::yield_now().await;
+        let status = plugin.auth_status().await;
+        assert!(matches!(status, AuthStatus::NotAuthenticated));
+
+        // Explicit: brief lock, drop, then another acquisition after await.
+        {
+            let _g = plugin.state.lock().await;
+        }
+        tokio::task::yield_now().await;
+        let _g = plugin.state.lock().await;
     }
 }

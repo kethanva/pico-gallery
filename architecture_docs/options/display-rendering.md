@@ -198,7 +198,7 @@ memory traffic per transition. On Pi Zero's shared LPDDR2 bus, this is measurabl
 
 | Device | RAM | Cores | Recommended approach | Reason |
 |---|---|---|---|---|
-| Pi Zero W / 2W | 512 MB | 1 | Direct DRM+GBM | Every MB and CPU % counts |
+| Pi Zero 2 W | 512 MB | 4 (one-core budget) | SDL2 + DRM probe | Current supported path; keep the simpler renderer on the production target |
 | Pi 2 / 3 | 1 GB | 4 | Either | SDL2 overhead is small relative to headroom |
 | Pi 4 / 5 | 4–8 GB | 4 | SDL2 + DRM probe | No reason to add complexity |
 

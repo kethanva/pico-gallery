@@ -104,3 +104,68 @@ pub fn apply_orientation_rgba(img: RgbaImage, orientation: u32) -> RgbaImage {
         _ => img, // 1 or any unknown value — no transform
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::RgbaImage;
+
+    #[test]
+    fn test_read_exif_empty() {
+        let info = read_exif(&[]);
+        assert_eq!(info.orientation, 1);
+        assert_eq!(info.date, None);
+    }
+
+    #[test]
+    fn test_apply_orientation_rgba() {
+        let mut img = RgbaImage::new(2, 3);
+        // Put a pixel at (0, 0) to track rotations
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+
+        // No transform
+        let out = apply_orientation_rgba(img.clone(), 1);
+        assert_eq!(out.dimensions(), (2, 3));
+        assert_eq!(out.get_pixel(0, 0)[0], 255);
+
+        // Flip horizontal
+        let out = apply_orientation_rgba(img.clone(), 2);
+        assert_eq!(out.dimensions(), (2, 3));
+        assert_eq!(out.get_pixel(1, 0)[0], 255);
+
+        // Rotate 180
+        let out = apply_orientation_rgba(img.clone(), 3);
+        assert_eq!(out.dimensions(), (2, 3));
+        assert_eq!(out.get_pixel(1, 2)[0], 255);
+
+        // Flip vertical
+        let out = apply_orientation_rgba(img.clone(), 4);
+        assert_eq!(out.dimensions(), (2, 3));
+        assert_eq!(out.get_pixel(0, 2)[0], 255);
+
+        // Rotate 90 CW + Flip Horiz
+        let out = apply_orientation_rgba(img.clone(), 5);
+        assert_eq!(out.dimensions(), (3, 2));
+        assert_eq!(out.get_pixel(0, 0)[0], 255);
+
+        // Rotate 90 CW
+        let out = apply_orientation_rgba(img.clone(), 6);
+        assert_eq!(out.dimensions(), (3, 2));
+        assert_eq!(out.get_pixel(2, 0)[0], 255);
+
+        // Rotate 270 CW + Flip Horiz
+        let out = apply_orientation_rgba(img.clone(), 7);
+        assert_eq!(out.dimensions(), (3, 2));
+        assert_eq!(out.get_pixel(2, 1)[0], 255);
+
+        // Rotate 270 CW
+        let out = apply_orientation_rgba(img.clone(), 8);
+        assert_eq!(out.dimensions(), (3, 2));
+        assert_eq!(out.get_pixel(0, 1)[0], 255);
+
+        // Unknown
+        let out = apply_orientation_rgba(img.clone(), 9);
+        assert_eq!(out.dimensions(), (2, 3));
+        assert_eq!(out.get_pixel(0, 0)[0], 255);
+    }
+}

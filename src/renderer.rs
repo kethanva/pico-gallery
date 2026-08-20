@@ -170,6 +170,10 @@ pub struct Renderer {
     /// as keys rather than being swallowed as typed text.
     text_input: sdl2::keyboard::TextInputUtil,
     text_input_active: bool,
+    /// True between a left MouseButtonDown and the matching Up. Touchscreens
+    /// often deliver taps on Up only; mice deliver both. Tracking this across
+    /// poll_events calls avoids double GalleryClick/BackToGallery.
+    left_pointer_down: bool,
     /// Precached sRGB output profile for ICC colour correction. Built once
     /// (the LUT precompute is the costly part) and reused for every photo —
     /// only the per-image *input* profile is rebuilt. Saves rebuilding the
@@ -179,96 +183,104 @@ pub struct Renderer {
     srgb_profile: Arc<qcms::Profile>,
 }
 
-impl Renderer {
-    pub fn init(config: DisplayConfig) -> Result<Self> {
-        // ── XDG_RUNTIME_DIR (Linux only) ──────────────────────────────────────
-        // SDL2 / mesa / dbus all complain when this is unset under systemd or
-        // when running over SSH. Point it at /run/user/$UID if that exists
-        // (systemd-logind creates it for interactive sessions) or fall back
-        // to a private /tmp/runtime-$UID dir with 0700 perms.
-        #[cfg(target_os = "linux")]
-        {
-            let uid: u32 = std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("Uid:"))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .and_then(|v| v.parse::<u32>().ok())
-                })
-                .unwrap_or(1000);
+/// SDL / DRM environment prepared before the Tokio runtime starts.
+///
+/// `set_var` is not thread-safe once spawn_blocking workers may read the
+/// environment, so [`prepare_display_env`] must run first. The probe results
+/// travel with this handle into [`Renderer::init`].
+#[derive(Debug, Clone, Default)]
+pub struct DisplayEnv {
+    pub probed_w: u32,
+    pub probed_h: u32,
+    pub probed_path: Option<String>,
+}
 
-            let runtime_ok = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(|p| std::path::Path::new(&p).is_dir())
-                .unwrap_or(false);
+/// Configure XDG_RUNTIME_DIR + KMS/DRM env vars and probe the display card.
+/// Call once from `main` before building the Tokio runtime.
+pub fn prepare_display_env() -> DisplayEnv {
+    // ── XDG_RUNTIME_DIR (Linux only) ──────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        let uid: u32 = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+            .unwrap_or(1000);
 
-            if !runtime_ok {
-                let run_user = format!("/run/user/{}", uid);
-                let chosen = if std::path::Path::new(&run_user).is_dir() {
-                    run_user
-                } else {
-                    let fallback = format!("/tmp/runtime-{}", uid);
-                    if let Err(e) = std::fs::create_dir_all(&fallback) {
-                        warn!("Could not create {}: {}", fallback, e);
-                    } else {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &fallback,
-                            std::fs::Permissions::from_mode(0o700),
-                        );
-                    }
-                    fallback
-                };
-                info!("Setting XDG_RUNTIME_DIR={}", chosen);
-                std::env::set_var("XDG_RUNTIME_DIR", chosen);
-            }
-        }
+        let runtime_ok = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|p| std::path::Path::new(&p).is_dir())
+            .unwrap_or(false);
 
-        // ── DRM display probe (Linux only) ────────────────────────────────────
-        // Finds the correct /dev/dri/cardN (Pi 4/5 has display on card1, not card0)
-        // and the native resolution. On macOS this block is compiled away entirely.
-        #[cfg(target_os = "linux")]
-        let (probed_w, probed_h, probed_path) = {
-            if let Some((dev_path, w, h)) = drm_probe::probe() {
-                (w, h, Some(dev_path))
+        if !runtime_ok {
+            let run_user = format!("/run/user/{}", uid);
+            let chosen = if std::path::Path::new(&run_user).is_dir() {
+                run_user
             } else {
-                (0u32, 0u32, None)
-            }
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (probed_w, probed_h, _probed_path) = (0u32, 0u32, None::<String>);
-
-        // ── KMS/DRM backend selection (Linux only) ────────────────────────────
-        #[cfg(target_os = "linux")]
-        {
-            let env_driver = std::env::var("SDL_VIDEODRIVER").ok();
-            let has_x11 = std::env::var("DISPLAY").is_ok();
-            let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-
-            // Use kmsdrm if:
-            //   a) the caller/service already requested it explicitly, OR
-            //   b) no graphical session is present and no driver override was given
-            let want_kmsdrm = match env_driver.as_deref() {
-                Some("kmsdrm") => true,
-                None if !has_x11 && !has_wayland => true,
-                _ => false,
-            };
-
-            if want_kmsdrm {
-                if env_driver.is_none() {
-                    info!("No graphical session detected; forcing SDL_VIDEODRIVER=kmsdrm");
-                    std::env::set_var("SDL_VIDEODRIVER", "kmsdrm");
+                let fallback = format!("/tmp/runtime-{}", uid);
+                if let Err(e) = std::fs::create_dir_all(&fallback) {
+                    warn!("Could not create {}: {}", fallback, e);
+                } else {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700));
                 }
-                // Always apply the probed device so SDL picks the right card
-                // (Pi 4 has the display on card1, not card0 which SDL defaults to).
-                if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
-                    if let Some(ref path) = probed_path {
-                        info!("Setting SDL_VIDEO_KMSDRM_DEVICE={}", path);
-                        std::env::set_var("SDL_VIDEO_KMSDRM_DEVICE", path);
-                    }
+                fallback
+            };
+            info!("Setting XDG_RUNTIME_DIR={}", chosen);
+            std::env::set_var("XDG_RUNTIME_DIR", chosen);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    let (probed_w, probed_h, probed_path) = {
+        if let Some((dev_path, w, h)) = drm_probe::probe() {
+            (w, h, Some(dev_path))
+        } else {
+            (0u32, 0u32, None)
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (probed_w, probed_h, probed_path) = (0u32, 0u32, None::<String>);
+
+    #[cfg(target_os = "linux")]
+    {
+        let env_driver = std::env::var("SDL_VIDEODRIVER").ok();
+        let has_x11 = std::env::var("DISPLAY").is_ok();
+        let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        let want_kmsdrm = match env_driver.as_deref() {
+            Some("kmsdrm") => true,
+            None if !has_x11 && !has_wayland => true,
+            _ => false,
+        };
+        if want_kmsdrm {
+            if env_driver.is_none() {
+                info!("No graphical session detected; forcing SDL_VIDEODRIVER=kmsdrm");
+                std::env::set_var("SDL_VIDEODRIVER", "kmsdrm");
+            }
+            if std::env::var("SDL_VIDEO_KMSDRM_DEVICE").is_err() {
+                if let Some(ref path) = probed_path {
+                    info!("Setting SDL_VIDEO_KMSDRM_DEVICE={}", path);
+                    std::env::set_var("SDL_VIDEO_KMSDRM_DEVICE", path);
                 }
             }
         }
+    }
+
+    DisplayEnv {
+        probed_w,
+        probed_h,
+        probed_path,
+    }
+}
+
+impl Renderer {
+    pub fn init(config: DisplayConfig, display_env: DisplayEnv) -> Result<Self> {
+        // Env vars + DRM probe already applied by [`prepare_display_env`].
+        let (probed_w, probed_h) = (display_env.probed_w, display_env.probed_h);
 
         let sdl_ctx = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {}", e))?;
 
@@ -410,6 +422,7 @@ impl Renderer {
             config,
             text_input,
             text_input_active: false,
+            left_pointer_down: false,
             srgb_profile: Arc::from(srgb_profile),
         })
     }
@@ -455,6 +468,27 @@ pub struct ImageProcessor {
 }
 
 impl ImageProcessor {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// SDL-free processor for unit tests (fetcher / decode path).
+    #[cfg(test)]
+    pub(crate) fn for_test(width: u32, height: u32) -> std::sync::Arc<Self> {
+        let mut srgb = qcms::Profile::new_sRGB();
+        srgb.precache_output_transform();
+        std::sync::Arc::new(Self {
+            config: DisplayConfig::default(),
+            width,
+            height,
+            srgb_profile: std::sync::Arc::from(srgb),
+        })
+    }
+
     // ── Image decode & scale ─────────────────────────────────────────────────
 
     /// Decode, EXIF-correct, and scale an image in one pass.
@@ -618,19 +652,59 @@ impl ImageProcessor {
         let orientation = crate::exif_util::read_exif(bytes).orientation;
         let size = max_px.max(1);
 
-        // Orient first so the cover crop matches what the gallery displays.
-        let rgba = crate::exif_util::apply_orientation_rgba(img.to_rgba8(), orientation);
-        let (sw, sh) = (rgba.width().max(1), rgba.height().max(1));
-        if sw == size && sh == size {
-            return Ok(rgba);
-        }
-        let scale = f32::max(size as f32 / sw as f32, size as f32 / sh as f32);
+        let (sw, sh) = (img.width(), img.height());
+        let (sw_nz, sh_nz) = match (std::num::NonZeroU32::new(sw), std::num::NonZeroU32::new(sh)) {
+            (Some(w), Some(h)) => (w, h),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "cannot create thumbnail for zero-sized image {}×{}",
+                    sw,
+                    sh
+                ))
+            }
+        };
+
+        // Gallery thumbs are square, so 90°/270° EXIF rotations do not
+        // change the scale target.
+        let (target_w, target_h) = (size, size);
+
+        let scale = f32::max(target_w as f32 / sw as f32, target_h as f32 / sh as f32);
         let nw = ((sw as f32 * scale).ceil() as u32).max(1);
         let nh = ((sh as f32 * scale).ceil() as u32).max(1);
-        let scaled = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
-        let ox = scaled.width().saturating_sub(size) / 2;
-        let oy = scaled.height().saturating_sub(size) / 2;
-        Ok(image::imageops::crop_imm(&scaled, ox, oy, size, size).to_image())
+
+        use fast_image_resize as fir;
+        let src = fir::Image::from_vec_u8(
+            sw_nz,
+            sh_nz,
+            img.into_rgb8().into_raw(),
+            fir::PixelType::U8x3,
+        )
+        .map_err(|e| anyhow::anyhow!("building thumbnail resize source: {}", e))?;
+
+        let mut dst = fir::Image::new(
+            std::num::NonZeroU32::new(nw).unwrap(),
+            std::num::NonZeroU32::new(nh).unwrap(),
+            fir::PixelType::U8x3,
+        );
+        let mut resizer = fir::Resizer::new(fir::ResizeAlg::Nearest);
+        resizer
+            .resize(&src.view(), &mut dst.view_mut())
+            .map_err(|e| anyhow::anyhow!("thumbnail resize: {}", e))?;
+
+        let rgb_raw = dst.into_vec();
+        let mut rgba_raw = Vec::with_capacity(nw as usize * nh as usize * 4);
+        for chunk in rgb_raw.chunks_exact(3) {
+            rgba_raw.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+        }
+        let small_rgba = RgbaImage::from_raw(nw, nh, rgba_raw)
+            .ok_or_else(|| anyhow::anyhow!("building thumbnail RGBA buffer"))?;
+
+        // Rotate the small scaled image (<1 MB)
+        let oriented = crate::exif_util::apply_orientation_rgba(small_rgba, orientation);
+        let (ow, oh) = (oriented.width(), oriented.height());
+        let ox = ow.saturating_sub(size) / 2;
+        let oy = oh.saturating_sub(size) / 2;
+        Ok(image::imageops::crop_imm(&oriented, ox, oy, size.min(ow), size.min(oh)).to_image())
     }
 
     // scale_image is kept for any future callers that don't need orientation.
@@ -651,16 +725,6 @@ impl ImageProcessor {
         icc_profile: &Option<Vec<u8>>,
     ) -> Result<RgbaImage> {
         let (sw, sh) = (img.width(), img.height());
-
-        // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
-        let scale = if self.config.fill_screen {
-            f32::max(dw as f32 / sw as f32, dh as f32 / sh as f32)
-        } else {
-            f32::min(dw as f32 / sw as f32, dh as f32 / sh as f32)
-        };
-        let (nw, nh) = ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32);
-
-        use fast_image_resize as fir;
         let (sw_nz, sh_nz) = match (std::num::NonZeroU32::new(sw), std::num::NonZeroU32::new(sh)) {
             (Some(w), Some(h)) => (w, h),
             _ => {
@@ -671,6 +735,17 @@ impl ImageProcessor {
                 ))
             }
         };
+
+        // fill_screen: cover (max scale, may crop); letterbox: contain (min scale, no crop).
+        let scale = if self.config.fill_screen {
+            f32::max(dw as f32 / sw as f32, dh as f32 / sh as f32)
+        } else {
+            f32::min(dw as f32 / sw as f32, dh as f32 / sh as f32)
+        };
+        let (nw, nh) = ((sw as f32 * scale) as u32, (sh as f32 * scale) as u32);
+
+        use fast_image_resize as fir;
+
         // Resize in RGB (3 bytes/px), not RGBA. The resizer's *source* is the
         // full-resolution decode, so dropping the alpha plane avoids ever
         // allocating a full-res W×H×4 buffer purely as scaler input — the single
@@ -737,7 +812,11 @@ impl Renderer {
         self.canvas.texture_creator()
     }
 
-    pub fn show_cut(&mut self, rgba: &RgbaImage, tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>) -> Result<()> {
+    pub fn show_cut(
+        &mut self,
+        rgba: &RgbaImage,
+        tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    ) -> Result<()> {
         let tex = rgba_to_texture(tc, rgba)?;
         self.canvas.clear();
         blit_centered(
@@ -1108,6 +1187,9 @@ impl Renderer {
                 Event::MouseButtonDown {
                     mouse_btn, x, y, ..
                 } => {
+                    if mouse_btn == MouseButton::Left {
+                        self.left_pointer_down = true;
+                    }
                     push_pointer_action(
                         &mut out,
                         mouse_btn,
@@ -1124,21 +1206,29 @@ impl Renderer {
 
                 // Touchscreens on Pi often deliver taps on button-up; handle
                 // gallery picks and the × close control without mapping release
-                // to slideshow prev/next (mouse-down still does that).
+                // to slideshow prev/next (mouse-down still does that). Skip Up
+                // when Down already ran in this press, so mice do not double-fire.
                 Event::MouseButtonUp {
                     mouse_btn: MouseButton::Left,
                     x,
                     y,
                     ..
-                } if !menu_open
-                    && (in_gallery
-                        || (gallery_mode
-                            && crate::osd::close_button_hit(x, y, self.width, self.height))) =>
-                {
-                    if in_gallery {
-                        out.push(SlideshowCmd::GalleryClick { x, y });
-                    } else {
-                        out.push(SlideshowCmd::BackToGallery);
+                } => {
+                    let was_down = self.left_pointer_down;
+                    self.left_pointer_down = false;
+                    if was_down {
+                        continue;
+                    }
+                    if !menu_open
+                        && (in_gallery
+                            || (gallery_mode
+                                && crate::osd::close_button_hit(x, y, self.width, self.height)))
+                    {
+                        if in_gallery {
+                            out.push(SlideshowCmd::GalleryClick { x, y });
+                        } else {
+                            out.push(SlideshowCmd::BackToGallery);
+                        }
                     }
                 }
 
@@ -1520,6 +1610,23 @@ mod tests {
     use super::*;
     use image::Rgba;
 
+    fn check_image_file_size(max_image_mb: u32, nbytes: usize) -> Result<()> {
+        let max_bytes = if max_image_mb > 0 {
+            max_image_mb as usize * 1_048_576
+        } else {
+            50 * 1_048_576
+        };
+        if nbytes > max_bytes {
+            Err(anyhow::anyhow!(
+                "image file {} MB exceeds max_image_mb={}",
+                nbytes / 1_048_576,
+                max_bytes / 1_048_576,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Build an `ImageProcessor` directly (no SDL) for decode-path tests.
     fn test_processor(width: u32, height: u32) -> ImageProcessor {
         let mut srgb = qcms::Profile::new_sRGB();
@@ -1616,5 +1723,36 @@ mod tests {
         let out = downsample_nn(&src, 10, 1);
         assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]); // left → red
         assert_eq!(out.get_pixel(9, 0).0, [0, 0, 255, 255]); // right → blue
+    }
+    #[test]
+    fn test_check_image_file_size() {
+        assert!(check_image_file_size(50, 49 * 1024 * 1024).is_ok());
+        assert!(check_image_file_size(50, 51 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn decode_and_scale_enforces_file_size() {
+        let mut proc = test_processor(800, 600);
+        proc.config.max_image_mb = 1;
+        let jpeg = tiny_jpeg(400, 200);
+        assert!(proc.decode_and_scale(&jpeg).is_ok());
+
+        let big_dummy = vec![0u8; 2 * 1024 * 1024]; // 2MB
+        assert!(proc.decode_and_scale(&big_dummy).is_err());
+    }
+    #[test]
+    fn decode_and_scale_enforces_megapixel_limit() {
+        let mut proc = test_processor(800, 600);
+        // Force a very strict limit
+        proc.config.max_megapixels = 1; // 1 MP
+
+        let jpeg = tiny_jpeg(2000, 2000); // 4 MP, will fail the limit
+
+        // This should fail because the decoded image would be 4MP > 1MP
+        assert!(proc.decode_and_scale(&jpeg).is_err());
+
+        // A smaller image should pass
+        let small_jpeg = tiny_jpeg(400, 400); // 0.16 MP
+        assert!(proc.decode_and_scale(&small_jpeg).is_ok());
     }
 }

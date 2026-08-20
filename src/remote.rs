@@ -25,10 +25,9 @@ use serde::Serialize;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::RemoteConfig;
 use crate::renderer::SlideshowCmd;
@@ -103,8 +102,9 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
                     let token = token.clone();
                     let bind_ip_str = Arc::new(bind_ip.to_string());
                     tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = handle_conn(stream, tx, status, token, bind_ip_str).await {
+                        if let Err(e) =
+                            handle_conn(stream, peer, tx, status, token, bind_ip_str, permit).await
+                        {
                             debug!("remote: connection error: {e}");
                         }
                     });
@@ -129,10 +129,12 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 async fn handle_conn(
     mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
     tx: Sender<SlideshowCmd>,
     status: SharedStatus,
     token: Arc<String>,
     bind_ip: Arc<String>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     // Read until end-of-headers or the buffer fills. A single `read` can
     // return a partial request when TCP fragments; looping keeps large
@@ -176,7 +178,8 @@ async fn handle_conn(
         return Ok(());
     }
 
-    if !(authorized(&req, &token) || method == "GET" && path == "/") {
+    if !(authorized(&req, &token) || endpoint_is_public(method, path, peer.ip().is_loopback())) {
+        drop(permit);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let response = http_response(
             "401 Unauthorized",
@@ -231,9 +234,14 @@ async fn handle_conn(
 fn authorized(req: &str, token: &str) -> bool {
     let Some(value) = req.lines().skip(1).find_map(|line| {
         line.split_once(':').and_then(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization")
-                .then(|| value.trim().strip_prefix("Bearer "))
-                .flatten()
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let value = value.trim();
+            value
+                .split_once(' ')
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, rest)| rest.trim())
         })
     }) else {
         return false;
@@ -241,17 +249,53 @@ fn authorized(req: &str, token: &str) -> bool {
     constant_time_eq(value.as_bytes(), token.as_bytes())
 }
 
+/// Endpoints that may be read without a bearer token.
+///
+/// `GET /` is the phone shell (token lives in the URL fragment). `GET
+/// /api/health` is public only from loopback so a local supervisor can probe
+/// readiness without embedding the token in a unit file.
+fn endpoint_is_public(method: &str, path: &str, peer_is_loopback: bool) -> bool {
+    method == "GET" && (path == "/" || (path == "/api/health" && peer_is_loopback))
+}
+
 fn validate_host(req: &str, bind_ip: &str) -> bool {
     let Some(value) = req.lines().skip(1).find_map(|line| {
-        line.split_once(':').and_then(|(name, value)| {
-            name.eq_ignore_ascii_case("host")
-                .then(|| value.trim())
-        })
+        line.split_once(':')
+            .and_then(|(name, value)| name.eq_ignore_ascii_case("host").then(|| value.trim()))
     }) else {
         return false;
     };
-    let host_no_port = value.split(':').next().unwrap_or(value);
-    host_no_port == bind_ip || host_no_port == "localhost"
+    // The Host header might be `IP:port`, `[IPv6]:port`, or `domain:port`.
+    let host_no_port = if value.starts_with('[') {
+        value
+            .split(']')
+            .next()
+            .unwrap_or(value)
+            .trim_start_matches('[')
+    } else {
+        value.split(':').next().unwrap_or(value)
+    };
+
+    if host_no_port.eq_ignore_ascii_case("localhost")
+        || host_no_port == bind_ip
+        || host_no_port == "127.0.0.1"
+        || host_no_port == "::1"
+    {
+        return true;
+    }
+
+    // Binding 0.0.0.0 / :: means "any local address"; accept a literal IP
+    // Host so phones can use the Pi's LAN address without DNS.
+    if (bind_ip == "0.0.0.0" || bind_ip == "::") && host_no_port.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+
+    // Single-label mDNS (e.g. `myframe.local`). Nested suffixes like
+    // `attacker.com.local` are rejected so a rebinding hostname cannot
+    // hide behind the `.local` allowance.
+    host_no_port
+        .strip_suffix(".local")
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -282,12 +326,21 @@ fn command(tx: &Sender<SlideshowCmd>, cmd: SlideshowCmd) -> String {
 }
 
 fn http_response(code: &str, content_type: &str, body: &str) -> String {
+    let csp = if content_type.starts_with("text/html") {
+        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'\r\n"
+    } else {
+        ""
+    };
     format!(
         "HTTP/1.1 {code}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          Connection: close\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Robots-Tag: noindex, nofollow\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         {csp}\
          \r\n\
          {body}",
         body.len(),
@@ -385,10 +438,190 @@ mod tests {
             "GET /api/status HTTP/1.1\r\nAuthorization: Bearer abc\r\n",
             "abc"
         ));
+        assert!(authorized(
+            "GET /api/status HTTP/1.1\r\nAuthorization: bearer abc\r\n",
+            "abc"
+        ));
         assert!(!authorized(
             "GET /api/status HTTP/1.1\r\nAuthorization: Bearer ab\r\n",
             "abc"
         ));
         assert!(!authorized("GET /api/status HTTP/1.1\r\n", "abc"));
+    }
+
+    #[test]
+    fn validate_host_allows_bind_ip() {
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n",
+            "127.0.0.1"
+        ));
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: 192.168.1.100:8080\r\n",
+            "192.168.1.100"
+        ));
+        assert!(!validate_host(
+            "GET / HTTP/1.1\r\nHost: 10.0.0.1\r\n",
+            "192.168.1.100"
+        ));
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: 192.168.1.50:8188\r\n",
+            "0.0.0.0"
+        ));
+        assert!(!validate_host(
+            "GET / HTTP/1.1\r\nHost: evil.example\r\n",
+            "0.0.0.0"
+        ));
+    }
+
+    #[test]
+    fn validate_host_allows_localhost_and_mdns() {
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: localhost\r\n",
+            "192.168.1.100"
+        ));
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: myframe.local\r\n",
+            "192.168.1.100"
+        ));
+        assert!(validate_host(
+            "GET / HTTP/1.1\r\nHost: myframe.local:8188\r\n",
+            "192.168.1.100"
+        ));
+        assert!(!validate_host(
+            "GET / HTTP/1.1\r\nHost: attacker.com.local\r\n",
+            "192.168.1.100"
+        ));
+    }
+
+    #[test]
+    fn validate_host_blocks_dns_rebinding() {
+        assert!(!validate_host(
+            "GET / HTTP/1.1\r\nHost: attacker.com\r\n",
+            "192.168.1.100"
+        ));
+        assert!(!validate_host(
+            "GET / HTTP/1.1\r\nHost: attacker.com:8188\r\n",
+            "192.168.1.100"
+        ));
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"password", b"password"));
+        assert!(!constant_time_eq(b"password", b"passwOrd"));
+        assert!(!constant_time_eq(b"password", b"pass"));
+        assert!(!constant_time_eq(b"pass", b"password"));
+    }
+
+    #[test]
+    fn test_http_response_format() {
+        let resp = http_response("200 OK", "text/plain", "hello");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: text/plain\r\n"));
+        assert!(resp.contains("Content-Length: 5\r\n"));
+        assert!(resp.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert!(resp.contains("X-Robots-Tag: noindex, nofollow\r\n"));
+        assert!(resp.ends_with("\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn html_response_carries_csp_and_robots_headers() {
+        let resp = http_response("200 OK", "text/html; charset=utf-8", "<p>x</p>");
+        assert!(resp.contains("Content-Security-Policy:"));
+        assert!(resp.contains("X-Robots-Tag: noindex, nofollow"));
+        assert!(resp.contains("Referrer-Policy: no-referrer"));
+    }
+
+    #[test]
+    fn health_is_public_from_loopback_only() {
+        assert!(endpoint_is_public("GET", "/", false));
+        assert!(endpoint_is_public("GET", "/api/health", true));
+        assert!(!endpoint_is_public("GET", "/api/health", false));
+        assert!(!endpoint_is_public("POST", "/api/next", true));
+        assert!(!endpoint_is_public("GET", "/api/status", true));
+    }
+
+    #[tokio::test]
+    async fn test_remote_integration() {
+        let status = Arc::new(Mutex::new(Status {
+            paused: false,
+            index: 1,
+            total: 10,
+            providers: 1,
+            filename: "test.jpg".to_string(),
+            album: "test_album".to_string(),
+            favorite: false,
+        }));
+
+        let mut config = RemoteConfig {
+            enabled: true,
+            port: 0,
+            bind: "127.0.0.1".to_string(),
+            token_file: None,
+            token: Some("1234567890123456".to_string()),
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config.port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut rx = start(&config, status.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port))
+            .await
+            .unwrap();
+        let req = "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer 1234567890123456\r\n\r\n";
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("test.jpg"));
+
+        let mut stream2 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port))
+            .await
+            .unwrap();
+        let req2 = "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        stream2.write_all(req2.as_bytes()).await.unwrap();
+        let n2 = stream2.read(&mut buf).await.unwrap();
+        let resp2 = String::from_utf8_lossy(&buf[..n2]);
+        assert!(resp2.contains("401 Unauthorized"));
+
+        let mut stream3 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port))
+            .await
+            .unwrap();
+        let req3 = "POST /api/next HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer 1234567890123456\r\n\r\n";
+        stream3.write_all(req3.as_bytes()).await.unwrap();
+        let n3 = stream3.read(&mut buf).await.unwrap();
+        let resp3 = String::from_utf8_lossy(&buf[..n3]);
+        assert!(resp3.contains("200 OK"));
+
+        let cmd = rx.recv().await.unwrap();
+        assert!(matches!(cmd, SlideshowCmd::Next));
+
+        // Test root page with no auth token
+        let mut stream4 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port))
+            .await
+            .unwrap();
+        let req4 = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        stream4.write_all(req4.as_bytes()).await.unwrap();
+        let n4 = stream4.read(&mut buf).await.unwrap();
+        let resp4 = String::from_utf8_lossy(&buf[..n4]);
+        assert!(resp4.contains("200 OK"));
+        assert!(resp4.contains("PicoGallery Remote"));
+
+        // Test health endpoint from loopback without auth
+        let mut stream5 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", config.port))
+            .await
+            .unwrap();
+        let req5 = "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        stream5.write_all(req5.as_bytes()).await.unwrap();
+        let n5 = stream5.read(&mut buf).await.unwrap();
+        let resp5 = String::from_utf8_lossy(&buf[..n5]);
+        assert!(resp5.contains("200 OK"));
+        assert!(resp5.contains("ready"));
     }
 }

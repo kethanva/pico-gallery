@@ -77,6 +77,14 @@ jobs:
           bash -n deploy.sh
           shellcheck install.sh deploy.sh
 
+      - name: Packaging consistency
+        run: |
+          UNIT_EXEC=$(grep '^ExecStart=' picogallery.service | head -1 | cut -d= -f2-)
+          DEB_BIN=$(python3 -c "import re,pathlib; t=pathlib.Path('Cargo.toml').read_text(); m=re.search(r'target/release/picogallery\",\s*\"([^\"]+)', t); print(m.group(1) if m else '')")
+          test "$UNIT_EXEC" = "$DEB_BIN" || { echo "unit ExecStart ($UNIT_EXEC) != deb asset path ($DEB_BIN)"; exit 1; }
+          ! grep -q '^\[Service\]' install.sh || { echo "install.sh authors a second unit"; exit 1; }
+          grep -q 'ReadWritePaths=-' picogallery.service || { echo "ReadWritePaths must tolerate missing paths"; exit 1; }
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -95,6 +103,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features
+
+      - name: Minimal feature build
+        run: cargo build --no-default-features --features plugin-directory
 
       - name: Audit dependencies
         uses: rustsec/audit-check@v2
@@ -122,6 +133,9 @@ jobs:
 
       - name: Resolve version label
         id: ver
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_BRANCH: ${{ github.event.inputs.branch }}
         run: |
           CREATE=false
           PRERELEASE=false
@@ -129,14 +143,14 @@ jobs:
           LABEL=""
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-              RELEASE_TAG="${{ github.event.inputs.tag }}"
+            if [[ -n "$INPUT_TAG" ]]; then
+              RELEASE_TAG="$INPUT_TAG"
               LABEL="${RELEASE_TAG#v}"
               CREATE=true
               [[ "$RELEASE_TAG" == *-* ]] && PRERELEASE=true
             else
               SHORT_SHA="${GITHUB_SHA::7}"
-              LABEL="${{ github.event.inputs.branch }}-${SHORT_SHA}"
+              LABEL="${INPUT_BRANCH}-${SHORT_SHA}"
             fi
           elif [[ "${{ github.ref_type }}" == "tag" ]]; then
             RELEASE_TAG="${GITHUB_REF_NAME}"
@@ -260,6 +274,9 @@ jobs:
             { next }
           '
           tar tvzf "${ARTIFACT_NAME}.tar.gz" | awk '$1 ~ /^[lh]/ { exit 1 }'
+
+          tar xzOf "${ARTIFACT_NAME}.tar.gz" "${ARTIFACT_NAME}/picogallery.service" \
+            | grep -q '^ExecStart=/usr/bin/picogallery'
 
           echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> "$GITHUB_ENV"
           echo "ARTIFACT_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> "$GITHUB_ENV"

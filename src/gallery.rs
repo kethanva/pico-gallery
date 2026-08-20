@@ -5,11 +5,23 @@
 
 use crate::compose::{blit_clipped, cover_square, fill_rect};
 use image::{Rgba, RgbaImage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 pub const GAP: u32 = 8;
 pub const MIN_CELL: u32 = 140;
 pub const HEADER_H: u32 = 36;
+/// In-memory gallery thumb cap. The RAM estimator in `config.rs` must use the
+/// same number so a 96-cell grid cannot silently exceed MemoryMax.
+pub const THUMB_CACHE_CAP: usize = 96;
+const THUMB_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Cell edge in pixels for a gallery grid at `screen_w`. Kept in one place so
+/// the startup memory estimator cannot drift from `GalleryGrid::new`.
+pub fn cell_px_for_width(screen_w: u32) -> u32 {
+    let cols = ((screen_w.saturating_sub(GAP)) / (MIN_CELL + GAP)).max(1);
+    (screen_w.saturating_sub(GAP * (cols + 1))) / cols
+}
 
 /// Scrollable photo grid with a small in-memory thumb cache.
 pub struct GalleryGrid {
@@ -19,18 +31,24 @@ pub struct GalleryGrid {
     /// Keyboard / click selection — opened with Enter or double-tap click.
     pub selected: usize,
     thumbs: HashMap<usize, RgbaImage>,
+    failed_thumbs: HashMap<usize, Instant>,
+    /// Queue indices with an in-flight thumb fetch. `needs_thumb` is false
+    /// while pending so a 30 ms gallery tick cannot spawn the same cell twice.
+    pending_thumbs: HashSet<usize>,
 }
 
 impl GalleryGrid {
     pub fn new(screen_w: u32) -> Self {
         let cols = ((screen_w.saturating_sub(GAP)) / (MIN_CELL + GAP)).max(1);
-        let cell = (screen_w.saturating_sub(GAP * (cols + 1))) / cols;
+        let cell = cell_px_for_width(screen_w);
         Self {
             scroll_y: 0,
             cols,
             cell,
             selected: 0,
             thumbs: HashMap::new(),
+            failed_thumbs: HashMap::new(),
+            pending_thumbs: HashSet::new(),
         }
     }
 
@@ -122,8 +140,10 @@ impl GalleryGrid {
     }
 
     pub fn insert_thumb(&mut self, index: usize, img: RgbaImage) {
+        self.pending_thumbs.remove(&index);
+        self.failed_thumbs.remove(&index);
         // Prefer evicting thumbs that are far from the newly inserted index.
-        if self.thumbs.len() >= 96 {
+        if self.thumbs.len() >= THUMB_CACHE_CAP {
             let mut keys: Vec<_> = self.thumbs.keys().copied().collect();
             keys.sort_by_key(|k| k.abs_diff(index));
             for k in keys.into_iter().rev().take(48) {
@@ -144,9 +164,44 @@ impl GalleryGrid {
         self.thumbs.get(&index)
     }
 
+    /// True when a missing thumbnail may be fetched now. Decode/network
+    /// failures are backed off so a corrupt selected photo cannot trigger a
+    /// download or full JPEG decode on every 30 ms gallery tick. In-flight
+    /// fetches (`mark_thumb_pending`) also suppress a re-spawn.
+    pub fn needs_thumb(&self, index: usize) -> bool {
+        if self.thumb(index).is_some() || self.pending_thumbs.contains(&index) {
+            return false;
+        }
+        match self.failed_thumbs.get(&index) {
+            Some(failed_at) => failed_at.elapsed() >= THUMB_RETRY_AFTER,
+            None => true,
+        }
+    }
+
+    pub fn mark_thumb_pending(&mut self, index: usize) {
+        self.pending_thumbs.insert(index);
+    }
+
+    pub fn clear_thumb_pending(&mut self, index: usize) {
+        self.pending_thumbs.remove(&index);
+    }
+
+    /// Drop in-flight markers after a fetcher invalidate so `needs_thumb`
+    /// can spawn again (returning from fullscreen, source switch, …).
+    pub fn clear_all_pending_thumbs(&mut self) {
+        self.pending_thumbs.clear();
+    }
+
+    pub fn mark_thumb_failed(&mut self, index: usize) {
+        self.pending_thumbs.remove(&index);
+        self.failed_thumbs.insert(index, Instant::now());
+    }
+
     /// Drop all cached thumbs (e.g. after the play queue is rebuilt).
     pub fn clear(&mut self) {
         self.thumbs.clear();
+        self.failed_thumbs.clear();
+        self.pending_thumbs.clear();
         self.scroll_y = 0;
         self.selected = 0;
     }
@@ -509,5 +564,222 @@ mod tests {
             g.scroll_y = 0;
             assert_eq!(g.visible_indices(h, c), naive_visible(&g, h, c));
         }
+    }
+
+    #[test]
+    fn test_rows_for_count() {
+        let mut g = GalleryGrid::new(800);
+        assert!(g.cols > 1); // cols should be around 800 / 148 = 5
+        assert_eq!(g.rows_for_count(0), 0);
+        assert_eq!(g.rows_for_count(1), 1);
+        assert_eq!(g.rows_for_count(g.cols as usize), 1);
+        assert_eq!(g.rows_for_count(g.cols as usize + 1), 2);
+
+        g.cols = 0;
+        assert_eq!(g.rows_for_count(10), 0);
+    }
+
+    #[test]
+    fn test_content_height() {
+        let g = GalleryGrid::new(800);
+        assert_eq!(g.content_height(0), HEADER_H + GAP); // rows=0 -> HEADER_H + GAP
+        let rows = g.rows_for_count(g.cols as usize + 1);
+        assert_eq!(
+            g.content_height(g.cols as usize + 1),
+            HEADER_H + rows * (g.cell + GAP) + GAP
+        );
+    }
+
+    #[test]
+    fn test_insert_thumb_and_clear() {
+        let mut g = GalleryGrid::new(800);
+        let img = image::RgbaImage::from_pixel(g.cell, g.cell, image::Rgba([0, 0, 0, 255]));
+        g.insert_thumb(5, img.clone());
+        assert!(g.thumb(5).is_some());
+
+        // Exceed the max capacity to trigger eviction
+        for i in 100..200 {
+            g.insert_thumb(i, img.clone());
+        }
+
+        // Assert we keep some reasonable amount of thumbs (max capacity is THUMB_CACHE_CAP)
+        assert!(g.thumbs.len() <= THUMB_CACHE_CAP);
+
+        g.clear();
+        assert!(g.thumbs.is_empty());
+        assert_eq!(g.scroll_y, 0);
+        assert_eq!(g.selected, 0);
+    }
+
+    #[test]
+    fn failed_thumbnail_is_backed_off_then_retried() {
+        let mut g = GalleryGrid::new(800);
+        assert!(g.needs_thumb(7));
+        g.mark_thumb_failed(7);
+        assert!(!g.needs_thumb(7));
+
+        g.failed_thumbs.insert(
+            7,
+            Instant::now() - THUMB_RETRY_AFTER - Duration::from_millis(1),
+        );
+        assert!(g.needs_thumb(7));
+
+        let image = RgbaImage::from_pixel(g.cell, g.cell, Rgba([0, 0, 0, 255]));
+        g.insert_thumb(7, image);
+        assert!(!g.needs_thumb(7));
+        assert!(!g.failed_thumbs.contains_key(&7));
+    }
+
+    #[test]
+    fn pending_thumb_is_not_requested_twice() {
+        let mut g = GalleryGrid::new(800);
+        assert!(g.needs_thumb(3));
+        g.mark_thumb_pending(3);
+        assert!(!g.needs_thumb(3));
+        g.clear_thumb_pending(3);
+        assert!(g.needs_thumb(3));
+        g.mark_thumb_pending(3);
+        let image = RgbaImage::from_pixel(g.cell, g.cell, Rgba([0, 0, 0, 255]));
+        g.insert_thumb(3, image);
+        assert!(!g.needs_thumb(3));
+        assert!(g.pending_thumbs.is_empty());
+    }
+
+    #[test]
+    fn test_cell_origin() {
+        let g = GalleryGrid::new(800);
+        let cols = g.cols;
+        let pitch = g.cell + GAP;
+
+        // Cell 0
+        let (x, y) = g.cell_origin(0);
+        assert_eq!(x, GAP);
+        assert_eq!(y, HEADER_H as i32 - g.scroll_y);
+
+        // Cell in second row
+        let (x, y) = g.cell_origin(cols as usize + 1);
+        assert_eq!(x, GAP + pitch);
+        assert_eq!(y, HEADER_H as i32 + pitch as i32 - g.scroll_y);
+    }
+
+    #[test]
+    fn test_set_selected() {
+        let mut g = GalleryGrid::new(800);
+        g.set_selected(5, 10);
+        assert_eq!(g.selected, 5);
+
+        g.set_selected(15, 10);
+        assert_eq!(g.selected, 9); // Clamps to count - 1
+
+        g.set_selected(5, 0);
+        assert_eq!(g.selected, 9); // count = 0 does nothing
+    }
+
+    #[test]
+    fn test_cell_px_for_width_edge_cases() {
+        // very small screen width
+        let w = cell_px_for_width(50);
+        assert!(w > 0);
+        let w2 = cell_px_for_width(200);
+        assert!(w2 >= MIN_CELL);
+    }
+
+    #[test]
+    fn test_index_at_edge_cases() {
+        let mut g = GalleryGrid::new(800);
+        g.scroll_y = 100;
+        // y < HEADER_H
+        assert_eq!(g.index_at(50, 10, 10), None);
+
+        // y_adj < 0 because of scroll_y
+        // wait, y_adj = y + scroll_y - HEADER_H
+        // if y = 40, scroll_y = 0 -> 40 + 0 - 36 = 4.
+        // if scroll_y is negative? It's clamped to 0.
+        // what if y < HEADER_H but y > 0? handled above.
+
+        // col_x < 0
+        let (_, origin_y) = g.cell_origin(0);
+        assert_eq!(g.index_at(GAP as i32 - 1, origin_y + 10, 10), None);
+    }
+
+    #[test]
+    fn test_ensure_selected_visible_moves_up() {
+        let mut g = GalleryGrid::new(400);
+        let count = 40;
+        let h = 300;
+        // Scroll way down
+        g.scroll_y = 500;
+        // Select first item
+        g.set_selected(0, count);
+        g.ensure_selected_visible(h, count);
+        assert_eq!(g.scroll_y, 0); // Scrolled back to top
+    }
+
+    #[test]
+    fn test_ensure_selected_visible_count_zero() {
+        let mut g = GalleryGrid::new(400);
+        g.scroll_y = 100;
+        g.ensure_selected_visible(300, 0);
+        assert_eq!(g.scroll_y, 100); // no change
+    }
+
+    #[test]
+    fn test_scroll_page_edge_cases() {
+        let mut g = GalleryGrid::new(400);
+        assert!(!g.scroll_page(1, 0, 300)); // count = 0
+        assert!(!g.scroll_page(0, 10, 300)); // direction = 0
+
+        let count = 40;
+        g.set_selected(0, count);
+        let h = 2000;
+        if g.scroll_page(1, count, h) {
+            let visible = g.visible_indices(h, count);
+            assert!(
+                visible.contains(&g.selected),
+                "after paging, selection must stay in the viewport"
+            );
+        } else {
+            assert_eq!(g.selected, 0);
+        }
+    }
+
+    #[test]
+    fn test_clear_all_pending_thumbs() {
+        let mut g = GalleryGrid::new(400);
+        g.mark_thumb_pending(5);
+        g.mark_thumb_pending(6);
+        assert!(!g.needs_thumb(5));
+        g.clear_all_pending_thumbs();
+        assert!(g.needs_thumb(5));
+        assert!(g.needs_thumb(6));
+    }
+
+    #[test]
+    fn test_render() {
+        let mut g = GalleryGrid::new(400);
+        let count = 5;
+        g.set_selected(1, count);
+
+        let thumb_img = RgbaImage::from_pixel(g.cell, g.cell, Rgba([255, 0, 0, 255]));
+        g.insert_thumb(0, thumb_img.clone());
+        g.insert_thumb(1, thumb_img.clone()); // Selected
+
+        let screen_w = 400;
+        let screen_h = 300;
+        let img = g.render(screen_w, screen_h, count);
+
+        assert_eq!(img.width(), screen_w);
+        assert_eq!(img.height(), screen_h);
+
+        // Basic check that something was drawn (not all black background)
+        // Background is Rgba([10, 10, 10, 255])
+        let mut has_other_pixels = false;
+        for p in img.pixels() {
+            if *p != Rgba([10, 10, 10, 255]) {
+                has_other_pixels = true;
+                break;
+            }
+        }
+        assert!(has_other_pixels);
     }
 }

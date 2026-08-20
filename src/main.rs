@@ -151,8 +151,7 @@ fn build_plugins(cfg: &Config, log: bool) -> Vec<BoxedPlugin> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main(flavor = "current_thread")] // single-threaded — Pi Zero has 1 core
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     // Logging. clap has already resolved precedence (--log-level flag beats
@@ -164,18 +163,28 @@ async fn main() -> Result<()> {
         .parse_filters(&args.log_level)
         .init();
 
-    // ── --print-default-config ───────────────────────────────────────────────
+    // Config-only commands must run before SDL env mutation / the runtime.
     if args.print_default_config {
         println!("{}", default_config());
         return Ok(());
     }
-
-    let config_path = args.config.unwrap_or_else(Config::default_path);
-
-    // ── --generate-config ────────────────────────────────────────────────────
+    let config_path = args.config.clone().unwrap_or_else(Config::default_path);
     if args.generate_config {
         return generate_config(&config_path, args.force);
     }
+
+    // MUST run before the Tokio runtime exists: `set_var` is not thread-safe
+    // once spawn_blocking workers may be reading the environment.
+    let display_env = picogallery::renderer::prepare_display_env();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?
+        .block_on(run(args, display_env))
+}
+
+async fn run(args: Args, display_env: picogallery::renderer::DisplayEnv) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(Config::default_path);
 
     // ── Normal startup ────────────────────────────────────────────────────────
     info!("Loading config from {}", config_path.display());
@@ -308,6 +317,7 @@ async fn main() -> Result<()> {
         plugins,
         config_path,
         Box::new(|c: &Config| build_plugins(c, true)),
+        display_env,
     )
     .await?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -431,6 +441,14 @@ prefetch_count = 3    # how many photos to pre-fetch ahead (keep low on Pi Zero)
 # dir = "/tmp/picogallery-cache"   # override cache location (default: ~/.cache/picogallery)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auth (headless OAuth / device-code)
+# Disable a source that sits unsigned-in longer than this so the frame still
+# starts. 0 = wait forever (only useful with a serial console attached).
+# ─────────────────────────────────────────────────────────────────────────────
+[auth]
+pending_timeout_secs = 180
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP remote control (optional)
 # Phone-friendly next/prev/pause/favourite page + JSON status API. A token is
 # required: visit http://<pi-ip>:8188/#<token> once enabled. The ♥ button favourites the current photo (sources that
@@ -457,7 +475,8 @@ device  = "/dev/cec0"
 # Wi-Fi  (Linux / Raspberry Pi only)
 # When enabled, these credentials are applied to the OS at startup and whenever
 # changed from the on-screen settings menu (right-click → Wi-Fi rows, edited
-# with a USB keyboard). Requires root — the Pi service runs as root. WPA2
+# with a USB keyboard). Requires host authorization; the Pi service normally
+# runs as an unprivileged user. WPA2
 # personal only: network name (SSID) + password, no enterprise/username. The
 # passphrase is stored here in plain text, so keep this file private (chmod 600).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -666,9 +685,11 @@ mod tests {
                 .any(|p| p.name == "directory" && p.enabled),
             "directory plugin should be enabled by default"
         );
-        // Remote section parses and is disabled out of the box (no-auth server).
+        // Remote section parses and is disabled out of the box (a token is
+        // required whenever the server is enabled).
         assert!(!cfg.remote.enabled);
         // HDMI CEC remote input is opt-in.
         assert!(!cfg.cec.enabled);
+        assert_eq!(cfg.auth.pending_timeout_secs, 180);
     }
 }

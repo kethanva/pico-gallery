@@ -97,18 +97,18 @@ async fn nmcli_connect(cfg: &WifiConfig) -> Result<()> {
     let password_file = if cfg.password.is_empty() {
         None
     } else {
-        let path = write_private_temp_secret(&cfg.password)
+        let file = write_private_temp_secret(&cfg.password)
             .context("creating temporary NetworkManager password file")?;
-        cmd.arg("--passwd-file").arg(&path);
-        Some(path)
+        cmd.arg("--passwd-file").arg(file.path());
+        Some(file)
     };
     cmd.args(["device", "wifi", "connect", &cfg.ssid]);
     let result = cmd
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("running nmcli: {e}"))?;
-    if let Some(path) = password_file {
-        let _ = std::fs::remove_file(path);
+    if let Some(file) = password_file {
+        drop(file);
     }
     if result.status.success() {
         Ok(())
@@ -121,41 +121,18 @@ async fn nmcli_connect(cfg: &WifiConfig) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_private_temp_secret(secret: &str) -> std::io::Result<std::path::PathBuf> {
+fn write_private_temp_secret(secret: &str) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir();
-    for attempt in 0..3 {
-        let path = dir.join(format!(
-            "picogallery-nmcli-{}-{nonce}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(format!("{secret}\n").as_bytes()) {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(e);
-                }
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate temporary password file",
-    ))
+    let mut file = tempfile::Builder::new()
+        .prefix("picogallery-nmcli-")
+        .tempfile()?;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(file.path(), perms)?;
+    file.write_all(format!("{secret}\n").as_bytes())?;
+    file.flush()?;
+    Ok(file)
 }
 
 #[cfg(target_os = "linux")]
@@ -172,10 +149,13 @@ async fn wpa_supplicant_connect(cfg: &WifiConfig) -> Result<()> {
     };
 
     let mut existing = std::fs::read_to_string(CONF).unwrap_or_default();
-    
+
     // Ensure preamble exists
     if !existing.contains("ctrl_interface=") {
-        existing.insert_str(0, "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
+        existing.insert_str(
+            0,
+            "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n",
+        );
     }
     if !existing.contains("update_config=1") {
         existing.push_str("update_config=1\n");
@@ -192,7 +172,7 @@ async fn wpa_supplicant_connect(cfg: &WifiConfig) -> Result<()> {
     let mut in_block = false;
     let mut current_block = String::new();
     let ssid_line = format!("ssid=\"{}\"", escape_wpa_string(&cfg.ssid));
-    
+
     for line in existing.lines() {
         if !in_block && line.trim().starts_with("network={") {
             in_block = true;
@@ -216,7 +196,7 @@ async fn wpa_supplicant_connect(cfg: &WifiConfig) -> Result<()> {
     if in_block {
         out.push_str(&current_block);
     }
-    
+
     out.push_str(&network_block);
 
     write_owner_only(CONF, &out).map_err(|e| anyhow::anyhow!("writing {CONF}: {e}"))?;
@@ -290,13 +270,86 @@ mod tests {
     }
 
     #[test]
-    fn credentials_enforce_protocol_lengths() {
+    fn credentials_reject_empty_ssid() {
         let cfg = WifiConfig {
-            ssid: "wifi".into(),
-            password: "short".into(),
+            ssid: "".into(),
             ..Default::default()
         };
         assert!(validate_credentials(&cfg).is_err());
+    }
+
+    #[test]
+    fn credentials_reject_long_ssid() {
+        let cfg = WifiConfig {
+            ssid: "123456789012345678901234567890123".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_err());
+    }
+
+    #[test]
+    fn credentials_accept_open() {
+        let cfg = WifiConfig {
+            ssid: "open_network".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_ok());
+    }
+
+    #[test]
+    fn credentials_accept_psk() {
+        let cfg = WifiConfig {
+            ssid: "secure_network".into(),
+            password: "password123".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_ok());
+    }
+
+    #[test]
+    fn credentials_reject_invalid_country() {
+        let cfg = WifiConfig {
+            ssid: "wifi".into(),
+            country: "USA".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_err());
+        let cfg = WifiConfig {
+            ssid: "wifi".into(),
+            country: "U1".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_err());
+    }
+
+    #[test]
+    fn credentials_accept_valid_country() {
+        let cfg = WifiConfig {
+            ssid: "wifi".into(),
+            country: "US".into(),
+            ..Default::default()
+        };
+        assert!(validate_credentials(&cfg).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temp_secret_is_owner_only_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = write_private_temp_secret("psk-test").expect("temp secret");
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn string_escape() {
+        assert_eq!(escape_wpa_string("test\\string"), "test\\\\string");
+        assert_eq!(escape_wpa_string("test\"string"), "test\\\"string");
     }
 }
 
@@ -307,21 +360,19 @@ mod tests {
 fn write_owner_only(path: &str, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    
-    // Explicitly chmod the file if it exists so permissions are fixed even if created world-readable
-    if std::path::Path::new(path).exists() {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(mut perms) = std::fs::metadata(path).map(|m| m.permissions()) {
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(contents.as_bytes())
+
+    let dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+
+    let mut temp = tempfile::Builder::new()
+        .prefix("wpa_supplicant.conf.")
+        .tempfile_in(dir)?;
+
+    let perms = std::os::unix::fs::PermissionsExt::from_mode(0o600);
+    std::fs::set_permissions(temp.path(), perms)?;
+
+    temp.write_all(contents.as_bytes())?;
+    temp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }

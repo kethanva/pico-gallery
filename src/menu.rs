@@ -573,4 +573,32 @@ mod tests {
             .unwrap();
         assert!(ssid.label.ends_with("myne_"));
     }
+
+    #[test]
+    fn edit_field_prefix() {
+        assert_eq!(EditField::WifiSsid.prefix(), "Wi-Fi network");
+        assert_eq!(EditField::WifiPassword.prefix(), "Wi-Fi password");
+        assert_eq!(
+            EditField::Connection {
+                plugin_idx: 0,
+                field_idx: 0
+            }
+            .prefix(),
+            "Setting"
+        );
+    }
+
+    #[test]
+    fn edge_cases_for_selectable() {
+        assert_eq!(first_selectable(&[]), 0);
+        assert_eq!(next_selectable(&[], 0, 1), 0);
+        assert_eq!(snap_to_selectable(&[], 0), 0);
+
+        let only_headers = vec![MenuRow::header("H1"), MenuRow::header("H2")];
+        // If there are no items, it shouldn't panic
+        assert_eq!(first_selectable(&only_headers), 0);
+        let nxt = next_selectable(&only_headers, 0, 1);
+        assert_eq!(nxt, 0);
+        assert_eq!(snap_to_selectable(&only_headers, 0), 0);
+    }
 }

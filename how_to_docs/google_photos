@@ -1,0 +1,155 @@
+----------
+1. Create OAuth credentials (5 minutes)                                                                                                                                     
+                                                                                                                                                                              
+  1. Sign in to https://console.cloud.google.com/ with your kethan.otherphotos.com Google Workspace account                                                                   
+  2. Create a project → Enable "Photos Library API"         
+  3. APIs & Services → Credentials → Create Credentials → OAuth client ID                                                                                                     
+    - Type: TV and Limited Input devices ← headless device flow
+    - Download or copy the Client ID and Client Secret                                                                                                                        
+  4. OAuth consent screen → Test users → add your email (required until you publish the app)
+                                                                                                                                                                              
+  2. Update config                                          
+                                                                                                                                                                              
+  Edit ~/.config/picogallery/config.toml — replace the placeholders:                                                                                                          
+  
+  [[plugins]]                                                                                                                                                                 
+  name          = "google-photos"                           
+  enabled       = true                                                                                                                                                        
+  client_id     = "123456789-abc.apps.googleusercontent.com"   # ← your value
+  client_secret = "GOCSPX-xxxxxxxxxxxxx"                        # ← your value                                                                                                
+                                                            
+  3. Run — it will guide you through auth                                                                                                                                     
+                                                            
+  cd /Volumes/SSD/projects/OpenPhotos                                                                                                                                         
+  SDL_LIB=$(find target/debug/build -name "libSDL2-2.0.0.dylib" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+  DYLD_LIBRARY_PATH="$SDL_LIB" target/debug/picogallery                                                                                                                       
+  
+  The app will print something like:                                                                                                                                          
+  Open this URL on any device:                              
+                                                                                                                                                                              
+    https://www.google.com/device                                                                                                                                             
+                                 
+  Enter code: ABCD-EFGH                                                                                                                                                       
+                                                                                                                                                                              
+  Visit that URL on your phone/laptop, sign in as your kethan.otherphotos.com account, approve — the Pi/Mac will get the token automatically and start showing your photos.
+  The token is saved to ~/.config/picogallery/google-photos-token.json so you only authenticate once.                                                                         
+                                                            
+✻ Brewed for 3m 42s                               
+
+
+
+
+
+
+
+
+-----------
+Here’s how to get a Google Photos API key / access setup (important: Google Photos mainly uses OAuth, not just a simple API key).
+
+⸻
+
+📸 Step 1: Go to Google Cloud Console
+
+Open: Google Cloud Console
+https://console.cloud.google.com/
+
+⸻
+
+🧱 Step 2: Create a Project
+	•	Click Select Project → New Project
+	•	Name it (e.g., Photos App)
+	•	Click Create
+
+⸻
+
+🔌 Step 3: Enable Google Photos API
+	•	Go to APIs & Services → Library
+	•	Search: Google Photos Library API
+	•	Click → Enable
+
+👉 Entity: Google Photos Library API
+
+⸻
+
+🔐 Step 4: Choose the Right Credential Type
+
+⚠️ This is where many people get confused:
+
+❌ API Key (NOT sufficient for Photos)
+	•	Google Photos does NOT work properly with just an API key
+	•	You cannot access user photos with only an API key
+
+⸻
+
+✅ Use OAuth 2.0 (Required)
+
+Steps:
+	1.	Go to APIs & Services → Credentials
+	2.	Click Create Credentials → OAuth client ID
+	3.	Configure consent screen:
+	•	App name
+	•	User support email
+	4.	Choose application type:
+	•	Web app / Desktop app
+	5.	Create → Copy:
+	•	Client ID
+	•	Client Secret
+
+👉 Entity: OAuth 2.0
+
+⸻
+
+🔑 Step 5: Scopes (Important)
+
+When requesting access, use scopes like:
+
+https://www.googleapis.com/auth/photoslibrary.readonly
+
+or
+
+https://www.googleapis.com/auth/photoslibrary
+
+
+⸻
+
+💻 Example Flow (Simple Concept)
+	1.	User logs in with Google
+	2.	User grants permission to Photos
+	3.	You get access token
+	4.	Use token to call API
+
+⸻
+
+🧪 Example API Call
+
+curl https://photoslibrary.googleapis.com/v1/albums \
+  -H "Authorization: Bearer ACCESS_TOKEN"
+
+
+⸻
+
+🍏 Optional: Store credentials as env variables (macOS)
+
+export GOOGLE_CLIENT_ID="your_client_id"
+export GOOGLE_CLIENT_SECRET="your_client_secret"
+
+
+⸻
+
+🧠 Summary
+	•	Google Photos API ❌ does NOT use simple API keys
+	•	You MUST use:
+	•	OAuth 2.0
+	•	Access tokens
+	•	API key alone = only for limited public data (not user photos)
+
+⸻
+
+🚀 If you want
+
+Tell me your use case:
+	•	Personal script
+	•	Web app
+	•	Mobile app
+
+…and I’ll give you a working starter code (Node/Python) for Google Photos API login + fetch photos.
