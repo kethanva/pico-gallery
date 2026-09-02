@@ -403,6 +403,8 @@ transition          = "fade"  # "cut" | "fade" | "slide_left" | "slide_right"
 transition_ms       = 800     # transition animation duration (ms); 0 = instant
 fill_screen         = false   # true = crop to fill screen; false = letterbox
 fps                 = 15      # frame-rate cap — lower saves CPU on Pi Zero
+resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | "lanczos3"
+                              # bilinear = least CPU/slide; lanczos3 = sharpest, heaviest
 # width  = 1920               # uncomment to force a specific resolution
 # height = 1080
 
@@ -414,6 +416,8 @@ gallery_mode      = true   # thumbnail grid; Esc/× returns from fullscreen
 letterbox_blur    = true   # fill letterbox bars with a blurred copy, not black
 ken_burns         = false  # slow zoom/pan per photo (more CPU; off on Pi Zero)
 on_this_day_boost = true   # surface photos taken on today's date in past years
+show_clock        = false  # clock pill in the corner (also toggled from the menu)
+# no_repeat_shown = false  # skip already-shown photos until the queue wraps
 
 # ── Memory-safety limits (skip oversized photos instead of OOM) ──────────────
 # max_image_mb   = 20    # raw file-size gate (0 = built-in 50 MB default)
@@ -431,6 +435,16 @@ on_this_day_boost = true   # surface photos taken on today's date in past years
 # night_end         = "07:00"
 # night_dim_percent = 25     # brightness reduction (0–90)
 # night_warmth      = 30     # warm tint strength (0–100)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Album / favourites targeting (optional)
+# Applied to the active source at startup and when changed from the on-screen
+# settings menu. Sources that cannot filter (e.g. directory) ignore what they
+# do not support.
+# ─────────────────────────────────────────────────────────────────────────────
+# [targeting]
+# album          = ""      # PhotoPrism album slug/UID, or a directory sub-folder
+# favorites_only = false   # only favourited photos (PhotoPrism)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache settings
@@ -577,6 +591,7 @@ enabled = false
 
 client_id     = "YOUR_LWA_CLIENT_ID"
 client_secret = "YOUR_LWA_CLIENT_SECRET"
+# client_secret_file = "/run/picogallery/amazon.secret"  # prefer over inline
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [PLUGIN] photoprism  ★ another Raspberry Pi running PhotoPrism as a server
@@ -601,6 +616,9 @@ url      = "http://photoprism.local:2342"   # base URL of the PhotoPrism server
 username = "admin"
 password = "insecure"                       # or use app_password below
 # app_password = "abcd-efgh-ijkl-mnop"      # PhotoPrism v0.10+ app password
+# password_file     = "/run/picogallery/photoprism.pass"  # prefer over inline
+# app_password_file = "/run/picogallery/photoprism.app"   # same, for app_password
+# Or set env PICOGALLERY_PHOTOPRISM_PASSWORD / _APP_PASSWORD
 
 # ── Filtering (all optional) ────────────────────────────────────────────────
 # album       = "january-2024"     # album UID or slug
@@ -651,6 +669,33 @@ password = "insecure"                       # or use app_password below
 # ─────────────────────────────────────────────────────────────────────────────
 # [PLUGIN] usb  ★ plug a USB stick / drive into the Pi and show its photos
 #
+# ─────────────────────────────────────────────────────────────────────────────
+# WebDAV plugin — Nextcloud / ownCloud / Synology / Apache mod_dav
+# Syncs a remote folder to a local cache dir, then serves photos from disk.
+#
+# SETUP (Nextcloud example)
+# 1. Files → "…" menu → WebDAV gives the url below.
+# 2. Use an app-password rather than your account password.
+# 3. Set remote_path to the folder to sync, then enabled = true.
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "webdav"
+enabled = false
+
+url      = "https://cloud.example.com/remote.php/dav/files/YOUR_USERNAME"
+username = "your-username"
+password = "your-password"                  # prefer an app-password
+# password_file = "/run/picogallery/webdav.pass"   # prefer over inline password
+
+remote_path        = "/Photos"              # sub-path to sync ("/" = everything)
+sync_dir           = "/tmp/picogallery-webdav"   # local cache dir
+sync_interval_secs = 3600                   # background re-sync; 0 = startup only
+
+# skip_tls_verify = false                   # true only for self-signed LAN certs
+# allowed_hosts   = ["cloud.example.com"]   # REQUIRED when skip_tls_verify = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USB plugin — auto-mount removable drives
 # Polls for USB block devices (sda1, sdb1, …) every 5 seconds, auto-mounts new
 # ones, and recursively scans them for .jpg / .jpeg. Unplugging clears those
 # photos and unmounts (if we mounted it). Linux only — a no-op elsewhere.
@@ -691,5 +736,27 @@ mod tests {
         // HDMI CEC remote input is opt-in.
         assert!(!cfg.cec.enabled);
         assert_eq!(cfg.auth.pending_timeout_secs, 180);
+    }
+
+    #[test]
+    fn shipped_example_config_parses_and_covers_the_same_sections() {
+        // config.example.toml is the copy-paste starting point in the README.
+        // It drifted from the generated template once already, so pin both the
+        // parse and the plugin list here.
+        let raw = include_str!("../config.example.toml");
+        let example: Config =
+            toml::from_str(raw).expect("config.example.toml must parse as valid Config");
+        let template: Config = toml::from_str(&default_config()).expect("template parses");
+
+        let mut example_plugins: Vec<&str> =
+            example.plugins.iter().map(|p| p.name.as_str()).collect();
+        let mut template_plugins: Vec<&str> =
+            template.plugins.iter().map(|p| p.name.as_str()).collect();
+        example_plugins.sort_unstable();
+        template_plugins.sort_unstable();
+        assert_eq!(
+            example_plugins, template_plugins,
+            "config.example.toml and the generated template must document the same sources"
+        );
     }
 }

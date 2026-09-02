@@ -56,6 +56,20 @@ resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | 
 # Skip photos already shown until the full queue has been displayed once.
 # no_repeat_shown = false
 
+# ── Presentation extras ───────────────────────────────────────────────────────
+#
+# letterbox_blur    — fill the letterbox bars with a blurred copy of the photo
+#                     instead of black (ignored when fill_screen = true)
+# ken_burns         — slow zoom/pan across each photo; costs CPU every frame,
+#                     so leave it off on a Pi Zero
+# on_this_day_boost — surface photos taken on today's date in earlier years
+# show_clock        — clock pill in the corner (also toggled from the menu)
+#
+# letterbox_blur    = true
+# ken_burns         = false
+# on_this_day_boost = true
+# show_clock        = false
+
 # ── Album / favourites targeting ──────────────────────────────────────────────
 #
 # Applied to PhotoPrism (album slug/UID, favourites) or directory (sub-folder).
@@ -108,6 +122,16 @@ resize_filter       = "catmull_rom" # "bilinear" | "catmull_rom" | "mitchell" | 
 # on_time  = "07:00"   # display turns on at 07:00 each morning
 # off_time = "22:00"   # display turns off at 22:00 each evening
 
+# ── Night mode (optional; HH:MM local time, both required) ────────────────────
+#
+# Dims and warm-shifts photos in a dark room instead of turning the panel off.
+# Applied once per slide in a single fixed-point pixel pass — not per frame.
+#
+# night_start       = "21:00"
+# night_end         = "07:00"
+# night_dim_percent = 25   # brightness reduction (0–90)
+# night_warmth      = 30   # warm tint strength (0–100)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +170,18 @@ bind    = "127.0.0.1" # set an explicit LAN IP only on a trusted network
 enabled = false
 device  = "/dev/cec0"
 # poll_ms = 250
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wi-Fi (Linux / Raspberry Pi only)
+# Applied to the OS at startup and whenever changed from the on-screen settings
+# menu. WPA2-personal only (SSID + passphrase, no enterprise). The passphrase
+# is stored here in plain text — keep this file chmod 600.
+# ─────────────────────────────────────────────────────────────────────────────
+[wifi]
+enabled  = false
+ssid     = ""
+password = ""
+# country  = "US"   # ISO 3166 code; some wpa_supplicant setups require it
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Plugins — enable one or more by setting  enabled = true
@@ -278,16 +314,34 @@ username = "admin"
 password = "insecure"                       # or use app_password / password_file below
 # app_password = "abcd-efgh-ijkl-mnop"      # PhotoPrism v0.10+ app password
 # password_file = "/run/picogallery/photoprism.pass"  # prefer over inline password
+# app_password_file = "/run/picogallery/photoprism.app"  # same, for app_password
 # Or set env PICOGALLERY_PHOTOPRISM_PASSWORD / PICOGALLERY_PHOTOPRISM_APP_PASSWORD
 
 # ── Filtering (all optional) ────────────────────────────────────────────────
 # album       = "january-2024"     # album UID or slug
+# albums      = ["trip", "family"] # OR several albums (album:trip|family)
 # favorites   = true               # only favourites
 # quality     = 3                  # 1=low … 5=excellent (drops anything lower)
 # country     = "fr"               # ISO country code
+# state       = "California"       # province / state name
+# city        = "Paris"            # city name
 # year        = 2024
+# after       = "2020-06-01"       # only photos on/after this date (YYYY-MM-DD)
+# before      = "2020-06-30"       # only photos on/before this date
 # media_type  = "image"            # image | raw | live | animated | video
+# color       = "blue"             # red|orange|gold|green|teal|blue|purple|pink|brown|white|grey|black
+# mono        = true               # only black & white / monochrome photos
+# panorama    = true               # only panoramas
+# orientation = "portrait"         # portrait | landscape | square
+# people      = ["Alice", "Bob"]   # only photos containing these subjects (faces)
+# labels      = ["beach", "dog"]   # any of these labels (label:beach|dog)
+# keywords    = ["sunset"]         # any of these keywords
+# memories    = true               # only photos taken on today's date in any year
 # query       = "label:beach keyword:sunset"   # raw PhotoPrism Q-language
+#
+# Private and archived photos are EXCLUDED by default. Opt back in:
+# include_private  = false
+# include_archived = false
 
 # ── Ordering / paging ───────────────────────────────────────────────────────
 # order    = "newest"   # newest | oldest | added | name | random | similar
@@ -304,3 +358,18 @@ password = "insecure"                       # or use app_password / password_fil
 # skip_tls_verify       = false    # true for self-signed LAN certs
 # allowed_hosts         = ["photoprism.local"]  # REQUIRED when skip_tls_verify=true
 # request_timeout_secs  = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [PLUGIN] usb — auto-mount removable drives (Linux only)
+# Polls for USB block devices (sda1, sdb1, …) every 5 seconds, auto-mounts new
+# ones, and recursively scans them for .jpg / .jpeg. Unplugging clears those
+# photos and unmounts again (if picogallery mounted it). A no-op off Linux.
+#
+# SETUP
+# 1. Set enabled = true and restart picogallery.
+# 2. Mounting uses `udisksctl` (no root needed) and falls back to `mount -o ro`.
+#    On a minimal image:  sudo apt install udisks2
+# ─────────────────────────────────────────────────────────────────────────────
+[[plugins]]
+name    = "usb"
+enabled = false

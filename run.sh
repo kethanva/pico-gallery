@@ -345,7 +345,7 @@ $TARGET_DIR/picogallery --generate-config --config "$TMPDIR_GEN/config.toml" 2>&
 info "--generate-config: OK"
 
 # Verify --print-default-config emits valid TOML (parse it).
-$TARGET_DIR/picogallery --print-default-config 2>/dev/null | \
+if $TARGET_DIR/picogallery --print-default-config 2>/dev/null | \
     python3 -c "
 import sys
 try:
@@ -359,8 +359,11 @@ except ImportError:
 data = tomllib.loads(sys.stdin.read())
 assert 'display' in data, 'missing [display] section'
 assert 'plugins' in data, 'missing [[plugins]]'
-" 2>/dev/null && info "--print-default-config: valid TOML" || \
+" 2>/dev/null; then
+    info "--print-default-config: valid TOML"
+else
     warn "--print-default-config: TOML parse check skipped (tomllib/tomli not available)"
+fi
 
 rm -rf "$TMPDIR_GEN"
 

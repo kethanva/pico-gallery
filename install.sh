@@ -50,7 +50,8 @@ section() { echo -e "\n${BOLD}${CYAN}== $* ==${RESET}"; }
 #     --photoprism-url http://photoprism.local:2342 \
 #     --photoprism-user admin --photoprism-pass 'YOUR_PASSWORD'
 #
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+SCRIPT_DIR="${SCRIPT_DIR:-$PWD}"
 
 MODE_FLAG=""            # download | build | all
 ASSUME_YES=0
@@ -142,9 +143,9 @@ echo -e "${RESET}"
 
 ARCH=$(uname -m)
 case "$ARCH" in
-  aarch64)       ARTIFACT_ARCH="aarch64"; RUST_TARGET="aarch64-unknown-linux-gnu" ;;
-  armv7l)        ARTIFACT_ARCH="armv7";   RUST_TARGET="armv7-unknown-linux-gnueabihf" ;;
-  armv6l)        ARTIFACT_ARCH="armv6";   RUST_TARGET="arm-unknown-linux-gnueabihf" ;;
+  aarch64)       ARTIFACT_ARCH="aarch64" ;;
+  armv7l)        ARTIFACT_ARCH="armv7" ;;
+  armv6l)        ARTIFACT_ARCH="armv6" ;;
   *)             die "Unsupported architecture: $ARCH (need aarch64 or armv7l)" ;;
 esac
 info "Architecture: $ARCH -> artifact: linux-${ARTIFACT_ARCH}"

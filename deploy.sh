@@ -46,7 +46,8 @@ warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
 die()  { echo -e "${RED}[x]${RESET} $*" >&2; exit 1; }
 
 # ── Optional local overrides (never commit deploy.local.env) ─────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+SCRIPT_DIR="${SCRIPT_DIR:-$PWD}"
 LOCAL_ENV="${DEPLOY_LOCAL_ENV:-$SCRIPT_DIR/deploy.local.env}"
 
 # Load KEY=VALUE lines only — never `source` as root (that would be RCE if the
@@ -91,7 +92,7 @@ load_local_env() {
       val="${val:1:${#val}-2}"
     fi
     printf -v "$key" '%s' "$val"
-    export "$key"
+    export "${key?}"
   done < "$file"
   info "Loaded local deploy settings from $file"
 }
@@ -144,7 +145,8 @@ fi
 
 # ── Install pre-built binary + provision PhotoPrism (no compile on Pi) ───────
 info "Installing release $PICOGALLERY_VERSION (download mode — no local build)"
-PICOGALLERY_VERSION="$PICOGALLERY_VERSION" "$INSTALL_SCRIPT" --mode download -y \
+export PICOGALLERY_VERSION
+"$INSTALL_SCRIPT" --mode download -y \
   --user "$KIOSK_USER" \
   --version "$PICOGALLERY_VERSION" \
   --photoprism-url  "$PHOTOPRISM_URL" \
