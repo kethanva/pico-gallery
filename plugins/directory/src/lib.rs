@@ -289,7 +289,7 @@ impl DirectoryPlugin {
             }
             Order::DateModified => {
                 // Newest first.
-                photos.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
+                photos.sort_by_key(|a| std::cmp::Reverse(a.modified_secs));
             }
             Order::Shuffle => {
                 let seed = SystemTime::now()

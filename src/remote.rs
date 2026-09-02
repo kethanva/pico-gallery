@@ -123,7 +123,7 @@ pub async fn start(cfg: &RemoteConfig, status: SharedStatus) -> Result<Receiver<
 /// Index just past the first CRLF-CRLF in `buf`, if present.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4)
-        .position(|w| w == [b'\r', b'\n', b'\r', b'\n'])
+        .position(|w| w == *b"\r\n\r\n")
         .map(|i| i + 4)
 }
 

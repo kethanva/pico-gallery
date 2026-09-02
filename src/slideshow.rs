@@ -2162,7 +2162,7 @@ fn apply_order(queue: &mut Vec<(usize, PhotoMeta)>, display: &DisplayConfig, see
             queue.sort_by_key(|(_, m)| m.taken_at);
         }
         PhotoOrder::NewestFirst => {
-            queue.sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
+            queue.sort_by_key(|(_, a)| std::cmp::Reverse(a.taken_at));
         }
         PhotoOrder::DateCluster => {
             *queue = date_cluster_order(std::mem::take(queue), seed);
@@ -2192,7 +2192,7 @@ fn apply_order_tail(
             queue[from..].sort_by_key(|(_, m)| m.taken_at);
         }
         PhotoOrder::NewestFirst => {
-            queue[from..].sort_by(|(_, a), (_, b)| b.taken_at.cmp(&a.taken_at));
+            queue[from..].sort_by_key(|(_, a)| std::cmp::Reverse(a.taken_at));
         }
         PhotoOrder::DateCluster => {
             queue[from..].sort_by_key(|(_, m)| m.taken_at);
