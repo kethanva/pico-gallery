@@ -224,7 +224,6 @@ async fn wpa_passphrase_block(cfg: &WifiConfig) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .await
         .context("starting wpa_passphrase")?;
     child
         .stdin
